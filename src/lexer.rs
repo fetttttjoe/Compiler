@@ -6,6 +6,7 @@ pub enum Token {
     Struct,
     // Special
     Main,
+    IdentifierClosed, // I need a better name for this
     // Constants and variables
     Var,
     Const,
@@ -43,6 +44,8 @@ pub enum Token {
 pub struct Lexer<'a> {
     input: Chars<'a>,
     current_char: Option<char>,
+    // I am not sure if that is a stupid approach
+    brace_counter: u32,
 }
 
 impl<'a> Lexer<'a> {
@@ -53,6 +56,8 @@ impl<'a> Lexer<'a> {
         Lexer {
             input: chars,
             current_char,
+            // I am not sure if that is a stupid approach
+            brace_counter: 0,
         }
     }
 
@@ -106,8 +111,8 @@ impl<'a> Lexer<'a> {
         if let Some(c) = self.current_char {
             match c {
                 ':' => self.consume_single_char(Token::Colon),
-                '{' => self.consume_single_char(Token::LeftBrace),
-                '}' => self.consume_single_char(Token::RightBrace),
+                '{' => self.handle_left_brace(),
+                '}' => self.handle_right_brace(),
                 '(' => self.consume_single_char(Token::LeftParen),
                 ')' => self.consume_single_char(Token::RightParen),
                 ',' => self.consume_single_char(Token::Comma),
@@ -137,6 +142,21 @@ impl<'a> Lexer<'a> {
             return Token::Eof;
         }
     }
+    
+    fn handle_left_brace(&mut self) -> Token {
+        self.brace_counter += 1;
+        self.consume_single_char(Token::LeftBrace)
+    }
+
+    fn handle_right_brace(&mut self) -> Token {
+        self.brace_counter -= 1;
+        if self.brace_counter == 0 {
+            self.consume_single_char(Token::IdentifierClosed)
+        } else {
+            self.consume_single_char(Token::RightBrace)
+        }
+    }
+
     fn consume_single_char(&mut self, token: Token) -> Token {
         self.advance();
         return token;
