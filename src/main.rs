@@ -8,10 +8,27 @@ fn main() {
         a: int,
         b: int,
     }
-        fun add(a: int, b: int): int {
-            var result = a + b;
-            return result;
-        }
+    
+    fun substract(a: int, b: int): int {
+        const result = a - b;
+        return result;
+    }
+
+    fun add(a: int, b: int): int {
+        const result = a + b;
+        return result;
+    }
+
+    fun main() {
+        const test = test { a: 1, b: 2 };
+        const result = substract(test.a, test.b);
+        var a = 1;
+        var b = 2;
+        const or = a || b;
+        const and = a && b;
+        const c = add(a, b);
+    }
+
     "#;
 
     let mut lexer = lexer::Lexer::new(source_code);
@@ -23,5 +40,7 @@ fn main() {
         }
         tokens.push(token);
     }
-    println!("{:?}", tokens);
+    for token in &tokens {
+        println!("{:?}", token);
+    }
 }
