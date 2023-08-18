@@ -12,6 +12,7 @@ pub enum Token {
     Const,
     // Types
     IntType,
+    FloatType,
     // Symbols
     Identifier(String),
     Colon,
@@ -130,7 +131,6 @@ impl<'a> Lexer<'a> {
                 '&' => self.consume_double_symbol('&'),
                 '|' =>  self.consume_double_symbol('|'),
                  _ if c.is_alphabetic() =>{ 
-                    println!("Processing alphabetic character: '{}', ASCII: {}", c, c as u8);
                     self.process_identifier()},
                 _ if c.is_digit(10) => {
                     let number = self.read_number();
@@ -188,6 +188,7 @@ impl<'a> Lexer<'a> {
             "var" => Token::Var,
             "const" => Token::Const,
             "int" => Token::IntType,
+            "float" => Token::FloatType,
             "return" => Token::Return,
             "main" => Token::Main,
             _ => Token::Identifier(identifier),
