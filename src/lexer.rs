@@ -4,8 +4,6 @@ pub enum Token {
     // Keywords
     Fun,
     Struct,
-    // Special
-    Main,
     IdentifierClosed, // I need a better name for this
     // Constants and variables
     Var,
@@ -15,30 +13,52 @@ pub enum Token {
     FloatType,
     // Symbols
     Identifier(String),
-    Colon,
-    LeftBrace,
-    RightBrace,
-    LeftParen,
-    RightParen,
-    Comma,
-    Dot,
+    // :
+    Colon,   
+    // {   
+    LeftBrace,  
+    // }
+    RightBrace, 
+    // (
+    LeftParen,  
+    // )
+    RightParen, 
+    // ,
+    Comma,      
+    // .
+    Dot,        
+    // ;
     Semicolon,
+    // return
     Return,
     IntLiteral(i32),
     Eof,
     // Operators
+    // =
     Equals,
+    // +
     Plus,
+    // -
     Minus,
+    // *
     Asterisk,
+    // /
     Slash,
+    // %
     Percent,
+    // !
     Exclamation,
+    // <
     LessThan,
+    // >
     GreaterThan,
+    // &
     Ampersand,
+    // |
     VerticalBar,
+    // &&
     DoubleAmpersand,
+    // ||
     DoubleVerticalBar,
 }
 
@@ -130,8 +150,9 @@ impl<'a> Lexer<'a> {
                 '>' => self.consume_single_char(Token::GreaterThan),
                 '&' => self.consume_double_symbol('&'),
                 '|' =>  self.consume_double_symbol('|'),
-                 _ if c.is_alphabetic() =>{ 
-                    self.process_identifier()},
+                 _ if c.is_alphabetic() => { 
+                    self.process_identifier()
+                },
                 _ if c.is_digit(10) => {
                     let number = self.read_number();
                     return Token::IntLiteral(number);
@@ -190,9 +211,19 @@ impl<'a> Lexer<'a> {
             "int" => Token::IntType,
             "float" => Token::FloatType,
             "return" => Token::Return,
-            "main" => Token::Main,
             _ => Token::Identifier(identifier),
         }
     }
     
+    pub fn analyse_source(mut self) -> Vec<Token> {
+        let mut tokens = Vec::new();
+        loop {
+            let token = self.next_token();
+            if token == Token::Eof {
+                break;
+            }
+            tokens.push(token.clone());
+        }
+        return tokens;
+    }
 }
