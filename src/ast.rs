@@ -254,17 +254,6 @@ pub fn create_statement_ast(index: &mut usize, tokens: &[lexer::Token]) -> State
     }
 }
 
-// fn parse_expression(index: &mut usize, tokens: &[lexer::Token]) -> Vec<lexer::Token> {
-//     let mut expression = Vec::new();
-//     while !matches!(tokens[*index], lexer::Token::Semicolon) {
-//         println!("tokens[{}]: {:?}", *index, tokens[*index]);
-//         expression.push(tokens[*index].clone());
-//         // Skip the current token and move to the next one
-//         *index += 1;
-//     }
-//     return expression;
-// }
-
 fn get_current_expression(index: &mut usize, tokens: &[lexer::Token]) -> Vec<Expression> {
     let mut expressions = Vec::new();
     while !matches!(tokens[*index], lexer::Token::Semicolon) {
