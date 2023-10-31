@@ -1,9 +1,5 @@
 use std::str::Chars;
 
-#[cfg(windows)]
-const LINE_ENDING: &'static str = "\r\n";
-#[cfg(not(windows))]
-const LINE_ENDING: &'static str = "\n";
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Token {
