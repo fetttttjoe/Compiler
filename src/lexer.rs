@@ -1,4 +1,10 @@
 use std::str::Chars;
+
+#[cfg(windows)]
+const LINE_ENDING: &'static str = "\r\n";
+#[cfg(not(windows))]
+const LINE_ENDING: &'static str = "\n";
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum Token {
     // Keywords
@@ -29,10 +35,6 @@ pub enum Token {
     Dot,        
     // ;
     Semicolon,
-    // return
-    Return,
-    IntLiteral(i32),
-    Eof,
     // Operators
     // =
     Equals,
@@ -60,6 +62,14 @@ pub enum Token {
     DoubleAmpersand,
     // ||
     DoubleVerticalBar,
+    // //
+    Comment,
+    // return
+    Return,
+    // Line End
+    LineEnd,
+    IntLiteral(i32),
+    Eof,
 }
 
 pub struct Lexer<'a> {
@@ -83,6 +93,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn advance(&mut self) {
+        println!("Advancing {:?}", self.current_char);
         self.current_char = self.input.next();
     }
 
@@ -92,11 +103,23 @@ impl<'a> Lexer<'a> {
 
 
     fn skip_whitespace(&mut self) {
+        println!("Skipping whitespace: {:?}", self.peek());
         while let Some(c) = self.peek() {
-            if !c.is_whitespace() {
+            if c != ' ' {
                 break;
             }
             self.advance();
+                // if c.is_whitespace() {
+                //     if c == '\r' || c == '\n' || c == ' ' {
+                //         break;
+                //     } else {
+                //         self.advance();
+                //     }
+                // }
+               
+            // if !c.is_whitespace() {
+            //     break;
+            // } 
         }
     }
 
@@ -127,6 +150,7 @@ impl<'a> Lexer<'a> {
     }
 
     pub fn next_token(&mut self) -> Token {
+        println!("Next token: {:?}", self.current_char);
         self.skip_whitespace();
         
         if let Some(c) = self.current_char {
@@ -143,13 +167,15 @@ impl<'a> Lexer<'a> {
                 '+' => self.consume_single_char(Token::Plus),
                 '-' => self.consume_single_char(Token::Minus),
                 '*' => self.consume_single_char(Token::Asterisk),
-                '/' => self.consume_single_char(Token::Slash),
                 '%' => self.consume_single_char(Token::Percent),
                 '!' => self.consume_single_char(Token::Exclamation),
                 '<' => self.consume_single_char(Token::LessThan),
                 '>' => self.consume_single_char(Token::GreaterThan),
                 '&' => self.consume_double_symbol('&'),
                 '|' =>  self.consume_double_symbol('|'),
+                '/' => self.consume_double_symbol('/'),
+                '\n' => self.consume_single_char(Token::LineEnd),
+                // _ if c == '\r' => self.consume_double_char('\r', Token::LineEnd, Token::Eof),
                  _ if c.is_alphabetic() => { 
                     self.process_identifier()
                 },
@@ -179,6 +205,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn consume_single_char(&mut self, token: Token) -> Token {
+        println!("Consuming single char: {:?}", self.current_char);
         self.advance();
         return token;
     }
@@ -198,6 +225,7 @@ impl<'a> Lexer<'a> {
         match symbol {
             '&' => self.consume_double_char('&', Token::DoubleAmpersand, Token::Ampersand),
             '|' => self.consume_double_char('|', Token::DoubleVerticalBar, Token::VerticalBar),
+            '/' => self.consume_double_char('/', Token::Comment, Token::Slash),
             _ => panic!("Unsupported double symbol: {}", symbol),
         }
     }
@@ -219,6 +247,7 @@ impl<'a> Lexer<'a> {
         let mut tokens = Vec::new();
         loop {
             let token = self.next_token();
+            println!("Token: {:?}", token);
             if token == Token::Eof {
                 break;
             }

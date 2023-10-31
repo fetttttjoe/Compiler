@@ -11,14 +11,16 @@ fn main() {
         const result = a - b * c;
         return result;
     }
+    // This is a comment
+    struct test {
+        a: int,
+        b: int,
+    }
     
     "#;
+    
     // fun ioasjdasiod(a: int, b:int): int {
     //     return sub(a * b, 1) - 100 + (5*6+4)
-    // }
-    // struct test {
-    //     a: int,
-    //     b: int,
     // }
     
     // fun main() {
@@ -40,7 +42,7 @@ fn main() {
     
     let lexer = lexer::Lexer::new(source_code);
     let tokens = lexer.analyse_source();
-
+    println!("TOKENS: {:?} ", tokens);
     let ast = ast::create_ast(&tokens);
 
     // Now 'ast' contains your Abstract Syntax Tree
