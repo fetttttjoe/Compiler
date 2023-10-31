@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Rust Debugger",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/Compiler",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "sourceLanguages": ["rust"]
+        }
+    ]
+}

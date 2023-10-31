@@ -83,13 +83,15 @@ fn skip_tokens_while<F>(index: &mut usize, tokens: &[lexer::Token], condition: F
 where
     F: Fn(&lexer::Token) -> bool,
 {
+    assert!(
+        tokens.len() > *index,
+        "Index > Tokens! At Tokens[{}]: {:?}",
+        *index,
+        tokens[*index]
+    );
+    
     while condition(&tokens[*index]) {
-        assert!(
-            tokens.len() > *index,
-            "Index > Tokens! At Tokens[{}]: {:?}",
-            *index,
-            tokens[*index]
-        );
+        println!("Skipping: {:?}", tokens[*index]);
         *index += 1;
     }
 }
@@ -162,7 +164,6 @@ pub fn create_function_ast(index: &mut usize, tokens: &[lexer::Token]) -> Functi
                     data_type: param_data_type,
                 });
             }
-
             skip_tokens_while(index, tokens, |token| matches!(token, lexer::Token::Comma));
         }
     }
@@ -223,32 +224,44 @@ pub fn create_statement_ast(index: &mut usize, tokens: &[lexer::Token]) -> State
         lexer::Token::Var | lexer::Token::Const => {
             // Handle Var and Const statements here
 
+            let old_index = index.clone();
             // For now, let's just skip these tokens
             skip_tokens_while(index, tokens, |token| {
                 matches!(token, lexer::Token::Var | lexer::Token::Const)
             });
             return StatementNode::NeedsToBeImplemented(format!(
                 "Var and Const statements at Lexer Index {}",
-                index
+                old_index
             ));
         }
         lexer::Token::Return => {
             // Handle Return statements here
 
+            let old_index = index.clone();
             // For now, let's just skip these tokens
             skip_tokens_while(index, tokens, |token| matches!(token, lexer::Token::Return));
             return StatementNode::NeedsToBeImplemented(format!(
                 "Return statements at Lexer Index {}",
+                old_index
+            ));
+        }
+        lexer::Token::LineEnd => {
+            // For now, let's just skip these tokens
+            skip_tokens_while(index, tokens, |token| matches!(token, lexer::Token::LineEnd));
+            return StatementNode::NeedsToBeImplemented(format!(
+                "Line End statement at Lexer Index {}",
                 index
             ));
         }
         _ => {
             // Handle other types of statements here
-
+            let old_index = index.clone();
+            *index += 1;
             // Default case: return an empty statement
             return StatementNode::NeedsToBeImplemented(format!(
-                "{:?} statements at Lexer Index {}",
-                tokens[*index], index
+                "{:?} statement at Lexer Index {}",
+                tokens[old_index],
+                old_index
             ));
         }
     }
@@ -338,7 +351,6 @@ pub fn create_ast(tokens: &[lexer::Token]) -> Vec<AstNode> {
                     }
                 }
             }
-
             _ => println!("Not implemented {:?}", tokens[index]),
         }
         index += 1;
