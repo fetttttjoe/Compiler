@@ -213,8 +213,31 @@ impl<'a> Checker<'a> {
             Stmt::Expr(e) => {
                 self.type_of_expr(e);
             }
-            Stmt::Assign { .. } => {
-                // Added in Task 11.
+            Stmt::Assign { name, value, span } => {
+                let value_ty = self.type_of_expr(value);
+                let binding = self
+                    .scopes
+                    .iter()
+                    .rev()
+                    .find_map(|s| s.get(name))
+                    .map(|info| (info.ty.clone(), info.mutable));
+                match binding {
+                    None => self.error(format!("undefined variable '{name}'"), *span),
+                    Some((binding_ty, mutable)) => {
+                        if !mutable {
+                            self.error(format!("cannot assign to const '{name}'"), *span);
+                        } else if value_ty != binding_ty {
+                            self.error(
+                                format!(
+                                    "cannot assign {} to variable of type {}",
+                                    value_ty.name(),
+                                    binding_ty.name()
+                                ),
+                                *span,
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -243,11 +266,9 @@ impl<'a> Checker<'a> {
                 let rt = self.type_of_expr(rhs);
                 self.check_binary(*op, lt, rt, *span)
             }
-            // Call / Field / StructLit added in Task 11.
-            _ => {
-                self.error("expression is not yet supported".to_string(), expr.span());
-                Type::Unit
-            }
+            Expr::Call { callee, args, span } => self.check_call(callee, args, *span),
+            Expr::Field { base, name, span } => self.check_field(base, name, *span),
+            Expr::StructLit { name, fields, span } => self.check_struct_lit(name, fields, *span),
         }
     }
 
@@ -274,6 +295,116 @@ impl<'a> Checker<'a> {
                 lt
             }
         }
+    }
+
+    fn check_call(&mut self, callee: &Expr, args: &[Expr], span: Span) -> Type {
+        let name = match callee {
+            Expr::Ident(n, _) => n.clone(),
+            _ => {
+                self.error("only named functions can be called".to_string(), span);
+                return Type::Unit;
+            }
+        };
+        let sig = match self.table.functions.get(&name) {
+            Some(sig) => sig.clone(),
+            None => {
+                self.error(format!("undefined function '{name}'"), span);
+                return Type::Unit;
+            }
+        };
+        if args.len() != sig.params.len() {
+            self.error(
+                format!(
+                    "function '{}' expects {} argument(s), found {}",
+                    name,
+                    sig.params.len(),
+                    args.len()
+                ),
+                span,
+            );
+        }
+        for (arg, expected) in args.iter().zip(&sig.params) {
+            let got = self.type_of_expr(arg);
+            if got != *expected {
+                self.error(
+                    format!(
+                        "expected argument of type {}, found {}",
+                        expected.name(),
+                        got.name()
+                    ),
+                    arg.span(),
+                );
+            }
+        }
+        sig.ret
+    }
+
+    fn check_field(&mut self, base: &Expr, field: &str, span: Span) -> Type {
+        let base_ty = self.type_of_expr(base);
+        let struct_name = match &base_ty {
+            Type::Struct(n) => n.clone(),
+            _ => {
+                self.error(format!("type {} has no fields", base_ty.name()), span);
+                return Type::Unit;
+            }
+        };
+        // Clone the field type so no borrow of `self.table` is held across `self.error`.
+        let field_ty = self
+            .table
+            .structs
+            .get(&struct_name)
+            .and_then(|st| st.fields.iter().find(|(fname, _)| fname == field))
+            .map(|(_, ty)| ty.clone());
+        match field_ty {
+            Some(ty) => ty,
+            None => {
+                self.error(
+                    format!("struct '{struct_name}' has no field '{field}'"),
+                    span,
+                );
+                Type::Unit
+            }
+        }
+    }
+
+    fn check_struct_lit(&mut self, name: &str, fields: &[(String, Expr)], span: Span) -> Type {
+        let decl = match self.table.structs.get(name) {
+            Some(st) => st.clone(),
+            None => {
+                self.error(format!("unknown struct '{name}'"), span);
+                for (_, value) in fields {
+                    self.type_of_expr(value);
+                }
+                return Type::Unit;
+            }
+        };
+        for (fname, value) in fields {
+            let got = self.type_of_expr(value);
+            match decl.fields.iter().find(|(dn, _)| dn == fname) {
+                Some((_, expected)) => {
+                    if got != *expected {
+                        self.error(
+                            format!(
+                                "field '{fname}' expects {}, found {}",
+                                expected.name(),
+                                got.name()
+                            ),
+                            value.span(),
+                        );
+                    }
+                }
+                None => self.error(
+                    format!("struct '{name}' has no field '{fname}'"),
+                    value.span(),
+                ),
+            }
+        }
+        for (dn, _) in &decl.fields {
+            if !fields.iter().any(|(fname, _)| fname == dn) {
+                self.error(format!("missing field '{dn}' in struct '{name}'"), span);
+            }
+        }
+        Type::Struct(name.to_string())
     }
 
     fn lookup(&mut self, name: &str, span: Span) -> Type {
@@ -371,6 +502,60 @@ mod tests {
         assert!(
             d.iter()
                 .any(|e| e.message.contains("expected return type int")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn well_typed_program_passes() {
+        let d = diags(
+            "struct P { x: int, y: int }\n\
+             fun add(a: int, b: int): int { return a + b; }\n\
+             fun main(): int { const p = P { x: 1, y: 2 }; return add(p.x, p.y); }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn wrong_argument_count_is_an_error() {
+        let d = diags("fun f(a: int): int { return a; } fun g(): int { return f(); }");
+        assert!(
+            d.iter().any(|e| e.message.contains("expects 1 argument")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn argument_type_mismatch_is_an_error() {
+        let d = diags("fun f(a: int): int { return a; } fun g(): int { return f(1.0); }");
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("expected argument of type int")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_field_is_an_error() {
+        let d = diags("struct P { x: int } fun f(p: P): int { return p.z; }");
+        assert!(d.iter().any(|e| e.message.contains("no field 'z'")), "{d:?}");
+    }
+
+    #[test]
+    fn struct_literal_field_type_mismatch_is_an_error() {
+        let d = diags("struct P { x: int } fun f(): int { const p = P { x: 1.0 }; return 1; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("field 'x' expects int")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn assigning_to_const_is_an_error() {
+        let d = diags("fun f(): int { const x = 1; x = 2; return x; }");
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("cannot assign to const 'x'")),
             "{d:?}"
         );
     }
