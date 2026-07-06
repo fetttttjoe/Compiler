@@ -3,6 +3,7 @@
 mod lexer;
 mod ast;
 mod span;
+mod diagnostic;
 
 
 fn main() {
