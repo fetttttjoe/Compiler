@@ -30,5 +30,13 @@ fun substract(a: int, b: int): int {
         std::process::exit(1);
     }
 
+    let (_table, check_diags) = check::check(&ast);
+    if !check_diags.is_empty() {
+        for diag in &check_diags {
+            eprintln!("{}", diag.render(&index));
+        }
+        std::process::exit(1);
+    }
+
     println!("{ast:#?}");
 }
