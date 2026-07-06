@@ -572,6 +572,28 @@ mod tests {
     }
 
     #[test]
+    fn assign_type_mismatch_is_an_error() {
+        let d = diags("fun f(): int { var x = 1; x = 1.0; return x; }");
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("cannot assign float to variable of type int")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn missing_struct_literal_field_is_an_error() {
+        let d = diags(
+            "struct P { x: int, y: int } fun f(): int { const p = P { x: 1 }; return 1; }",
+        );
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("missing field 'y' in struct 'P'")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
     fn assigning_to_const_is_an_error() {
         let d = diags("fun f(): int { const x = 1; x = 2; return x; }");
         assert!(

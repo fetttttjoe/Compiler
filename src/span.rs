@@ -54,6 +54,15 @@ mod tests {
     }
 
     #[test]
+    fn locate_handles_boundary_offsets() {
+        // Empty input and the one-past-the-end offset (EOF diagnostics point
+        // there) must resolve without panicking.
+        assert_eq!(LineIndex::new("").locate(0), (1, 1));
+        let index = LineIndex::new("ab\n");
+        assert_eq!(index.locate(3), (2, 1)); // offset == source.len()
+    }
+
+    #[test]
     fn locate_handles_crlf_and_cr_line_endings() {
         let crlf = LineIndex::new("ab\r\ncd");
         assert_eq!(crlf.locate(5), (2, 2)); // 'd' on line 2

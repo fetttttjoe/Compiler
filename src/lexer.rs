@@ -275,4 +275,17 @@ mod tests {
         let (tokens, _) = lex("fun");
         assert_eq!(tokens[0].span, Span::new(0, 3));
     }
+
+    #[test]
+    fn integer_overflow_reports_a_diagnostic_and_recovers() {
+        // Too large for i64: a diagnostic plus a placeholder token, not a
+        // silent 0 and not a panic.
+        let (tokens, diags) = lex("99999999999999999999");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("out of range"), "{diags:?}");
+        assert_eq!(
+            tokens.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+            vec![TokenKind::IntLiteral(0), TokenKind::Eof]
+        );
+    }
 }
