@@ -17,12 +17,17 @@ fun substract(a: int, b: int): int {
 "#;
 
     let index = LineIndex::new(source);
-    let (tokens, diagnostics) = lexer::lex(source);
+    let (tokens, lex_diags) = lexer::lex(source);
+    let (ast, parse_diags) = parser::parse(&tokens);
 
-    for diag in &diagnostics {
+    let mut had_error = false;
+    for diag in lex_diags.iter().chain(parse_diags.iter()) {
         eprintln!("{}", diag.render(&index));
+        had_error = true;
     }
-    for token in &tokens {
-        println!("{:?}", token.kind);
+    if had_error {
+        std::process::exit(1);
     }
+
+    println!("{ast:#?}");
 }
