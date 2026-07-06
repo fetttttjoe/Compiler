@@ -9,6 +9,11 @@ impl Span {
     pub fn new(start: usize, end: usize) -> Self {
         Span { start, end }
     }
+
+    /// The span covering everything from the start of `self` to the end of `end`.
+    pub fn to(self, end: Span) -> Span {
+        Span::new(self.start, end.end)
+    }
 }
 
 /// Precomputed line-start byte offsets, used to turn a byte offset into a

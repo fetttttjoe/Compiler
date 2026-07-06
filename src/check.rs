@@ -216,10 +216,7 @@ impl<'a> Checker<'a> {
             Stmt::Assign { name, value, span } => {
                 let value_ty = self.type_of_expr(value);
                 let binding = self
-                    .scopes
-                    .iter()
-                    .rev()
-                    .find_map(|s| s.get(name))
+                    .find_var(name)
                     .map(|info| (info.ty.clone(), info.mutable));
                 match binding {
                     None => self.error(format!("undefined variable '{name}'"), *span),
@@ -305,8 +302,11 @@ impl<'a> Checker<'a> {
                 return Type::Unit;
             }
         };
-        let sig = match self.table.functions.get(&name) {
-            Some(sig) => sig.clone(),
+        // Copy the table reference out of `self` so the signature borrow is
+        // independent of the `&mut self` calls below — no clone needed.
+        let table = self.table;
+        let sig = match table.functions.get(&name) {
+            Some(sig) => sig,
             None => {
                 self.error(format!("undefined function '{name}'"), span);
                 return Type::Unit;
@@ -336,7 +336,7 @@ impl<'a> Checker<'a> {
                 );
             }
         }
-        sig.ret
+        sig.ret.clone()
     }
 
     fn check_field(&mut self, base: &Expr, field: &str, span: Span) -> Type {
@@ -348,7 +348,6 @@ impl<'a> Checker<'a> {
                 return Type::Unit;
             }
         };
-        // Clone the field type so no borrow of `self.table` is held across `self.error`.
         let field_ty = self
             .table
             .structs
@@ -368,8 +367,9 @@ impl<'a> Checker<'a> {
     }
 
     fn check_struct_lit(&mut self, name: &str, fields: &[(String, Expr)], span: Span) -> Type {
-        let decl = match self.table.structs.get(name) {
-            Some(st) => st.clone(),
+        let table = self.table;
+        let decl = match table.structs.get(name) {
+            Some(st) => st,
             None => {
                 self.error(format!("unknown struct '{name}'"), span);
                 for (_, value) in fields {
@@ -414,11 +414,14 @@ impl<'a> Checker<'a> {
         Type::Struct(name.to_string())
     }
 
+    /// The innermost binding for `name`, searching scopes inside-out.
+    fn find_var(&self, name: &str) -> Option<&VarInfo> {
+        self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
     fn lookup(&mut self, name: &str, span: Span) -> Type {
-        for scope in self.scopes.iter().rev() {
-            if let Some(info) = scope.get(name) {
-                return info.ty.clone();
-            }
+        if let Some(info) = self.find_var(name) {
+            return info.ty.clone();
         }
         self.error(format!("undefined variable '{name}'"), span);
         Type::Unit
