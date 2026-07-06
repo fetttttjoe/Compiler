@@ -378,7 +378,14 @@ impl<'a> Checker<'a> {
                 return Type::Unit;
             }
         };
+        let mut seen = HashSet::new();
         for (fname, value) in fields {
+            if !seen.insert(fname.clone()) {
+                self.error(
+                    format!("duplicate field '{fname}' in struct literal"),
+                    value.span(),
+                );
+            }
             let got = self.type_of_expr(value);
             match decl.fields.iter().find(|(dn, _)| dn == fname) {
                 Some((_, expected)) => {
@@ -546,6 +553,17 @@ mod tests {
         let d = diags("struct P { x: int } fun f(): int { const p = P { x: 1.0 }; return 1; }");
         assert!(
             d.iter().any(|e| e.message.contains("field 'x' expects int")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_struct_literal_field_is_an_error() {
+        let d = diags(
+            "struct P { x: int } fun f(): int { const p = P { x: 1, x: 2 }; return 1; }",
+        );
+        assert!(
+            d.iter().any(|e| e.message.contains("duplicate field 'x'")),
             "{d:?}"
         );
     }
