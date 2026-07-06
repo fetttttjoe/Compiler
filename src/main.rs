@@ -16,6 +16,10 @@ fun substract(a: int, b: int): int {
     const result = a - b;
     return result;
 }
+
+fun main(): int {
+    return substract(10, 4);
+}
 "#;
 
     let index = LineIndex::new(source);
@@ -39,5 +43,11 @@ fun substract(a: int, b: int): int {
         std::process::exit(1);
     }
 
-    println!("{ast:#?}");
+    match interpreter::interpret(&ast) {
+        Ok(value) => println!("=> {value:?}"),
+        Err(diag) => {
+            eprintln!("{}", diag.render(&index));
+            std::process::exit(1);
+        }
+    }
 }
