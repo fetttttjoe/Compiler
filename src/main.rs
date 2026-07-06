@@ -1,6 +1,7 @@
 mod ast;
 mod check;
 mod diagnostic;
+mod interpreter;
 mod lexer;
 mod parser;
 mod span;
