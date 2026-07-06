@@ -40,6 +40,10 @@ impl Lexer<'_> {
         Some(c)
     }
 
+    fn error(&mut self, message: String, span: Span) {
+        self.diagnostics.push(Diagnostic::error(message, span));
+    }
+
     fn skip_whitespace(&mut self) {
         while matches!(self.peek(), Some(c) if syntax::is_whitespace(c)) {
             self.bump();
@@ -92,10 +96,10 @@ impl Lexer<'_> {
             other => {
                 let start = self.pos;
                 self.bump();
-                self.diagnostics.push(Diagnostic::error(
+                self.error(
                     format!("unexpected character '{other}'"),
                     Span::new(start, self.pos),
-                ));
+                );
                 None
             }
         }
@@ -114,10 +118,10 @@ impl Lexer<'_> {
             self.bump();
             Some(both)
         } else {
-            self.diagnostics.push(Diagnostic::error(
+            self.error(
                 format!("expected '{first}{first}'"),
                 Span::new(start, self.pos),
-            ));
+            );
             None
         }
     }
@@ -160,10 +164,10 @@ impl Lexer<'_> {
             match text.parse::<f64>() {
                 Ok(f) => Some(TokenKind::FloatLiteral(f)),
                 Err(_) => {
-                    self.diagnostics.push(Diagnostic::error(
+                    self.error(
                         format!("invalid float literal '{text}'"),
                         Span::new(start, self.pos),
-                    ));
+                    );
                     None
                 }
             }
@@ -171,10 +175,10 @@ impl Lexer<'_> {
             match text.parse::<i64>() {
                 Ok(n) => Some(TokenKind::IntLiteral(n)),
                 Err(_) => {
-                    self.diagnostics.push(Diagnostic::error(
+                    self.error(
                         format!("integer literal '{text}' out of range"),
                         Span::new(start, self.pos),
-                    ));
+                    );
                     Some(TokenKind::IntLiteral(0)) // recover with a placeholder value
                 }
             }

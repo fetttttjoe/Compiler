@@ -21,11 +21,17 @@ impl Parser<'_> {
         matches!(self.peek().kind, TokenKind::Eof)
     }
 
-    fn advance(&mut self) -> Token {
-        let tok = self.tokens[self.pos].clone();
+    /// Steps past the current token without cloning it. Use when the token's
+    /// value is not needed; `advance` returns the (cloned) token instead.
+    fn bump(&mut self) {
         if self.pos + 1 < self.tokens.len() {
             self.pos += 1;
         }
+    }
+
+    fn advance(&mut self) -> Token {
+        let tok = self.tokens[self.pos].clone();
+        self.bump();
         tok
     }
 
@@ -35,7 +41,7 @@ impl Parser<'_> {
 
     fn eat(&mut self, kind: &TokenKind) -> bool {
         if self.check(kind) {
-            self.advance();
+            self.bump();
             true
         } else {
             false
@@ -44,7 +50,9 @@ impl Parser<'_> {
 
     fn expect(&mut self, kind: TokenKind) -> Span {
         if self.check(&kind) {
-            self.advance().span
+            let span = self.peek().span;
+            self.bump();
+            span
         } else {
             let tok = self.peek().clone();
             self.error(
@@ -58,7 +66,7 @@ impl Parser<'_> {
     fn expect_identifier(&mut self) -> String {
         let tok = self.peek().clone();
         if let TokenKind::Identifier(name) = tok.kind {
-            self.advance();
+            self.bump();
             name
         } else {
             self.error(
@@ -77,15 +85,15 @@ impl Parser<'_> {
         let tok = self.peek().clone();
         match tok.kind {
             TokenKind::IntType => {
-                self.advance();
+                self.bump();
                 TypeAnn::Int
             }
             TokenKind::FloatType => {
-                self.advance();
+                self.bump();
                 TypeAnn::Float
             }
             TokenKind::Identifier(n) => {
-                self.advance();
+                self.bump();
                 TypeAnn::Named(n)
             }
             other => {
@@ -129,7 +137,7 @@ impl Parser<'_> {
             params,
             return_type,
             body,
-            span: Span::new(start.start, end.end),
+            span: start.to(end),
         }
     }
 
@@ -151,7 +159,7 @@ impl Parser<'_> {
         Struct {
             name,
             fields,
-            span: Span::new(start.start, end.end),
+            span: start.to(end),
         }
     }
 
@@ -159,16 +167,16 @@ impl Parser<'_> {
     /// least the offending token — recovery that makes no progress would leave
     /// the caller's loop stuck on the same token forever.
     fn synchronize(&mut self) {
-        self.advance();
+        self.bump();
         while !self.at_eof() {
             match self.peek().kind {
                 TokenKind::Semicolon => {
-                    self.advance();
+                    self.bump();
                     return;
                 }
                 TokenKind::RightBrace | TokenKind::Fun | TokenKind::Struct => return,
                 _ => {
-                    self.advance();
+                    self.bump();
                 }
             }
         }
@@ -193,9 +201,9 @@ impl Parser<'_> {
             if prec.left_bp() < min_bp {
                 break;
             }
-            self.advance(); // operator
+            self.bump(); // operator
             let rhs = self.parse_expr(prec.right_bp());
-            let span = Span::new(lhs.span().start, rhs.span().end);
+            let span = lhs.span().to(rhs.span());
             lhs = Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
@@ -213,9 +221,9 @@ impl Parser<'_> {
             TokenKind::Bang => UnOp::Not,
             _ => return self.parse_atom(),
         };
-        self.advance();
+        self.bump();
         let rhs = self.parse_expr(PREFIX_BP);
-        let span = Span::new(tok.span.start, rhs.span().end);
+        let span = tok.span.to(rhs.span());
         Expr::Unary {
             op,
             rhs: Box::new(rhs),
@@ -255,7 +263,7 @@ impl Parser<'_> {
     fn parse_postfix(&mut self, lhs: Expr) -> Expr {
         match self.peek().kind {
             TokenKind::LeftParen => {
-                self.advance();
+                self.bump();
                 let mut args = Vec::new();
                 while !self.check(&TokenKind::RightParen) && !self.at_eof() {
                     args.push(self.parse_expr(0));
@@ -264,7 +272,7 @@ impl Parser<'_> {
                     }
                 }
                 let end = self.expect(TokenKind::RightParen);
-                let span = Span::new(lhs.span().start, end.end);
+                let span = lhs.span().to(end);
                 Expr::Call {
                     callee: Box::new(lhs),
                     args,
@@ -272,7 +280,7 @@ impl Parser<'_> {
                 }
             }
             TokenKind::Dot => {
-                self.advance();
+                self.bump();
                 let field = self.advance();
                 let (name, name_span) = match field.kind {
                     TokenKind::Identifier(n) => (n, field.span),
@@ -284,7 +292,7 @@ impl Parser<'_> {
                         (String::new(), field.span)
                     }
                 };
-                let span = Span::new(lhs.span().start, name_span.end);
+                let span = lhs.span().to(name_span);
                 Expr::Field {
                     base: Box::new(lhs),
                     name,
@@ -311,7 +319,7 @@ impl Parser<'_> {
         Expr::StructLit {
             name,
             fields,
-            span: Span::new(start.start, end.end),
+            span: start.to(end),
         }
     }
 
@@ -320,7 +328,7 @@ impl Parser<'_> {
         match tok.kind {
             TokenKind::Var | TokenKind::Const => {
                 let mutable = matches!(tok.kind, TokenKind::Var);
-                self.advance();
+                self.bump();
                 let name = self.expect_identifier();
                 self.expect(TokenKind::Equals);
                 let value = self.parse_expr(0);
@@ -329,11 +337,11 @@ impl Parser<'_> {
                     mutable,
                     name,
                     value,
-                    span: Span::new(tok.span.start, end.end),
+                    span: tok.span.to(end),
                 }
             }
             TokenKind::Return => {
-                self.advance();
+                self.bump();
                 let value = if self.check(&TokenKind::Semicolon) {
                     None
                 } else {
@@ -342,7 +350,7 @@ impl Parser<'_> {
                 let end = self.expect(TokenKind::Semicolon);
                 Stmt::Return {
                     value,
-                    span: Span::new(tok.span.start, end.end),
+                    span: tok.span.to(end),
                 }
             }
             _ => {
@@ -351,14 +359,14 @@ impl Parser<'_> {
                 if let Expr::Ident(name, ident_span) = &expr {
                     if self.check(&TokenKind::Equals) {
                         let name = name.clone();
-                        let start = ident_span.start;
-                        self.advance(); // '='
+                        let start = *ident_span;
+                        self.bump(); // '='
                         let value = self.parse_expr(0);
                         let end = self.expect(TokenKind::Semicolon);
                         return Stmt::Assign {
                             name,
                             value,
-                            span: Span::new(start, end.end),
+                            span: start.to(end),
                         };
                     }
                 }
@@ -416,7 +424,7 @@ const PREFIX_BP: u8 = 12;
 /// Postfix (call `(`, field `.`) binds tighter than everything, including prefix.
 const POSTFIX_BP: u8 = 14;
 
-fn describe(kind: &TokenKind) -> String {
+fn describe(kind: &TokenKind) -> &'static str {
     use TokenKind::*;
     match kind {
         Fun => "'fun'",
@@ -450,9 +458,11 @@ fn describe(kind: &TokenKind) -> String {
         PipePipe => "'||'",
         Eof => "end of input",
     }
-    .to_string()
 }
 
+/// Parses a token stream (which must end in `Eof`) into top-level items,
+/// collecting diagnostics and recovering at item boundaries instead of failing
+/// on the first error.
 pub fn parse(tokens: &[Token]) -> (Ast, Vec<Diagnostic>) {
     let mut parser = Parser {
         tokens,

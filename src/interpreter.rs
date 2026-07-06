@@ -98,16 +98,16 @@ impl<'a> Interp<'a> {
             }
             Stmt::Assign { name, value, span } => {
                 let v = self.eval(value)?;
-                for scope in self.scopes.iter_mut().rev() {
-                    if scope.contains_key(name) {
-                        scope.insert(name.clone(), v);
-                        return Ok(Flow::Normal);
+                match self.scopes.iter_mut().rev().find_map(|s| s.get_mut(name)) {
+                    Some(slot) => {
+                        *slot = v;
+                        Ok(Flow::Normal)
                     }
+                    None => Err(Diagnostic::error(
+                        format!("undefined variable '{name}'"),
+                        *span,
+                    )),
                 }
-                Err(Diagnostic::error(
-                    format!("undefined variable '{name}'"),
-                    *span,
-                ))
             }
         }
     }
