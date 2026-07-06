@@ -96,7 +96,19 @@ impl<'a> Interp<'a> {
                 self.eval(e)?;
                 Ok(Flow::Normal)
             }
-            Stmt::Assign { .. } => Ok(Flow::Normal), // implemented in Task 13
+            Stmt::Assign { name, value, span } => {
+                let v = self.eval(value)?;
+                for scope in self.scopes.iter_mut().rev() {
+                    if scope.contains_key(name) {
+                        scope.insert(name.clone(), v);
+                        return Ok(Flow::Normal);
+                    }
+                }
+                Err(Diagnostic::error(
+                    format!("undefined variable '{name}'"),
+                    *span,
+                ))
+            }
         }
     }
 
@@ -114,10 +126,35 @@ impl<'a> Interp<'a> {
                 let r = self.eval(rhs)?;
                 eval_binary(*op, l, r, *span)
             }
-            // Call added in Task 13.
-            _ => Err(Diagnostic::error(
-                "evaluation not yet supported",
-                expr.span(),
+            Expr::Call { callee, args, span } => {
+                let name = match callee.as_ref() {
+                    Expr::Ident(n, _) => n.clone(),
+                    _ => {
+                        return Err(Diagnostic::error(
+                            "only named functions can be called",
+                            *span,
+                        ))
+                    }
+                };
+                let func = match self.functions.get(name.as_str()).copied() {
+                    Some(f) => f,
+                    None => {
+                        return Err(Diagnostic::error(
+                            format!("undefined function '{name}'"),
+                            *span,
+                        ))
+                    }
+                };
+                let mut argv = Vec::with_capacity(args.len());
+                for arg in args {
+                    argv.push(self.eval(arg)?);
+                }
+                self.call(func, argv, *span)
+            }
+            // Struct runtime values are deferred (they still parse and type-check).
+            Expr::Field { span, .. } | Expr::StructLit { span, .. } => Err(Diagnostic::error(
+                "struct values are not yet supported at runtime",
+                *span,
             )),
         }
     }
@@ -194,7 +231,9 @@ fn int_arith(op: BinOp, a: i64, b: i64, span: Span) -> Result<Value, Diagnostic>
     Ok(Value::Int(v))
 }
 
-fn float_arith(op: BinOp, a: f64, b: f64, span: Span) -> Result<Value, Diagnostic> {
+// `_span` kept for signature symmetry with `int_arith`; floats have no
+// erroring operations (division by zero is IEEE infinity).
+fn float_arith(op: BinOp, a: f64, b: f64, _span: Span) -> Result<Value, Diagnostic> {
     let v = match op {
         BinOp::Add => a + b,
         BinOp::Sub => a - b,
@@ -253,5 +292,26 @@ mod tests {
     #[test]
     fn division_by_zero_is_a_runtime_error() {
         assert!(run("fun main(): int { return 10 / 0; }").is_err());
+    }
+
+    #[test]
+    fn end_to_end_function_calls() {
+        let program = "\
+fun square(n: int): int { return n * n; }
+fun main(): int {
+    const a = square(3);
+    var b = 4;
+    b = b + a;
+    return b;
+}";
+        assert_eq!(run(program), Ok(Value::Int(13)));
+    }
+
+    #[test]
+    fn nested_calls() {
+        let program = "\
+fun inc(n: int): int { return n + 1; }
+fun main(): int { return inc(inc(inc(0))); }";
+        assert_eq!(run(program), Ok(Value::Int(3)));
     }
 }
