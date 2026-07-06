@@ -92,6 +92,14 @@ impl Parser<'_> {
     pub fn parse_expr(&mut self, min_bp: u8) -> Expr {
         let mut lhs = self.parse_prefix();
         loop {
+            // Postfix (call `(`, field `.`) binds tighter than every operator.
+            if matches!(self.peek().kind, TokenKind::LeftParen | TokenKind::Dot) {
+                if POSTFIX_BP < min_bp {
+                    break;
+                }
+                lhs = self.parse_postfix(lhs);
+                continue;
+            }
             let Some((prec, op)) = Precedence::of(&self.peek().kind) else {
                 break;
             };
@@ -133,7 +141,15 @@ impl Parser<'_> {
         match tok.kind {
             TokenKind::IntLiteral(n) => Expr::Int(n, tok.span),
             TokenKind::FloatLiteral(f) => Expr::Float(f, tok.span),
-            TokenKind::Identifier(name) => Expr::Ident(name, tok.span),
+            TokenKind::Identifier(name) => {
+                // ponytail: `Ident {` in expression position is a struct literal.
+                // Revisit this disambiguation when `if cond { … }` control flow lands.
+                if self.check(&TokenKind::LeftBrace) {
+                    self.parse_struct_literal(name, tok.span)
+                } else {
+                    Expr::Ident(name, tok.span)
+                }
+            }
             TokenKind::LeftParen => {
                 let inner = self.parse_expr(0);
                 self.expect(TokenKind::RightParen);
@@ -146,6 +162,69 @@ impl Parser<'_> {
                 );
                 Expr::Int(0, tok.span) // recovery placeholder
             }
+        }
+    }
+
+    fn parse_postfix(&mut self, lhs: Expr) -> Expr {
+        match self.peek().kind {
+            TokenKind::LeftParen => {
+                self.advance();
+                let mut args = Vec::new();
+                while !self.check(&TokenKind::RightParen) && !self.at_eof() {
+                    args.push(self.parse_expr(0));
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                let end = self.expect(TokenKind::RightParen);
+                let span = Span::new(lhs.span().start, end.end);
+                Expr::Call {
+                    callee: Box::new(lhs),
+                    args,
+                    span,
+                }
+            }
+            TokenKind::Dot => {
+                self.advance();
+                let field = self.advance();
+                let (name, name_span) = match field.kind {
+                    TokenKind::Identifier(n) => (n, field.span),
+                    other => {
+                        self.error(
+                            format!("expected a field name, found {}", describe(&other)),
+                            field.span,
+                        );
+                        (String::new(), field.span)
+                    }
+                };
+                let span = Span::new(lhs.span().start, name_span.end);
+                Expr::Field {
+                    base: Box::new(lhs),
+                    name,
+                    span,
+                }
+            }
+            _ => unreachable!("parse_postfix called on a non-postfix token"),
+        }
+    }
+
+    fn parse_struct_literal(&mut self, name: String, start: Span) -> Expr {
+        self.expect(TokenKind::LeftBrace);
+        let mut fields = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.at_eof() {
+            let field_name = self.expect_identifier();
+            self.expect(TokenKind::Colon);
+            let value = self.parse_expr(0);
+            fields.push((field_name, value));
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self.expect(TokenKind::RightBrace);
+        Expr::StructLit {
+            name,
+            fields,
+            span: Span::new(start.start, end.end),
         }
     }
 }
@@ -193,6 +272,9 @@ impl Precedence {
 
 /// Unary prefix operators bind tighter than every binary operator.
 const PREFIX_BP: u8 = 12;
+
+/// Postfix (call `(`, field `.`) binds tighter than everything, including prefix.
+const POSTFIX_BP: u8 = 14;
 
 fn describe(kind: &TokenKind) -> String {
     use TokenKind::*;
@@ -268,5 +350,28 @@ mod tests {
     #[test]
     fn parentheses_override_precedence() {
         assert_eq!(expr("(a - b) * c").sexpr(), "(* (- a b) c)");
+    }
+
+    #[test]
+    fn function_call() {
+        assert_eq!(expr("f(a, b)").sexpr(), "(call f a b)");
+    }
+
+    #[test]
+    fn field_access_chains_left() {
+        assert_eq!(expr("a.b.c").sexpr(), "(. (. a b) c)");
+    }
+
+    #[test]
+    fn call_then_field_access() {
+        assert_eq!(expr("f(x).y").sexpr(), "(. (call f x) y)");
+    }
+
+    #[test]
+    fn struct_literal() {
+        assert_eq!(
+            expr("Point { x: 1, y: 2 }").sexpr(),
+            "(struct Point x=1 y=2)"
+        );
     }
 }
