@@ -155,8 +155,11 @@ impl Parser<'_> {
         }
     }
 
-    /// Recovery: skip to the next statement/item boundary.
+    /// Recovery: skip to the next statement/item boundary. Always consumes at
+    /// least the offending token — recovery that makes no progress would leave
+    /// the caller's loop stuck on the same token forever.
     fn synchronize(&mut self) {
+        self.advance();
         while !self.at_eof() {
             match self.peek().kind {
                 TokenKind::Semicolon => {
@@ -637,6 +640,16 @@ mod tests {
     fn recovers_from_a_bad_top_level_token() {
         // A stray token is reported, then parsing resumes at `fun`.
         let (tokens, _) = lex("42 fun ok(): int { return 1; }");
+        let (ast, pd) = parse(&tokens);
+        assert_eq!(pd.len(), 1);
+        assert_eq!(ast.len(), 1);
+    }
+
+    #[test]
+    fn recovers_from_a_stray_top_level_right_brace() {
+        // Regression: `synchronize()` used to return without consuming a
+        // stray `}`, leaving `parse()` stuck on the same token forever.
+        let (tokens, _) = lex("} fun ok(): int { return 1; }");
         let (ast, pd) = parse(&tokens);
         assert_eq!(pd.len(), 1);
         assert_eq!(ast.len(), 1);
