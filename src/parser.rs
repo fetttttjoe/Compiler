@@ -1,4 +1,6 @@
-use crate::ast::{BinOp, Expr, Stmt, UnOp};
+use crate::ast::{
+    Ast, BinOp, Expr, Field, Function, Item, Param, Stmt, Struct, TypeAnn, UnOp,
+};
 use crate::diagnostic::Diagnostic;
 use crate::span::Span;
 use crate::token::{Token, TokenKind};
@@ -69,6 +71,88 @@ impl Parser<'_> {
 
     fn error(&mut self, message: String, span: Span) {
         self.diagnostics.push(Diagnostic::error(message, span));
+    }
+
+    fn parse_type(&mut self) -> TypeAnn {
+        let tok = self.peek().clone();
+        match tok.kind {
+            TokenKind::IntType => {
+                self.advance();
+                TypeAnn::Int
+            }
+            TokenKind::FloatType => {
+                self.advance();
+                TypeAnn::Float
+            }
+            TokenKind::Identifier(n) => {
+                self.advance();
+                TypeAnn::Named(n)
+            }
+            other => {
+                self.error(
+                    format!("expected a type, found {}", describe(&other)),
+                    tok.span,
+                );
+                TypeAnn::Int // recovery default
+            }
+        }
+    }
+
+    fn parse_function(&mut self) -> Function {
+        let start = self.expect(TokenKind::Fun);
+        let name = self.expect_identifier();
+        self.expect(TokenKind::LeftParen);
+        let mut params = Vec::new();
+        while !self.check(&TokenKind::RightParen) && !self.at_eof() {
+            let param_name = self.expect_identifier();
+            self.expect(TokenKind::Colon);
+            let ty = self.parse_type();
+            params.push(Param { name: param_name, ty });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RightParen);
+        let return_type = if self.eat(&TokenKind::Colon) {
+            Some(self.parse_type())
+        } else {
+            None
+        };
+        self.expect(TokenKind::LeftBrace);
+        let mut body = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.at_eof() {
+            body.push(self.parse_stmt());
+        }
+        let end = self.expect(TokenKind::RightBrace);
+        Function {
+            name,
+            params,
+            return_type,
+            body,
+            span: Span::new(start.start, end.end),
+        }
+    }
+
+    fn parse_struct(&mut self) -> Struct {
+        let start = self.expect(TokenKind::Struct);
+        let name = self.expect_identifier();
+        self.expect(TokenKind::LeftBrace);
+        let mut fields = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.at_eof() {
+            let field_name = self.expect_identifier();
+            self.expect(TokenKind::Colon);
+            let ty = self.parse_type();
+            fields.push(Field { name: field_name, ty });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self.expect(TokenKind::RightBrace);
+        Struct {
+            name,
+            fields,
+            span: Span::new(start.start, end.end),
+        }
     }
 
     /// Recovery: skip to the next statement/item boundary.
@@ -366,6 +450,30 @@ fn describe(kind: &TokenKind) -> String {
     .to_string()
 }
 
+pub fn parse(tokens: &[Token]) -> (Ast, Vec<Diagnostic>) {
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        diagnostics: Vec::new(),
+    };
+    let mut items = Vec::new();
+    while !parser.at_eof() {
+        match parser.peek().kind {
+            TokenKind::Fun => items.push(Item::Function(parser.parse_function())),
+            TokenKind::Struct => items.push(Item::Struct(parser.parse_struct())),
+            _ => {
+                let tok = parser.peek().clone();
+                parser.error(
+                    format!("expected 'fun' or 'struct', found {}", describe(&tok.kind)),
+                    tok.span,
+                );
+                parser.synchronize();
+            }
+        }
+    }
+    (items, parser.diagnostics)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +598,47 @@ mod tests {
             Stmt::Expr(e) => assert_eq!(e.sexpr(), "(call f x)"),
             other => panic!("expected Expr statement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_a_function() {
+        let (tokens, ld) = lex("fun add(a: int, b: int): int { return a + b; }");
+        assert!(ld.is_empty());
+        let (ast, pd) = parse(&tokens);
+        assert!(pd.is_empty(), "parse errors: {pd:?}");
+        assert_eq!(ast.len(), 1);
+        match &ast[0] {
+            Item::Function(f) => {
+                assert_eq!(f.name, "add");
+                assert_eq!(f.params.len(), 2);
+                assert_eq!(f.return_type, Some(TypeAnn::Int));
+                assert_eq!(f.body.len(), 1);
+            }
+            other => panic!("expected function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_a_struct() {
+        let (tokens, _) = lex("struct Point { x: int, y: float }");
+        let (ast, pd) = parse(&tokens);
+        assert!(pd.is_empty(), "parse errors: {pd:?}");
+        match &ast[0] {
+            Item::Struct(s) => {
+                assert_eq!(s.name, "Point");
+                assert_eq!(s.fields.len(), 2);
+                assert_eq!(s.fields[1].ty, TypeAnn::Float);
+            }
+            other => panic!("expected struct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovers_from_a_bad_top_level_token() {
+        // A stray token is reported, then parsing resumes at `fun`.
+        let (tokens, _) = lex("42 fun ok(): int { return 1; }");
+        let (ast, pd) = parse(&tokens);
+        assert_eq!(pd.len(), 1);
+        assert_eq!(ast.len(), 1);
     }
 }
