@@ -19,13 +19,9 @@ pub struct LineIndex {
 
 impl LineIndex {
     pub fn new(source: &str) -> Self {
-        let mut line_starts = vec![0];
-        for (i, b) in source.bytes().enumerate() {
-            if b == b'\n' {
-                line_starts.push(i + 1);
-            }
+        LineIndex {
+            line_starts: crate::syntax::line_starts(source),
         }
-        LineIndex { line_starts }
     }
 
     /// Returns (line, column), both 1-based.
@@ -50,5 +46,14 @@ mod tests {
         assert_eq!(index.locate(3), (2, 1)); // 'c'
         assert_eq!(index.locate(5), (2, 3)); // 'e'
         assert_eq!(index.locate(7), (3, 1)); // 'f'
+    }
+
+    #[test]
+    fn locate_handles_crlf_and_cr_line_endings() {
+        let crlf = LineIndex::new("ab\r\ncd");
+        assert_eq!(crlf.locate(5), (2, 2)); // 'd' on line 2
+
+        let cr = LineIndex::new("ab\rcd");
+        assert_eq!(cr.locate(4), (2, 2)); // 'd' on line 2
     }
 }
