@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, Expr, UnOp};
+use crate::ast::{BinOp, Expr, Stmt, UnOp};
 use crate::diagnostic::Diagnostic;
 use crate::span::Span;
 use crate::token::{Token, TokenKind};
@@ -227,6 +227,59 @@ impl Parser<'_> {
             span: Span::new(start.start, end.end),
         }
     }
+
+    pub fn parse_stmt(&mut self) -> Stmt {
+        let tok = self.peek().clone();
+        match tok.kind {
+            TokenKind::Var | TokenKind::Const => {
+                let mutable = matches!(tok.kind, TokenKind::Var);
+                self.advance();
+                let name = self.expect_identifier();
+                self.expect(TokenKind::Equals);
+                let value = self.parse_expr(0);
+                let end = self.expect(TokenKind::Semicolon);
+                Stmt::Let {
+                    mutable,
+                    name,
+                    value,
+                    span: Span::new(tok.span.start, end.end),
+                }
+            }
+            TokenKind::Return => {
+                self.advance();
+                let value = if self.check(&TokenKind::Semicolon) {
+                    None
+                } else {
+                    Some(self.parse_expr(0))
+                };
+                let end = self.expect(TokenKind::Semicolon);
+                Stmt::Return {
+                    value,
+                    span: Span::new(tok.span.start, end.end),
+                }
+            }
+            _ => {
+                let expr = self.parse_expr(0);
+                // `ident = expr;` is an assignment; anything else is an expression statement.
+                if let Expr::Ident(name, ident_span) = &expr {
+                    if self.check(&TokenKind::Equals) {
+                        let name = name.clone();
+                        let start = ident_span.start;
+                        self.advance(); // '='
+                        let value = self.parse_expr(0);
+                        let end = self.expect(TokenKind::Semicolon);
+                        return Stmt::Assign {
+                            name,
+                            value,
+                            span: Span::new(start, end.end),
+                        };
+                    }
+                }
+                self.expect(TokenKind::Semicolon);
+                Stmt::Expr(expr)
+            }
+        }
+    }
 }
 
 /// Operator precedence, lowest to highest. Declaration order *is* the ranking —
@@ -373,5 +426,69 @@ mod tests {
             expr("Point { x: 1, y: 2 }").sexpr(),
             "(struct Point x=1 y=2)"
         );
+    }
+
+    fn stmt(src: &str) -> Stmt {
+        let (tokens, diags) = lex(src);
+        assert!(diags.is_empty(), "lex errors: {diags:?}");
+        let mut p = Parser {
+            tokens: &tokens,
+            pos: 0,
+            diagnostics: Vec::new(),
+        };
+        let s = p.parse_stmt();
+        assert!(p.diagnostics.is_empty(), "parse errors: {:?}", p.diagnostics);
+        s
+    }
+
+    #[test]
+    fn const_binding_is_immutable() {
+        match stmt("const x = a + 1;") {
+            Stmt::Let { mutable, name, value, .. } => {
+                assert!(!mutable);
+                assert_eq!(name, "x");
+                assert_eq!(value.sexpr(), "(+ a 1)");
+            }
+            other => panic!("expected Let, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn var_binding_is_mutable() {
+        match stmt("var y = 2;") {
+            Stmt::Let { mutable, .. } => assert!(mutable),
+            other => panic!("expected Let, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn return_with_and_without_value() {
+        match stmt("return a * b;") {
+            Stmt::Return { value: Some(e), .. } => assert_eq!(e.sexpr(), "(* a b)"),
+            other => panic!("expected Return, got {other:?}"),
+        }
+        match stmt("return;") {
+            Stmt::Return { value: None, .. } => {}
+            other => panic!("expected empty Return, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assignment_statement() {
+        match stmt("x = 5;") {
+            Stmt::Assign { name, value, .. } => {
+                assert_eq!(name, "x");
+                assert_eq!(value.sexpr(), "5");
+            }
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expression_statement() {
+        match stmt("f(x);") {
+            Stmt::Expr(e) => assert_eq!(e.sexpr(), "(call f x)"),
+            other => panic!("expected Expr statement, got {other:?}"),
+        }
     }
 }
