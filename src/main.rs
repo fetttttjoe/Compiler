@@ -2,6 +2,7 @@
 
 mod lexer;
 mod ast;
+mod span;
 
 
 fn main() {
