@@ -36,6 +36,8 @@ multi-file CLI without disturbing the phase contracts.
    file is an error): without imports there is no way to disambiguate a call,
    so last-one-wins would be a silent footgun. Per-file/module namespaces
    arrive with the module system (own design round).
+   > **Superseded by ADR 0004:** per-file namespaces and `import`/`export`
+   > landed; compilation is now entry-point driven.
 5. **Determinism is a contract.** Front-end diagnostics sort by
    `(span.start, span.end)` (stable sort) before reporting — same input,
    byte-identical output, regardless of thread scheduling. Item merge order
