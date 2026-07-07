@@ -55,6 +55,9 @@ pub const KW_FALSE: &str = "false";
 pub const KW_IF: &str = "if";
 pub const KW_ELSE: &str = "else";
 pub const KW_WHILE: &str = "while";
+pub const KW_IMPORT: &str = "import";
+pub const KW_EXPORT: &str = "export";
+pub const KW_FROM: &str = "from";
 
 /// True for a source line break (`\n` or `\r`). CRLF is handled by the caller
 /// consuming the trailing `\n`.

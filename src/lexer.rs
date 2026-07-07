@@ -290,6 +290,9 @@ impl Lexer<'_> {
             syntax::KW_IF => TokenKind::If,
             syntax::KW_ELSE => TokenKind::Else,
             syntax::KW_WHILE => TokenKind::While,
+            syntax::KW_IMPORT => TokenKind::Import,
+            syntax::KW_EXPORT => TokenKind::Export,
+            syntax::KW_FROM => TokenKind::From,
             syntax::KW_TRUE => TokenKind::True,
             syntax::KW_FALSE => TokenKind::False,
             syntax::KW_INT => TokenKind::IntType,
@@ -395,6 +398,19 @@ mod tests {
                 TokenKind::Bang,
                 TokenKind::Less,
                 TokenKind::Greater,
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn module_keywords() {
+        assert_eq!(
+            kinds("import export from"),
+            vec![
+                TokenKind::Import,
+                TokenKind::Export,
+                TokenKind::From,
                 TokenKind::Eof
             ]
         );
