@@ -27,7 +27,7 @@ impl Diagnostic {
     ///
     /// ```text
     /// error: cannot apply '+' to string and int
-    ///  --> src/main.lang:3:15
+    ///  --> src/main.ys:3:15
     ///   |
     /// 3 |     const x = s + 1;
     ///   |               ^^^^^
@@ -78,34 +78,34 @@ mod tests {
     #[test]
     fn render_shows_file_line_and_caret_underline() {
         let mut map = SourceMap::new();
-        map.add("main.lang", "fun f()\n  bad + 1;");
+        map.add("main.ys", "fun f()\n  bad + 1;");
         let diag = Diagnostic::error("undefined variable 'bad'", Span::new(10, 13));
         assert_eq!(
             diag.render(&map),
-            "error: undefined variable 'bad'\n --> main.lang:2:3\n  |\n2 |   bad + 1;\n  |   ^^^"
+            "error: undefined variable 'bad'\n --> main.ys:2:3\n  |\n2 |   bad + 1;\n  |   ^^^"
         );
     }
 
     #[test]
     fn render_points_into_the_second_file() {
         let mut map = SourceMap::new();
-        map.add("a.lang", "one");
-        let base = map.add("b.lang", "\tx + 1.0;");
+        map.add("a.ys", "one");
+        let base = map.add("b.ys", "\tx + 1.0;");
         let diag = Diagnostic::error("mismatched type", Span::new(base + 5, base + 8));
         assert_eq!(
             diag.render(&map),
-            "error: mismatched type\n --> b.lang:1:6\n  |\n1 | \tx + 1.0;\n  | \t    ^^^"
+            "error: mismatched type\n --> b.ys:1:6\n  |\n1 | \tx + 1.0;\n  | \t    ^^^"
         );
     }
 
     #[test]
     fn render_clamps_eof_spans_to_one_caret() {
         let mut map = SourceMap::new();
-        map.add("a.lang", "a\r\nbb");
+        map.add("a.ys", "a\r\nbb");
         let eof = Diagnostic::error("unexpected end of input", Span::new(5, 5));
         assert_eq!(
             eof.render(&map),
-            "error: unexpected end of input\n --> a.lang:2:3\n  |\n2 | bb\n  |   ^"
+            "error: unexpected end of input\n --> a.ys:2:3\n  |\n2 | bb\n  |   ^"
         );
     }
 }

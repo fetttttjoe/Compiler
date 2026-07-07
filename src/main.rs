@@ -109,8 +109,8 @@ mod tests {
     #[test]
     fn cross_file_calls_compile_and_run() {
         let mut map = SourceMap::new();
-        map.add("lib.lang", "fun forty(): int { return 40; }");
-        map.add("main.lang", "fun main(): int { return forty() + 2; }");
+        map.add("lib.ys", "fun forty(): int { return 40; }");
+        map.add("main.ys", "fun main(): int { return forty() + 2; }");
         let (ast, diags) = front_end(&map);
         assert!(diags.is_empty(), "{diags:?}");
         let (_t, cd) = check::check(&ast);
@@ -124,8 +124,8 @@ mod tests {
     #[test]
     fn duplicate_functions_across_files_are_reported() {
         let mut map = SourceMap::new();
-        map.add("a.lang", "fun f(): int { return 1; }");
-        map.add("b.lang", "fun f(): int { return 2; }");
+        map.add("a.ys", "fun f(): int { return 1; }");
+        map.add("b.ys", "fun f(): int { return 2; }");
         let (ast, diags) = front_end(&map);
         assert!(diags.is_empty(), "{diags:?}");
         let (_t, cd) = check::check(&ast);
@@ -138,10 +138,10 @@ mod tests {
     #[test]
     fn diagnostics_are_sorted_by_source_position_across_files() {
         let mut map = SourceMap::new();
-        map.add("a.lang", "fun f(): int { return 1; } #");
-        map.add("b.lang", "@ fun g(): int { return 2; }");
+        map.add("a.ys", "fun f(): int { return 1; } #");
+        map.add("b.ys", "@ fun g(): int { return 2; }");
         let (_ast, diags) = front_end(&map);
         assert_eq!(diags.len(), 2, "{diags:?}");
-        assert!(diags[0].span.start < diags[1].span.start, "a.lang first");
+        assert!(diags[0].span.start < diags[1].span.start, "a.ys first");
     }
 }

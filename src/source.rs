@@ -88,36 +88,36 @@ mod tests {
     #[test]
     fn add_assigns_bases_with_a_gap() {
         let mut map = SourceMap::new();
-        let a = map.add("a.lang", "ab");
-        let b = map.add("b.lang", "xyz");
+        let a = map.add("a.ys", "ab");
+        let b = map.add("b.ys", "xyz");
         assert_eq!(a, 0);
-        // +1 gap: a zero-width span at a.lang's EOF (offset 2) must not
-        // collide with b.lang's first byte.
+        // +1 gap: a zero-width span at a.ys's EOF (offset 2) must not
+        // collide with b.ys's first byte.
         assert_eq!(b, 3);
     }
 
     #[test]
     fn resolve_finds_the_right_file_line_and_column() {
         let mut map = SourceMap::new();
-        map.add("a.lang", "one\ntwo");
-        let base = map.add("b.lang", "alpha\nbeta");
+        map.add("a.ys", "one\ntwo");
+        let base = map.add("b.ys", "alpha\nbeta");
 
         let r = map.resolve(5); // 'w' in "two"
-        assert_eq!((r.file, r.line, r.col), ("a.lang", 2, 2));
+        assert_eq!((r.file, r.line, r.col), ("a.ys", 2, 2));
         assert_eq!(r.line_text, "two");
 
         let r = map.resolve(base + 7); // 'e' in "beta"
-        assert_eq!((r.file, r.line, r.col), ("b.lang", 2, 2));
+        assert_eq!((r.file, r.line, r.col), ("b.ys", 2, 2));
         assert_eq!(r.line_text, "beta");
     }
 
     #[test]
     fn resolve_handles_eof_offsets() {
         let mut map = SourceMap::new();
-        map.add("a.lang", "ab");
-        map.add("b.lang", "x");
-        // a.lang's EOF sentinel offset resolves into a.lang, not b.lang.
+        map.add("a.ys", "ab");
+        map.add("b.ys", "x");
+        // a.ys's EOF sentinel offset resolves into a.ys, not b.ys.
         let r = map.resolve(2);
-        assert_eq!((r.file, r.line, r.col), ("a.lang", 1, 3));
+        assert_eq!((r.file, r.line, r.col), ("a.ys", 1, 3));
     }
 }

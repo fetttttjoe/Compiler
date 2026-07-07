@@ -9,7 +9,7 @@ fn compiler(args: &[&str]) -> Output {
 
 #[test]
 fn runs_a_multi_file_program() {
-    let out = compiler(&["examples/math.lang", "examples/main.lang"]);
+    let out = compiler(&["examples/math.ys", "examples/main.ys"]);
     assert!(
         out.status.success(),
         "{}",
@@ -20,11 +20,11 @@ fn runs_a_multi_file_program() {
 
 #[test]
 fn reports_errors_with_file_locations_and_is_deterministic() {
-    let first = compiler(&["tests/fixtures/broken.lang"]);
-    let second = compiler(&["tests/fixtures/broken.lang"]);
+    let first = compiler(&["tests/fixtures/broken.ys"]);
+    let second = compiler(&["tests/fixtures/broken.ys"]);
     assert_eq!(first.status.code(), Some(1));
     let err = String::from_utf8_lossy(&first.stderr);
-    assert!(err.contains("--> tests/fixtures/broken.lang:2:12"), "{err}");
+    assert!(err.contains("--> tests/fixtures/broken.ys:2:12"), "{err}");
     assert!(err.contains("undefined variable 'undefined'"), "{err}");
     assert_eq!(
         first.stderr, second.stderr,
@@ -41,7 +41,7 @@ fn no_arguments_is_a_usage_error() {
 
 #[test]
 fn unreadable_file_is_a_clean_error() {
-    let out = compiler(&["no/such/file.lang"]);
+    let out = compiler(&["no/such/file.ys"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("cannot read"));
 }
