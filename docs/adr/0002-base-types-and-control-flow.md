@@ -66,3 +66,11 @@ analysis — matches what a future codegen can easily verify).
 
 **Deferred next:** struct values at runtime (`Value::Struct`), `else`-less
 match-style constructs, `for`, string interpolation, codegen (per ADR 0001).
+
+> **Amendment (2026-07-07):** struct values at runtime landed — literals
+> construct `Value::Struct` (fields stored sorted by name) and field access
+> reads it; evaluation stays in literal-written order. Struct equality landed
+> with it: `==`/`!=` compare structurally on matching struct types (identity
+> is (module, name), per ADR 0004). Field assignment landed too —
+> `Stmt::Assign` now takes a place expression (`x`, `p.x`, `o.i.v`); the
+> root variable must be `var`.

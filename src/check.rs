@@ -14,6 +14,10 @@ pub enum Type {
     /// A struct type identified by (defining module, name) — same-named
     /// structs in different modules are distinct types.
     Struct(usize, String),
+    /// `T?` — T or null.
+    Optional(Box<Type>),
+    /// The type of the `null` literal; fits only into `T?` slots.
+    Null,
     Unit,
 }
 
@@ -25,8 +29,25 @@ impl Type {
             Type::Bool => "bool".to_string(),
             Type::Str => "string".to_string(),
             Type::Struct(_, n) => n.clone(),
+            Type::Optional(inner) => format!("{}?", inner.name()),
+            Type::Null => "null".to_string(),
             Type::Unit => "unit".to_string(),
         }
+    }
+}
+
+/// Can a value of type `value` be stored where `target` is expected?
+/// Exact match, or `T`/`null` into `T?`. Never an implicit conversion —
+/// optionality is spelled in the target's type.
+fn fits(value: &Type, target: &Type) -> bool {
+    if value == target {
+        return true;
+    }
+    match target {
+        Type::Optional(inner) => {
+            matches!(value, Type::Null) || value == inner.as_ref()
+        }
+        _ => false,
     }
 }
 
@@ -39,6 +60,8 @@ pub struct FnSig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructType {
     pub fields: Vec<(String, Type)>,
+    /// True for `refstruct` declarations (reference semantics).
+    pub by_ref: bool,
 }
 
 /// A per-module view: visible name → the (module, name) that defines it.
@@ -49,6 +72,10 @@ type Alias = HashMap<String, (usize, String)>;
 /// alike. Consumed by the interpreter (and later codegen).
 pub struct Resolutions {
     pub functions: Vec<Alias>,
+    /// Per module: the visible type names that denote `refstruct`s, so the
+    /// interpreter (and later codegen) knows which literals allocate a
+    /// shared object instead of a value.
+    pub ref_structs: Vec<HashSet<String>>,
 }
 
 /// One module's declared names with their export flags.
@@ -157,7 +184,13 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                             )
                         })
                         .collect();
-                    structs.insert((mi, s.name.clone()), StructType { fields });
+                    structs.insert(
+                        (mi, s.name.clone()),
+                        StructType {
+                            fields,
+                            by_ref: s.by_ref,
+                        },
+                    );
                 }
                 Item::Function(f) => {
                     let params = f
@@ -190,6 +223,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                     structs: &structs,
                     diagnostics: &mut diags,
                     scopes: Vec::new(),
+                    nonnull: Vec::new(),
                     ret: Type::Unit,
                 };
                 checker.check_function(f);
@@ -197,7 +231,24 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
         }
     }
 
-    (Resolutions { functions: fn_aliases }, diags)
+    let ref_structs = ty_aliases
+        .iter()
+        .map(|alias| {
+            alias
+                .iter()
+                .filter(|(_, key)| structs.get(*key).is_some_and(|s| s.by_ref))
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .collect();
+
+    (
+        Resolutions {
+            functions: fn_aliases,
+            ref_structs,
+        },
+        diags,
+    )
 }
 
 fn collect_names(ast: &[Item], diags: &mut Vec<Diagnostic>) -> ModuleNames {
@@ -240,6 +291,9 @@ fn resolve_type(
         TypeAnn::Float => Type::Float,
         TypeAnn::Bool => Type::Bool,
         TypeAnn::Str => Type::Str,
+        TypeAnn::Optional(inner) => {
+            Type::Optional(Box::new(resolve_type(inner, ty_alias, span, diags)))
+        }
         TypeAnn::Named(name) => match ty_alias.get(name) {
             Some((m, n)) => Type::Struct(*m, n.clone()),
             None => {
@@ -268,6 +322,10 @@ struct Checker<'a> {
     structs: &'a HashMap<(usize, String), StructType>,
     diagnostics: &'a mut Vec<Diagnostic>,
     scopes: Vec<HashMap<String, VarInfo>>,
+    /// Narrowing stack: names proven non-null by an enclosing `!= null`
+    /// check. A narrowed `T?` reads as `T`; rebinding or shadowing a name
+    /// removes it from every set.
+    nonnull: Vec<HashSet<String>>,
     ret: Type,
 }
 
@@ -284,6 +342,7 @@ impl<'a> Checker<'a> {
             Type::Struct(m, n) if *m != self.module => {
                 format!("{n} (from {})", self.paths[*m])
             }
+            Type::Optional(inner) => format!("{}?", self.type_name(inner)),
             _ => t.name(),
         }
     }
@@ -309,14 +368,29 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Type-checks a nested block in its own scope: bindings made inside die
-    /// at the closing brace.
-    fn check_block(&mut self, stmts: &[Stmt]) {
+    /// Type-checks a nested block in its own scope (bindings made inside die
+    /// at the closing brace), with a set of names proven non-null for its
+    /// duration.
+    fn check_block_narrowed(&mut self, stmts: &[Stmt], nonnull: HashSet<String>) {
+        self.nonnull.push(nonnull);
         self.scopes.push(HashMap::new());
         for stmt in stmts {
             self.check_stmt(stmt);
         }
         self.scopes.pop();
+        self.nonnull.pop();
+    }
+
+    fn is_nonnull(&self, name: &str) -> bool {
+        self.nonnull.iter().any(|set| set.contains(name))
+    }
+
+    /// Drops `name` from every narrowing set — used when it's rebound or
+    /// shadowed and might be null again.
+    fn unnarrow(&mut self, name: &str) {
+        for set in &mut self.nonnull {
+            set.remove(name);
+        }
     }
 
     fn check_condition(&mut self, keyword: &str, cond: &Expr) {
@@ -337,10 +411,41 @@ impl<'a> Checker<'a> {
             Stmt::Let {
                 mutable,
                 name,
+                ty,
                 value,
-                ..
+                span,
             } => {
-                let ty = self.type_of_expr(value);
+                let init_ty = self.type_of_expr(value);
+                let ty = match ty {
+                    Some(ann) => {
+                        let declared =
+                            resolve_type(ann, self.ty_alias, *span, self.diagnostics);
+                        if !fits(&init_ty, &declared) {
+                            self.error(
+                                format!(
+                                    "'{name}' is declared as {} but initialized with {}",
+                                    self.type_name(&declared),
+                                    self.type_name(&init_ty)
+                                ),
+                                *span,
+                            );
+                        }
+                        declared
+                    }
+                    None if init_ty == Type::Null => {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                format!("cannot infer a type for '{name}' from 'null'"),
+                                *span,
+                            )
+                            .with_help(format!(
+                                "add an annotation, e.g. 'var {name}: T? = null;'"
+                            )),
+                        );
+                        Type::Unit // recovery
+                    }
+                    None => init_ty,
+                };
                 self.scopes.last_mut().unwrap().insert(
                     name.clone(),
                     VarInfo {
@@ -348,13 +453,15 @@ impl<'a> Checker<'a> {
                         mutable: *mutable,
                     },
                 );
+                // A new binding shadows any narrowing of the same name.
+                self.unnarrow(name);
             }
             Stmt::Return { value, span } => {
                 let ty = match value {
                     Some(e) => self.type_of_expr(e),
                     None => Type::Unit,
                 };
-                if ty != self.ret {
+                if !fits(&ty, &self.ret) {
                     self.error(
                         format!(
                             "expected return type {}, found {}",
@@ -372,39 +479,65 @@ impl<'a> Checker<'a> {
                 ..
             } => {
                 self.check_condition("if", cond);
-                self.check_block(then_body);
+                let (if_true, if_false) = null_checks(cond);
+                self.check_block_narrowed(then_body, if_true);
                 if let Some(else_body) = else_body {
-                    self.check_block(else_body);
+                    self.check_block_narrowed(else_body, if_false);
                 }
             }
             Stmt::While { cond, body, .. } => {
                 self.check_condition("while", cond);
-                self.check_block(body);
+                let (if_true, _) = null_checks(cond);
+                self.check_block_narrowed(body, if_true);
             }
             Stmt::Expr(e) => {
                 self.type_of_expr(e);
             }
-            Stmt::Assign { name, value, span } => {
+            Stmt::Assign { target, value, span } => {
                 let value_ty = self.type_of_expr(value);
-                let binding = self
-                    .find_var(name)
-                    .map(|info| (info.ty.clone(), info.mutable));
-                match binding {
-                    None => self.error(format!("undefined variable '{name}'"), *span),
-                    Some((binding_ty, mutable)) => {
-                        if !mutable {
-                            self.error(format!("cannot assign to const '{name}'"), *span);
-                        } else if value_ty != binding_ty {
-                            self.error(
-                                format!(
-                                    "cannot assign {} to variable of type {}",
-                                    self.type_name(&value_ty),
-                                    self.type_name(&binding_ty)
-                                ),
-                                *span,
-                            );
-                        }
-                    }
+                // The parser only builds place targets, so a root always exists.
+                let Some((root, root_span)) = root_ident(target) else {
+                    return;
+                };
+                let Some(mutable) = self.find_var(root).map(|info| info.mutable) else {
+                    self.lookup(root, root_span); // emits undefined + suggestion
+                    return;
+                };
+                // Rebinding a variable invalidates its narrowing — the new
+                // value may be null again. (The value above was typed while
+                // still narrowed, so `cur = cur.next` checks out.)
+                if matches!(target, Expr::Ident(..)) {
+                    self.unnarrow(root);
+                }
+                // Typing the target may emit its own errors (unknown field);
+                // stop here when it does — mutability/mismatch checks on an
+                // ill-formed target would only add noise.
+                let before = self.diagnostics.len();
+                let target_ty = self.type_of_expr(target);
+                if self.diagnostics.len() != before {
+                    return;
+                }
+                // Mutation needs a `var` root unless the chain crosses a
+                // refstruct boundary — past a reference we mutate the shared
+                // object, not the binding.
+                if !mutable && !self.crosses_ref(target) {
+                    self.error(format!("cannot assign to const '{root}'"), *span);
+                    return;
+                }
+                if !fits(&value_ty, &target_ty) {
+                    let message = match target {
+                        Expr::Field { name, .. } => format!(
+                            "field '{name}' expects {}, found {}",
+                            self.type_name(&target_ty),
+                            self.type_name(&value_ty)
+                        ),
+                        _ => format!(
+                            "cannot assign {} to variable of type {}",
+                            self.type_name(&value_ty),
+                            self.type_name(&target_ty)
+                        ),
+                    };
+                    self.error(message, *span);
                 }
             }
         }
@@ -417,6 +550,7 @@ impl<'a> Checker<'a> {
             Expr::Bool(_, _) => Type::Bool,
             Expr::Str(_, _) => Type::Str,
             Expr::Ident(name, span) => self.lookup(name, *span),
+            Expr::Null(_) => Type::Null,
             Expr::Unary { op, rhs, span } => {
                 let ty = self.type_of_expr(rhs);
                 match op {
@@ -437,11 +571,25 @@ impl<'a> Checker<'a> {
             }
             Expr::Binary { op, lhs, rhs, span } => {
                 let lt = self.type_of_expr(lhs);
-                let rt = self.type_of_expr(rhs);
+                // `x != null && …` — the null check guards the right side.
+                let rt = if *op == BinOp::And {
+                    let (if_true, _) = null_checks(lhs);
+                    self.nonnull.push(if_true);
+                    let rt = self.type_of_expr(rhs);
+                    self.nonnull.pop();
+                    rt
+                } else {
+                    self.type_of_expr(rhs)
+                };
                 self.check_binary(*op, lt, rt, *span)
             }
             Expr::Call { callee, args, span } => self.check_call(callee, args, *span),
-            Expr::Field { base, name, span } => self.check_field(base, name, *span),
+            Expr::Field {
+                base,
+                name,
+                optional,
+                span,
+            } => self.check_field(base, name, *optional, *span),
             Expr::StructLit { name, fields, span } => self.check_struct_lit(name, fields, *span),
         }
     }
@@ -456,10 +604,24 @@ impl<'a> Checker<'a> {
             }
             // Ordering on matching numerics.
             Lt | Le | Gt | Ge => (lt == rt && is_numeric(&lt), Type::Bool),
-            // Equality on any matching primitive type.
-            Eq | Ne => (lt == rt && is_primitive(&lt), Type::Bool),
+            // Equality on any matching primitive or struct type (struct
+            // identity is (module, name)), plus null checks on optionals.
+            Eq | Ne => (eq_comparable(&lt, &rt), Type::Bool),
             // Logic on bools.
             And | Or => (lt == Type::Bool && rt == Type::Bool, Type::Bool),
+            // `a ?? b`: a must be optional; b re-fills it (`T` unwraps,
+            // `T?`/null keep it optional).
+            Coalesce => match &lt {
+                Type::Optional(inner) => {
+                    let result = if rt == **inner {
+                        (**inner).clone()
+                    } else {
+                        lt.clone()
+                    };
+                    (fits(&rt, &lt), result)
+                }
+                _ => (false, lt.clone()),
+            },
         };
         if !ok {
             self.error(
@@ -513,7 +675,7 @@ impl<'a> Checker<'a> {
         }
         for (arg, expected) in args.iter().zip(&sig.params) {
             let got = self.type_of_expr(arg);
-            if got != *expected {
+            if !fits(&got, expected) {
                 self.error(
                     format!(
                         "expected argument of type {}, found {}",
@@ -527,24 +689,60 @@ impl<'a> Checker<'a> {
         sig.ret.clone()
     }
 
-    fn check_field(&mut self, base: &Expr, field: &str, span: Span) -> Type {
+    fn check_field(&mut self, base: &Expr, field: &str, optional: bool, span: Span) -> Type {
         let base_ty = self.type_of_expr(base);
-        let (sm, struct_name) = match &base_ty {
-            Type::Struct(m, n) => (*m, n.clone()),
-            _ => {
-                self.error(
-                    format!("type {} has no fields", self.type_name(&base_ty)),
-                    span,
+        // Stage 1: the optional layer — `?.` must strip one, `.` must not
+        // have one to strip.
+        let inner = match (&base_ty, optional) {
+            (Type::Optional(inner), true) => inner.as_ref(),
+            (Type::Optional(_), false) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "{} may be null — its fields can't be read directly",
+                            self.type_name(&base_ty)
+                        ),
+                        span,
+                    )
+                    .with_help("use '?.', or check '!= null' first".to_string()),
                 );
                 return Type::Unit;
             }
+            (_, true) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "'?.' on {}, which is never null",
+                            self.type_name(&base_ty)
+                        ),
+                        span,
+                    )
+                    .with_help("use '.'".to_string()),
+                );
+                return Type::Unit;
+            }
+            (ty, false) => ty,
         };
+        // Stage 2: the field lookup, shared by both forms.
+        let Type::Struct(sm, struct_name) = inner else {
+            self.error(
+                format!("type {} has no fields", self.type_name(&base_ty)),
+                span,
+            );
+            return Type::Unit;
+        };
+        let (sm, struct_name) = (*sm, struct_name.clone());
         let field_ty = self
             .structs
             .get(&(sm, struct_name.clone()))
             .and_then(|st| st.fields.iter().find(|(fname, _)| fname == field))
             .map(|(_, ty)| ty.clone());
         match field_ty {
+            Some(ty) if optional => match ty {
+                // `a?.b` is optional; an already-optional field stays flat.
+                Type::Optional(_) => ty,
+                other => Type::Optional(Box::new(other)),
+            },
             Some(ty) => ty,
             None => {
                 self.error(
@@ -581,7 +779,7 @@ impl<'a> Checker<'a> {
             let got = self.type_of_expr(value);
             match decl.fields.iter().find(|(dn, _)| dn == fname) {
                 Some((_, expected)) => {
-                    if got != *expected {
+                    if !fits(&got, expected) {
                         self.error(
                             format!(
                                 "field '{fname}' expects {}, found {}",
@@ -606,6 +804,30 @@ impl<'a> Checker<'a> {
         Type::Struct(key.0, key.1.clone())
     }
 
+    /// True when mutating through this place chain passes a refstruct
+    /// boundary (some field access has a by-ref base). Bases get re-typed,
+    /// but only after the whole target typed cleanly, so no duplicate
+    /// diagnostics are emitted.
+    fn crosses_ref(&mut self, place: &Expr) -> bool {
+        match place {
+            Expr::Field { base, .. } => {
+                let base_ty = self.type_of_expr(base);
+                self.is_by_ref(&base_ty) || self.crosses_ref(base)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_by_ref(&self, t: &Type) -> bool {
+        match t {
+            Type::Struct(m, n) => self
+                .structs
+                .get(&(*m, n.clone()))
+                .is_some_and(|s| s.by_ref),
+            _ => false,
+        }
+    }
+
     /// The innermost binding for `name`, searching scopes inside-out.
     fn find_var(&self, name: &str) -> Option<&VarInfo> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
@@ -613,6 +835,12 @@ impl<'a> Checker<'a> {
 
     fn lookup(&mut self, name: &str, span: Span) -> Type {
         if let Some(info) = self.find_var(name) {
+            // A narrowed optional reads as its inner type.
+            if self.is_nonnull(name) {
+                if let Type::Optional(inner) = &info.ty {
+                    return (**inner).clone();
+                }
+            }
             return info.ty.clone();
         }
         let visible = self.scopes.iter().flat_map(|s| s.keys().map(String::as_str));
@@ -625,12 +853,51 @@ impl<'a> Checker<'a> {
     }
 }
 
-fn is_numeric(t: &Type) -> bool {
-    matches!(t, Type::Int | Type::Float)
+/// Comparability for `==`/`!=`: two non-unit types compare when either fits
+/// the other — same type, `null` vs `T?`, or `T` vs `T?`.
+fn eq_comparable(lt: &Type, rt: &Type) -> bool {
+    *lt != Type::Unit && *rt != Type::Unit && (fits(lt, rt) || fits(rt, lt))
 }
 
-fn is_primitive(t: &Type) -> bool {
-    matches!(t, Type::Int | Type::Float | Type::Bool | Type::Str)
+/// The names a condition proves non-null: `(if_true, if_false)`.
+/// `x != null` proves `x` in the true branch, `x == null` in the false
+/// branch; `&&` accumulates its sides' true-facts. Nothing deeper (v1).
+fn null_checks(cond: &Expr) -> (HashSet<String>, HashSet<String>) {
+    let (mut if_true, mut if_false) = (HashSet::new(), HashSet::new());
+    if let Expr::Binary { op, lhs, rhs, .. } = cond {
+        match op {
+            BinOp::Ne => if_true.extend(ident_vs_null(lhs, rhs)),
+            BinOp::Eq => if_false.extend(ident_vs_null(lhs, rhs)),
+            BinOp::And => {
+                if_true.extend(null_checks(lhs).0);
+                if_true.extend(null_checks(rhs).0);
+            }
+            _ => {}
+        }
+    }
+    (if_true, if_false)
+}
+
+fn ident_vs_null(a: &Expr, b: &Expr) -> Option<String> {
+    match (a, b) {
+        (Expr::Ident(n, _), Expr::Null(_)) | (Expr::Null(_), Expr::Ident(n, _)) => {
+            Some(n.clone())
+        }
+        _ => None,
+    }
+}
+
+/// The variable at the root of a place expression (`o.i.v` → `o`).
+fn root_ident(e: &Expr) -> Option<(&str, Span)> {
+    match e {
+        Expr::Ident(n, s) => Some((n, *s)),
+        Expr::Field { base, .. } => root_ident(base),
+        _ => None,
+    }
+}
+
+fn is_numeric(t: &Type) -> bool {
+    matches!(t, Type::Int | Type::Float)
 }
 
 /// Definite-return analysis: does this statement list guarantee a `return` on
@@ -763,6 +1030,49 @@ mod tests {
         assert!(
             d.iter()
                 .any(|e| e.message.contains("cannot apply '==' to int and float")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn struct_equality_is_well_typed() {
+        let d = diags(
+            "struct P { x: int }\n\
+             fun f(a: P, b: P): bool { return a == b || a != b; }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn struct_ordering_is_rejected() {
+        let d = diags(
+            "struct P { x: int }\n\
+             fun f(a: P, b: P): bool { return a < b; }",
+        );
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot apply '<'")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn equality_across_distinct_struct_types_is_rejected() {
+        // Same short name in two modules — identity is (module, name).
+        let (_, d) = multi(&[
+            (
+                "main.ys",
+                "import { make } from \"./lib\";\n\
+                 struct P { x: int }\n\
+                 fun f(): bool { return P { x: 1 } == make(); }",
+            ),
+            (
+                "lib.ys",
+                "export struct P { x: int }\n\
+                 export fun make(): P { return P { x: 1 }; }",
+            ),
+        ]);
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot apply '=='")),
             "{d:?}"
         );
     }
@@ -1105,6 +1415,223 @@ mod tests {
                 .any(|e| e.message.contains("missing field 'y' in struct 'P'")),
             "{d:?}"
         );
+    }
+
+    #[test]
+    fn field_assignment_is_well_typed() {
+        let d = diags("struct P { x: int } fun f() { var p = P { x: 1 }; p.x = 2; }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn field_assignment_type_mismatch_is_an_error() {
+        let d = diags("struct P { x: int } fun f() { var p = P { x: 1 }; p.x = 1.0; }");
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("field 'x' expects int, found float")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn field_assignment_through_const_is_an_error() {
+        let d = diags("struct P { x: int } fun f() { const p = P { x: 1 }; p.x = 2; }");
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("cannot assign to const 'p'")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn assigning_to_unknown_field_is_an_error() {
+        let d = diags("struct P { x: int } fun f() { var p = P { x: 1 }; p.z = 2; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("no field 'z'")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn refstruct_field_mutation_through_const_is_allowed() {
+        let d = diags("refstruct P { x: int } fun f() { const p = P { x: 1 }; p.x = 2; }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn refstruct_param_mutation_is_allowed() {
+        let d = diags("refstruct P { x: int } fun g(p: P) { p.x = 5; }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn rebinding_const_refstruct_is_rejected() {
+        let d = diags(
+            "refstruct P { x: int } fun f() { const p = P { x: 1 }; p = P { x: 2 }; }",
+        );
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("cannot assign to const 'p'")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn value_struct_param_mutation_stays_rejected() {
+        let d = diags("struct V { x: int } fun g(v: V) { v.x = 5; }");
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("cannot assign to const 'v'")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn mutation_past_a_ref_boundary_in_a_const_chain_is_allowed() {
+        // `b` is a const value struct, but `b.r.v` mutates the shared R
+        // object, not `b` itself — allowed. Replacing `b.r` would mutate
+        // `b`'s own copy — rejected.
+        let src = "refstruct R { v: int }\n\
+                   struct Box { r: R }\n\
+                   fun f() { const b = Box { r: R { v: 1 } }; b.r.v = 7; }";
+        let d = diags(src);
+        assert!(d.is_empty(), "unexpected: {d:?}");
+
+        let src = "refstruct R { v: int }\n\
+                   struct Box { r: R }\n\
+                   fun f() { const b = Box { r: R { v: 1 } }; b.r = R { v: 2 }; }";
+        let d = diags(src);
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("cannot assign to const 'b'")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn refstruct_equality_is_well_typed() {
+        let d = diags(
+            "refstruct P { x: int }\n\
+             fun f(a: P, b: P): bool { return a == b || a != b; }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn optional_annotation_accepts_null_and_values() {
+        let d = diags(
+            "refstruct P { x: int }\n\
+             fun f() { var p: P? = null; p = P { x: 1 }; p = null; }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn bare_null_needs_an_annotation() {
+        let d = diags("fun f() { var x = null; }");
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("cannot infer") && e.help.is_some()),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn plain_dot_on_an_optional_errors_with_a_hint() {
+        let d = diags("refstruct P { x: int } fun f(p: P?): int { return p.x; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("may be null")
+                && e.help.as_deref().is_some_and(|h| h.contains("?."))),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn optional_chaining_produces_an_optional() {
+        let d = diags("refstruct P { x: int } fun f(p: P?): int? { return p?.x; }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn optional_chaining_on_a_non_optional_is_rejected() {
+        let d = diags("refstruct P { x: int } fun f(p: P): int? { return p?.x; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("never null")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn coalescing_unwraps_an_optional() {
+        let d = diags("refstruct P { x: int } fun f(p: P?): int { return p?.x ?? 0; }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn coalescing_requires_an_optional_left_side() {
+        let d = diags("fun f(a: int): int { return a ?? 1; }");
+        assert!(d.iter().any(|e| e.message.contains("'??'")), "{d:?}");
+    }
+
+    #[test]
+    fn null_checks_narrow_in_if_and_while() {
+        let d = diags(
+            "refstruct Node { v: int, next: Node? }\n\
+             fun sum(head: Node?): int {\n\
+                 var acc = 0;\n\
+                 var cur = head;\n\
+                 while cur != null { acc = acc + cur.v; cur = cur.next; }\n\
+                 if head != null { acc = acc + head.v; }\n\
+                 return acc;\n\
+             }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn leading_null_check_narrows_the_rest_of_the_condition() {
+        let d = diags(
+            "refstruct P { x: int }\n\
+             fun f(p: P?): bool { return p != null && p.x > 0; }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn equals_null_narrows_the_else_branch() {
+        let d = diags(
+            "refstruct P { x: int }\n\
+             fun f(p: P?): int { if p == null { return 0; } else { return p.x; } }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn null_comparison_on_a_non_optional_is_rejected() {
+        let d = diags("fun f(a: int): bool { return a == null; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot apply '=='")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn values_fit_optional_parameters() {
+        let d = diags(
+            "refstruct P { x: int }\n\
+             fun f(p: P?) { }\n\
+             fun g() { f(P { x: 1 }); f(null); }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn struct_literal_fields_accept_null_for_optionals() {
+        let d = diags(
+            "refstruct Node { v: int, next: Node? }\n\
+             fun f() { const n = Node { v: 1, next: null }; }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
     }
 
     #[test]

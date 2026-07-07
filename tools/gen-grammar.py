@@ -24,10 +24,10 @@ GRAMMAR = ROOT / "editors" / "vscode" / "syntaxes" / "ys.tmLanguage.json"
 # How each keyword spelling maps to a TextMate scope. Every KW_ in syntax.rs
 # must appear in exactly one bucket (checked below).
 CATEGORIES = {
-    "storage.type.ys": ["fun", "struct", "var", "const"],
+    "storage.type.ys": ["fun", "struct", "refstruct", "var", "const"],
     "keyword.control.ys": ["return", "if", "else", "while", "import", "export", "from"],
     "support.type.primitive.ys": ["int", "float", "bool", "string"],
-    "constant.language.ys": ["true", "false"],
+    "constant.language.ys": ["true", "false", "null"],
 }
 
 
@@ -97,7 +97,7 @@ def build_grammar():
             },
             "operators": {
                 "name": "keyword.operator.ys",
-                "match": r"==|!=|<=|>=|&&|\|\||[-+*/%=<>!]",
+                "match": r"\?\?|\?\.|==|!=|<=|>=|&&|\|\||[-+*/%=<>!?]",
             },
         },
     }

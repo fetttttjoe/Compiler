@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::ast::{BinOp, Expr, Function, Item, Stmt, UnOp};
 use crate::check::Resolutions;
@@ -6,22 +8,85 @@ use crate::diagnostic::Diagnostic;
 use crate::modules::ModuleGraph;
 use crate::span::Span;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
     Float(f64),
     Bool(bool),
     Str(String),
+    /// Fields sorted by name (literals may write them in any order, and
+    /// sorting makes `PartialEq` order-independent); lookup is a linear
+    /// scan — structs are small, and the checker guarantees the field
+    /// exists.
+    Struct {
+        name: String,
+        fields: Vec<(String, Value)>,
+    },
+    /// A `refstruct` instance: one shared object (always a `Value::Struct`
+    /// inside), aliased by every copy of the handle.
+    Ref(Rc<RefCell<Value>>),
+    /// The `null` literal — the empty state of a `T?` slot.
+    Null,
     Unit,
 }
 
+/// Like the derive, except `Ref` compares by identity (same object), not by
+/// contents — so struct equality recursing into a ref field is identity too.
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (
+                Value::Struct { name: an, fields: af },
+                Value::Struct { name: bn, fields: bf },
+            ) => an == bn && af == bf,
+            (Value::Ref(a), Value::Ref(b)) => Rc::ptr_eq(a, b),
+            (Value::Null, Value::Null) => true,
+            (Value::Unit, Value::Unit) => true,
+            _ => false,
+        }
+    }
+}
+
 impl Value {
+    /// Debug-style rendering with a depth cap — cyclic refstruct values
+    /// (constructible since optionals landed) would recurse forever under
+    /// derived `Debug`.
+    // ponytail: depth cap, not cycle detection — 8 levels is plenty for a
+    // result dump; switch to pointer-tracking if real output needs it.
+    pub fn render(&self) -> String {
+        self.render_depth(8)
+    }
+
+    fn render_depth(&self, depth: usize) -> String {
+        if depth == 0 {
+            return "...".to_string();
+        }
+        match self {
+            Value::Ref(cell) => format!("Ref({})", cell.borrow().render_depth(depth - 1)),
+            Value::Struct { name, fields } => {
+                let fields: Vec<String> = fields
+                    .iter()
+                    .map(|(f, v)| format!("{f}: {}", v.render_depth(depth - 1)))
+                    .collect();
+                format!("{name} {{ {} }}", fields.join(", "))
+            }
+            other => format!("{other:?}"),
+        }
+    }
+
     fn type_name(&self) -> &'static str {
         match self {
             Value::Int(_) => "int",
             Value::Float(_) => "float",
             Value::Bool(_) => "bool",
             Value::Str(_) => "string",
+            Value::Struct { .. } => "struct",
+            Value::Ref(_) => "refstruct",
+            Value::Null => "null",
             Value::Unit => "unit",
         }
     }
@@ -137,18 +202,10 @@ impl<'a> Interp<'a> {
                 self.eval(e)?;
                 Ok(Flow::Normal)
             }
-            Stmt::Assign { name, value, span } => {
+            Stmt::Assign { target, value, .. } => {
                 let v = self.eval(value)?;
-                match self.scopes.iter_mut().rev().find_map(|s| s.get_mut(name)) {
-                    Some(slot) => {
-                        *slot = v;
-                        Ok(Flow::Normal)
-                    }
-                    None => Err(Diagnostic::error(
-                        format!("undefined variable '{name}'"),
-                        *span,
-                    )),
-                }
+                self.assign_place(target, v)?;
+                Ok(Flow::Normal)
             }
         }
     }
@@ -205,12 +262,18 @@ impl<'a> Interp<'a> {
             Expr::Bool(b, _) => Ok(Value::Bool(*b)),
             Expr::Str(s, _) => Ok(Value::Str(s.clone())),
             Expr::Ident(name, span) => self.lookup(name, *span),
+            Expr::Null(_) => Ok(Value::Null),
             Expr::Unary { op, rhs, span } => {
                 let v = self.eval(rhs)?;
                 eval_unary(*op, v, *span)
             }
             Expr::Binary { op, lhs, rhs, span } => match op {
                 BinOp::And | BinOp::Or => self.eval_logical(*op, lhs, rhs),
+                // `??` is lazy: the fallback runs only when the left is null.
+                BinOp::Coalesce => match self.eval(lhs)? {
+                    Value::Null => self.eval(rhs),
+                    v => Ok(v),
+                },
                 _ => {
                     let l = self.eval(lhs)?;
                     let r = self.eval(rhs)?;
@@ -254,10 +317,80 @@ impl<'a> Interp<'a> {
                 }
                 self.call(func, target_module, argv, *span)
             }
-            // Struct runtime values are deferred (they still parse and type-check).
-            Expr::Field { span, .. } | Expr::StructLit { span, .. } => Err(Diagnostic::error(
-                "struct values are not yet supported at runtime",
-                *span,
+            // The checker has already verified literals are complete and
+            // fields exist, so the error arms here are defensive only.
+            Expr::StructLit { name, fields, .. } => {
+                // Evaluate in written order (side effects), store sorted.
+                let mut vals = Vec::with_capacity(fields.len());
+                for (fname, fexpr) in fields {
+                    vals.push((fname.clone(), self.eval(fexpr)?));
+                }
+                vals.sort_by(|a, b| a.0.cmp(&b.0));
+                let value = Value::Struct {
+                    name: name.clone(),
+                    fields: vals,
+                };
+                // A refstruct literal allocates one shared object; everyone
+                // who copies the handle aliases it.
+                if self.resolutions.ref_structs[self.module].contains(name.as_str()) {
+                    Ok(Value::Ref(Rc::new(RefCell::new(value))))
+                } else {
+                    Ok(value)
+                }
+            }
+            Expr::Field {
+                base,
+                name,
+                optional,
+                span,
+            } => match self.eval(base)? {
+                // `?.` short-circuits on null; plain `.` never sees one
+                // (the checker rejects it).
+                Value::Null if *optional => Ok(Value::Null),
+                v => get_field(&v, name, *span),
+            },
+        }
+    }
+
+    /// Writes `v` into the storage a place expression names. Field chains
+    /// are read-modify-write: a value-struct hop clones the struct, sets the
+    /// field in the copy, and writes the copy back into its own place; a
+    /// refstruct hop mutates the shared object directly (that's the aliasing
+    /// semantics — and it also ends the write-back, since the handle itself
+    /// is unchanged). Error arms are defensive; the checker has already
+    /// validated the place.
+    // ponytail: value hops clone the intermediate structs — fine for the
+    // interpreter (the oracle); codegen will write in place.
+    fn assign_place(&mut self, target: &'a Expr, v: Value) -> Result<(), Diagnostic> {
+        match target {
+            Expr::Ident(name, span) => {
+                match self.scopes.iter_mut().rev().find_map(|s| s.get_mut(name)) {
+                    Some(slot) => {
+                        *slot = v;
+                        Ok(())
+                    }
+                    None => Err(Diagnostic::error(
+                        format!("undefined variable '{name}'"),
+                        *span,
+                    )),
+                }
+            }
+            Expr::Field {
+                base, name, span, ..
+            } => match self.eval(base)? {
+                // A refstruct hop mutates the shared object directly — the
+                // aliasing semantics, and the end of the write-back chain.
+                Value::Ref(cell) => set_field(&mut cell.borrow_mut(), name, v, *span),
+                // A value hop: set the field in the copy, write the copy
+                // back into its own place. (set_field rejects non-structs.)
+                mut owned => {
+                    set_field(&mut owned, name, v, *span)?;
+                    self.assign_place(base, owned)
+                }
+            },
+            _ => Err(Diagnostic::error(
+                "invalid assignment target",
+                target.span(),
             )),
         }
     }
@@ -272,6 +405,44 @@ impl<'a> Interp<'a> {
             format!("undefined variable '{name}'"),
             span,
         ))
+    }
+}
+
+/// Reads a field out of a struct value, following refstruct handles — the
+/// read half of `Expr::Field`. Clones the field out (the oracle trades
+/// copies for simplicity).
+fn get_field(container: &Value, field: &str, span: Span) -> Result<Value, Diagnostic> {
+    match container {
+        Value::Struct { fields, .. } => fields
+            .iter()
+            .find(|(fname, _)| fname == field)
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| Diagnostic::error(format!("no field '{field}'"), span)),
+        Value::Ref(cell) => get_field(&cell.borrow(), field, span),
+        other => Err(Diagnostic::error(
+            format!("type {} has no fields", other.type_name()),
+            span,
+        )),
+    }
+}
+
+/// Sets a field inside a (borrowed) struct value — the write half of a
+/// field-chain hop in `assign_place`.
+fn set_field(container: &mut Value, field: &str, v: Value, span: Span) -> Result<(), Diagnostic> {
+    match container {
+        Value::Struct { fields, .. } => {
+            match fields.iter_mut().find(|(fname, _)| fname == field) {
+                Some((_, slot)) => {
+                    *slot = v;
+                    Ok(())
+                }
+                None => Err(Diagnostic::error(format!("no field '{field}'"), span)),
+            }
+        }
+        other => Err(Diagnostic::error(
+            format!("type {} has no fields", other.type_name()),
+            span,
+        )),
     }
 }
 
@@ -299,15 +470,23 @@ fn eval_binary(op: BinOp, l: Value, r: Value, span: Span) -> Result<Value, Diagn
         (Value::Float(a), Value::Float(b)) => float_op(op, a, b, span),
         (Value::Str(a), Value::Str(b)) => str_op(op, a, b, span),
         (Value::Bool(a), Value::Bool(b)) => bool_op(op, a, b, span),
-        (a, b) => Err(Diagnostic::error(
-            format!(
-                "cannot apply '{}' to {} and {}",
-                op.symbol(),
-                a.type_name(),
-                b.type_name()
-            ),
-            span,
-        )),
+        // Everything else — structs, refs, null — supports only equality:
+        // structural for structs, identity for refs, presence for null, all
+        // encoded in `Value::eq`. The checker guarantees the operands are
+        // comparable; mixed pairs only reach here from rejected programs.
+        (l, r) => match op {
+            BinOp::Eq => Ok(Value::Bool(l == r)),
+            BinOp::Ne => Ok(Value::Bool(l != r)),
+            _ => Err(Diagnostic::error(
+                format!(
+                    "cannot apply '{}' to {} and {}",
+                    op.symbol(),
+                    l.type_name(),
+                    r.type_name()
+                ),
+                span,
+            )),
+        },
     }
 }
 
@@ -326,7 +505,7 @@ fn int_op(op: BinOp, a: i64, b: i64, span: Span) -> Result<Value, Diagnostic> {
         Le => Value::Bool(a <= b),
         Gt => Value::Bool(a > b),
         Ge => Value::Bool(a >= b),
-        And | Or => unreachable!("logical operators short-circuit in eval_logical"),
+        And | Or | Coalesce => unreachable!("short-circuiting operators are handled lazily in eval"),
     };
     Ok(v)
 }
@@ -348,7 +527,7 @@ fn float_op(op: BinOp, a: f64, b: f64, _span: Span) -> Result<Value, Diagnostic>
         Le => Value::Bool(a <= b),
         Gt => Value::Bool(a > b),
         Ge => Value::Bool(a >= b),
-        And | Or => unreachable!("logical operators short-circuit in eval_logical"),
+        And | Or | Coalesce => unreachable!("short-circuiting operators are handled lazily in eval"),
     };
     Ok(v)
 }
@@ -587,6 +766,282 @@ fun main(): int {
     return x;
 }";
         assert_eq!(run(program), Ok(Value::Int(1)));
+    }
+
+    #[test]
+    fn struct_literal_and_field_access() {
+        let program = "\
+struct Point { x: int, y: int }
+fun main(): int {
+    const p = Point { x: 3, y: 4 };
+    return p.x * p.x + p.y * p.y;
+}";
+        assert_eq!(run(program), Ok(Value::Int(25)));
+    }
+
+    #[test]
+    fn structs_pass_through_calls() {
+        let program = "\
+struct Point { x: int, y: int }
+fun make(x: int, y: int): Point { return Point { x: x, y: y }; }
+fun sum(p: Point): int { return p.x + p.y; }
+fun main(): int { return sum(make(1, 2)); }";
+        assert_eq!(run(program), Ok(Value::Int(3)));
+    }
+
+    #[test]
+    fn nested_struct_field_access() {
+        let program = "\
+struct Inner { v: int }
+struct Outer { i: Inner }
+fun main(): int {
+    const o = Outer { i: Inner { v: 7 } };
+    return o.i.v;
+}";
+        assert_eq!(run(program), Ok(Value::Int(7)));
+    }
+
+    #[test]
+    fn imported_struct_constructs_and_reads_across_modules() {
+        assert_eq!(
+            run_multi(&[
+                (
+                    "main.ys",
+                    "import { Pair, make } from \"./lib\";\n\
+                     fun main(): int { const p = make(); return p.a + Pair { a: 1, b: 2 }.b; }"
+                ),
+                (
+                    "lib.ys",
+                    "export struct Pair { a: int, b: int }\n\
+                     export fun make(): Pair { return Pair { a: 40, b: 0 }; }"
+                ),
+            ]),
+            Ok(Value::Int(42))
+        );
+    }
+
+    #[test]
+    fn struct_equality_compares_fields() {
+        let program = "\
+struct Point { x: int, y: int }
+fun main(): bool {
+    const a = Point { x: 1, y: 2 };
+    const b = Point { x: 1, y: 2 };
+    const c = Point { x: 9, y: 2 };
+    return a == b && a != c;
+}";
+        assert_eq!(run(program), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn struct_equality_ignores_literal_field_order() {
+        let program = "\
+struct Point { x: int, y: int }
+fun main(): bool {
+    return Point { x: 1, y: 2 } == Point { y: 2, x: 1 };
+}";
+        assert_eq!(run(program), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn nested_struct_equality_recurses() {
+        let program = "\
+struct Inner { v: int }
+struct Outer { i: Inner }
+fun main(): bool {
+    const a = Outer { i: Inner { v: 1 } };
+    const b = Outer { i: Inner { v: 2 } };
+    return a != b;
+}";
+        assert_eq!(run(program), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn field_assignment_mutates_the_struct() {
+        let program = "\
+struct Point { x: int, y: int }
+fun main(): int {
+    var p = Point { x: 1, y: 2 };
+    p.x = 40;
+    return p.x + p.y;
+}";
+        assert_eq!(run(program), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn nested_field_assignment() {
+        let program = "\
+struct Inner { v: int }
+struct Outer { i: Inner }
+fun main(): int {
+    var o = Outer { i: Inner { v: 1 } };
+    o.i.v = 9;
+    return o.i.v;
+}";
+        assert_eq!(run(program), Ok(Value::Int(9)));
+    }
+
+    #[test]
+    fn refstruct_aliases_share_mutation() {
+        let program = "\
+refstruct P { x: int }
+fun main(): int {
+    const a = P { x: 1 };
+    const b = a;
+    b.x = 5;
+    return a.x;
+}";
+        assert_eq!(run(program), Ok(Value::Int(5)));
+    }
+
+    #[test]
+    fn functions_mutate_refstruct_arguments() {
+        let program = "\
+refstruct P { x: int }
+fun bump(p: P) { p.x = p.x + 1; }
+fun main(): int {
+    const p = P { x: 1 };
+    bump(p);
+    bump(p);
+    return p.x;
+}";
+        assert_eq!(run(program), Ok(Value::Int(3)));
+    }
+
+    #[test]
+    fn refstruct_equality_is_identity() {
+        let program = "\
+refstruct P { x: int }
+fun main(): bool {
+    const a = P { x: 1 };
+    const b = P { x: 1 };
+    const c = a;
+    return a == c && a != b;
+}";
+        assert_eq!(run(program), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn value_struct_copies_stay_independent() {
+        // Pins ADR 0005: plain structs copy; mutating the copy leaves the
+        // original untouched.
+        let program = "\
+struct V { x: int }
+fun main(): int {
+    var a = V { x: 1 };
+    var b = a;
+    b.x = 9;
+    return a.x;
+}";
+        assert_eq!(run(program), Ok(Value::Int(1)));
+    }
+
+    #[test]
+    fn value_struct_compares_ref_fields_by_identity() {
+        let program = "\
+refstruct R { v: int }
+struct Box { r: R }
+fun main(): bool {
+    const r1 = R { v: 1 };
+    const r2 = R { v: 1 };
+    const a = Box { r: r1 };
+    const b = Box { r: r1 };
+    const c = Box { r: r2 };
+    return a == b && a != c;
+}";
+        assert_eq!(run(program), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn mutation_through_a_mixed_value_ref_chain() {
+        let program = "\
+refstruct R { v: int }
+struct Box { r: R }
+fun main(): int {
+    const b = Box { r: R { v: 1 } };
+    b.r.v = 7;
+    return b.r.v;
+}";
+        assert_eq!(run(program), Ok(Value::Int(7)));
+    }
+
+    #[test]
+    fn imported_refstruct_mutates_across_modules() {
+        assert_eq!(
+            run_multi(&[
+                (
+                    "main.ys",
+                    "import { Counter, bump } from \"./lib\";\n\
+                     fun main(): int { const c = Counter { n: 0 }; bump(c); bump(c); return c.n; }"
+                ),
+                (
+                    "lib.ys",
+                    "export refstruct Counter { n: int }\n\
+                     export fun bump(c: Counter) { c.n = c.n + 1; }"
+                ),
+            ]),
+            Ok(Value::Int(2))
+        );
+    }
+
+    #[test]
+    fn optional_chaining_short_circuits_on_null() {
+        let program = "\
+refstruct P { x: int }
+fun get(p: P?): int { return p?.x ?? 42; }
+fun main(): int { return get(null) + get(P { x: 1 }); }";
+        assert_eq!(run(program), Ok(Value::Int(43)));
+    }
+
+    #[test]
+    fn null_equality_at_runtime() {
+        let program = "\
+refstruct P { x: int }
+fun main(): bool {
+    var p: P? = null;
+    const was_null = p == null;
+    p = P { x: 1 };
+    return was_null && p != null;
+}";
+        assert_eq!(run(program), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn linked_list_builds_traverses_and_mutates() {
+        let program = "\
+refstruct Node { v: int, next: Node? }
+fun main(): int {
+    const head = Node { v: 1, next: Node { v: 2, next: Node { v: 3, next: null } } };
+    var cur: Node? = head;
+    var sum = 0;
+    while cur != null {
+        cur.v = cur.v * 10;
+        sum = sum + cur.v;
+        cur = cur.next;
+    }
+    return sum;
+}";
+        assert_eq!(run(program), Ok(Value::Int(60)));
+    }
+
+    #[test]
+    fn cyclic_values_render_finitely() {
+        let program = "\
+refstruct Node { v: int, next: Node? }
+fun main(): Node {
+    const a = Node { v: 1, next: null };
+    a.next = a;
+    return a;
+}";
+        let rendered = run(program).unwrap().render();
+        assert!(rendered.contains("Node") && rendered.contains("..."), "{rendered}");
+        assert!(rendered.len() < 500, "unbounded: {} bytes", rendered.len());
+    }
+
+    #[test]
+    fn scalar_rendering_matches_debug() {
+        assert_eq!(Value::Int(55).render(), "Int(55)");
+        assert_eq!(Value::Bool(true).render(), "Bool(true)");
     }
 
     #[test]

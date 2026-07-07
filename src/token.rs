@@ -5,6 +5,7 @@ pub enum TokenKind {
     // Keywords
     Fun,
     Struct,
+    RefStruct,
     Var,
     Const,
     Return,
@@ -16,6 +17,7 @@ pub enum TokenKind {
     From,
     True,
     False,
+    Null,
     // Type keywords
     IntType,
     FloatType,
@@ -51,6 +53,12 @@ pub enum TokenKind {
     GreaterEq,
     AmpAmp,
     PipePipe,
+    /// `?` — only valid as a postfix type modifier (`int?`).
+    Question,
+    /// `??` — null coalescing.
+    QuestionQuestion,
+    /// `?.` — optional chaining.
+    QuestionDot,
     // End of input
     Eof,
 }

@@ -126,6 +126,15 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type(&mut self) -> TypeAnn {
+        let base = self.parse_base_type();
+        if self.eat(&TokenKind::Question) {
+            TypeAnn::Optional(Box::new(base))
+        } else {
+            base
+        }
+    }
+
+    fn parse_base_type(&mut self) -> TypeAnn {
         let tok = self.peek().clone();
         match tok.kind {
             TokenKind::IntType => {
@@ -191,7 +200,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_struct(&mut self, exported: bool) -> Struct {
-        let start = self.expect(TokenKind::Struct);
+        // The caller dispatched on the keyword — `struct` or `refstruct`.
+        let kw = self.advance();
+        let by_ref = kw.kind == TokenKind::RefStruct;
+        let start = kw.span;
         let name = self.expect_identifier();
         self.expect(TokenKind::LeftBrace);
         let mut fields = Vec::new();
@@ -207,6 +219,7 @@ impl<'a> Parser<'a> {
         let end = self.expect(TokenKind::RightBrace);
         Struct {
             exported,
+            by_ref,
             name,
             fields,
             span: start.to(end),
@@ -227,6 +240,7 @@ impl<'a> Parser<'a> {
                 TokenKind::RightBrace
                 | TokenKind::Fun
                 | TokenKind::Struct
+                | TokenKind::RefStruct
                 | TokenKind::Import
                 | TokenKind::Export => return,
                 _ => {
@@ -250,8 +264,11 @@ impl<'a> Parser<'a> {
     fn parse_expr_inner(&mut self, min_bp: u8) -> Expr {
         let mut lhs = self.parse_prefix();
         loop {
-            // Postfix (call `(`, field `.`) binds tighter than every operator.
-            if matches!(self.peek().kind, TokenKind::LeftParen | TokenKind::Dot) {
+            // Postfix (call `(`, field `.`/`?.`) binds tighter than every operator.
+            if matches!(
+                self.peek().kind,
+                TokenKind::LeftParen | TokenKind::Dot | TokenKind::QuestionDot
+            ) {
                 if POSTFIX_BP < min_bp {
                     break;
                 }
@@ -301,6 +318,7 @@ impl<'a> Parser<'a> {
             TokenKind::FloatLiteral(f) => Expr::Float(f, tok.span),
             TokenKind::True => Expr::Bool(true, tok.span),
             TokenKind::False => Expr::Bool(false, tok.span),
+            TokenKind::Null => Expr::Null(tok.span),
             TokenKind::StringLiteral(s) => Expr::Str(s, tok.span),
             TokenKind::Identifier(name) => {
                 if self.struct_literals_allowed && self.check(&TokenKind::LeftBrace) {
@@ -352,7 +370,8 @@ impl<'a> Parser<'a> {
                     span,
                 }
             }
-            TokenKind::Dot => {
+            TokenKind::Dot | TokenKind::QuestionDot => {
+                let optional = self.peek().kind == TokenKind::QuestionDot;
                 self.bump();
                 let field = self.advance();
                 let (name, name_span) = match field.kind {
@@ -369,6 +388,7 @@ impl<'a> Parser<'a> {
                 Expr::Field {
                     base: Box::new(lhs),
                     name,
+                    optional,
                     span,
                 }
             }
@@ -561,6 +581,11 @@ impl<'a> Parser<'a> {
                 let mutable = matches!(tok.kind, TokenKind::Var);
                 self.bump();
                 let name = self.expect_identifier();
+                let ty = if self.eat(&TokenKind::Colon) {
+                    Some(self.parse_type())
+                } else {
+                    None
+                };
                 self.expect(TokenKind::Equals);
                 let value = self.parse_expr(0);
                 let (end, clean) = self.expect_or_flag(TokenKind::Semicolon);
@@ -568,6 +593,7 @@ impl<'a> Parser<'a> {
                     Stmt::Let {
                         mutable,
                         name,
+                        ty,
                         value,
                         span: tok.span.to(end),
                     },
@@ -592,23 +618,24 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 let expr = self.parse_expr(0);
-                // `ident = expr;` is an assignment; anything else is an expression statement.
-                if let Expr::Ident(name, ident_span) = &expr {
-                    if self.check(&TokenKind::Equals) {
-                        let name = name.clone();
-                        let start = *ident_span;
-                        self.bump(); // '='
-                        let value = self.parse_expr(0);
-                        let (end, clean) = self.expect_or_flag(TokenKind::Semicolon);
-                        return (
-                            Stmt::Assign {
-                                name,
-                                value,
-                                span: start.to(end),
-                            },
-                            clean,
-                        );
+                // `place = expr;` is an assignment; anything else is an
+                // expression statement.
+                if self.check(&TokenKind::Equals) {
+                    if !is_place(&expr) {
+                        self.error("invalid assignment target".to_string(), expr.span());
                     }
+                    let start = expr.span();
+                    self.bump(); // '='
+                    let value = self.parse_expr(0);
+                    let (end, clean) = self.expect_or_flag(TokenKind::Semicolon);
+                    return (
+                        Stmt::Assign {
+                            target: expr,
+                            value,
+                            span: start.to(end),
+                        },
+                        clean,
+                    );
                 }
                 let (_, clean) = self.expect_or_flag(TokenKind::Semicolon);
                 (Stmt::Expr(expr), clean)
@@ -617,11 +644,23 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// A place expression can be assigned to: a variable or a field chain rooted
+/// at one. `?.` links are excluded — a target that might not exist can't be
+/// written to.
+fn is_place(e: &Expr) -> bool {
+    match e {
+        Expr::Ident(..) => true,
+        Expr::Field { base, optional, .. } => !optional && is_place(base),
+        _ => false,
+    }
+}
+
 /// Operator precedence, lowest to highest. Declaration order *is* the ranking —
 /// the Pratt binding powers are derived from it, so adding a level means adding
 /// a variant in the right place, not hand-tuning numbers.
 #[derive(Clone, Copy)]
 enum Precedence {
+    Coalesce,   // ??
     Or,         // ||
     And,        // &&
     Equality,   // == !=
@@ -635,6 +674,7 @@ impl Precedence {
     /// token is not a binary operator.
     fn of(kind: &TokenKind) -> Option<(Precedence, BinOp)> {
         Some(match kind {
+            TokenKind::QuestionQuestion => (Precedence::Coalesce, BinOp::Coalesce),
             TokenKind::PipePipe => (Precedence::Or, BinOp::Or),
             TokenKind::AmpAmp => (Precedence::And, BinOp::And),
             TokenKind::EqEq => (Precedence::Equality, BinOp::Eq),
@@ -664,10 +704,10 @@ impl Precedence {
 }
 
 /// Unary prefix operators bind tighter than every binary operator.
-const PREFIX_BP: u8 = 14;
+const PREFIX_BP: u8 = 16;
 
 /// Postfix (call `(`, field `.`) binds tighter than everything, including prefix.
-const POSTFIX_BP: u8 = 16;
+const POSTFIX_BP: u8 = 18;
 
 // Adding a Precedence level shifts the derived binding powers — this guard
 // keeps prefix/postfix above every infix level at compile time.
@@ -678,6 +718,7 @@ fn describe(kind: &TokenKind) -> &'static str {
     match kind {
         Fun => "'fun'",
         Struct => "'struct'",
+        RefStruct => "'refstruct'",
         Var => "'var'",
         Const => "'const'",
         Return => "'return'",
@@ -689,6 +730,7 @@ fn describe(kind: &TokenKind) -> &'static str {
         From => "'from'",
         True => "'true'",
         False => "'false'",
+        Null => "'null'",
         IntType => "'int'",
         FloatType => "'float'",
         BoolType => "'bool'",
@@ -718,6 +760,9 @@ fn describe(kind: &TokenKind) -> &'static str {
         LessEq => "'<='",
         Greater => "'>'",
         GreaterEq => "'>='",
+        Question => "'?'",
+        QuestionQuestion => "'??'",
+        QuestionDot => "'?.'",
         AmpAmp => "'&&'",
         PipePipe => "'||'",
         Eof => "end of input",
@@ -733,7 +778,9 @@ pub fn parse(tokens: &[Token]) -> (Ast, Vec<Diagnostic>) {
     while !parser.at_eof() {
         match parser.peek().kind {
             TokenKind::Fun => items.push(Item::Function(parser.parse_function(false))),
-            TokenKind::Struct => items.push(Item::Struct(parser.parse_struct(false))),
+            TokenKind::Struct | TokenKind::RefStruct => {
+                items.push(Item::Struct(parser.parse_struct(false)))
+            }
             TokenKind::Import => items.push(Item::Import(parser.parse_import())),
             TokenKind::Export => {
                 parser.bump();
@@ -741,7 +788,7 @@ pub fn parse(tokens: &[Token]) -> (Ast, Vec<Diagnostic>) {
                     TokenKind::Fun => {
                         items.push(Item::Function(parser.parse_function(true)))
                     }
-                    TokenKind::Struct => {
+                    TokenKind::Struct | TokenKind::RefStruct => {
                         items.push(Item::Struct(parser.parse_struct(true)))
                     }
                     _ => {
@@ -872,12 +919,89 @@ mod tests {
     #[test]
     fn assignment_statement() {
         match stmt("x = 5;") {
-            Stmt::Assign { name, value, .. } => {
-                assert_eq!(name, "x");
+            Stmt::Assign { target, value, .. } => {
+                assert_eq!(target.sexpr(), "x");
                 assert_eq!(value.sexpr(), "5");
             }
             other => panic!("expected Assign, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn field_assignment_statement() {
+        match stmt("o.i.v = 1;") {
+            Stmt::Assign { target, value, .. } => {
+                assert_eq!(target.sexpr(), "(. (. o i) v)");
+                assert_eq!(value.sexpr(), "1");
+            }
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optional_chaining_and_coalescing_parse() {
+        assert_eq!(expr("a?.b ?? c").sexpr(), "(?? (?. a b) c)");
+        assert_eq!(expr("a.b?.c").sexpr(), "(?. (. a b) c)");
+    }
+
+    #[test]
+    fn coalescing_binds_loosest() {
+        assert_eq!(expr("a ?? b || c").sexpr(), "(?? a (|| b c))");
+    }
+
+    #[test]
+    fn optional_type_annotations_parse() {
+        let (tokens, _) = lex("fun f(p: Point?): int? { return 1; }");
+        let (ast, pd) = parse(&tokens);
+        assert!(pd.is_empty(), "parse errors: {pd:?}");
+        let Item::Function(f) = &ast[0] else { panic!() };
+        assert_eq!(
+            f.params[0].ty,
+            TypeAnn::Optional(Box::new(TypeAnn::Named("Point".into())))
+        );
+        assert_eq!(f.return_type, Some(TypeAnn::Optional(Box::new(TypeAnn::Int))));
+    }
+
+    #[test]
+    fn let_bindings_take_optional_annotations() {
+        match stmt("var head: Node? = null;") {
+            Stmt::Let { ty, value, .. } => {
+                assert_eq!(
+                    ty,
+                    Some(TypeAnn::Optional(Box::new(TypeAnn::Named("Node".into()))))
+                );
+                assert_eq!(value.sexpr(), "null");
+            }
+            other => panic!("expected Let, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optional_chain_is_not_a_place() {
+        let (tokens, _) = lex("a?.b = 1;");
+        let mut p = Parser::new(&tokens);
+        p.parse_stmt();
+        assert!(
+            p.diagnostics
+                .iter()
+                .any(|e| e.message.contains("invalid assignment target")),
+            "{:?}",
+            p.diagnostics
+        );
+    }
+
+    #[test]
+    fn non_place_assignment_target_is_an_error() {
+        let (tokens, _) = lex("f() = 1;");
+        let mut p = Parser::new(&tokens);
+        p.parse_stmt();
+        assert!(
+            p.diagnostics
+                .iter()
+                .any(|e| e.message.contains("invalid assignment target")),
+            "{:?}",
+            p.diagnostics
+        );
     }
 
     #[test]
@@ -904,6 +1028,19 @@ mod tests {
             }
             other => panic!("expected function, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn refstruct_sets_the_by_ref_flag() {
+        let (tokens, _) = lex("refstruct P { x: int } export refstruct Q { y: int } struct V { z: int }");
+        let (ast, pd) = parse(&tokens);
+        assert!(pd.is_empty(), "parse errors: {pd:?}");
+        let Item::Struct(p) = &ast[0] else { panic!() };
+        assert!(p.by_ref && !p.exported);
+        let Item::Struct(q) = &ast[1] else { panic!() };
+        assert!(q.by_ref && q.exported);
+        let Item::Struct(v) = &ast[2] else { panic!() };
+        assert!(!v.by_ref);
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub const LESS: char = '<';
 pub const GREATER: char = '>';
 pub const AMPERSAND: char = '&';
 pub const PIPE: char = '|';
+pub const QUESTION: char = '?';
 pub const UNDERSCORE: char = '_';
 
 // --- String literals ---
@@ -43,6 +44,7 @@ pub const ESCAPE_TAB: char = 't';
 // --- Keyword spellings ---
 pub const KW_FUN: &str = "fun";
 pub const KW_STRUCT: &str = "struct";
+pub const KW_REFSTRUCT: &str = "refstruct";
 pub const KW_VAR: &str = "var";
 pub const KW_CONST: &str = "const";
 pub const KW_RETURN: &str = "return";
@@ -52,6 +54,7 @@ pub const KW_BOOL: &str = "bool";
 pub const KW_STRING: &str = "string";
 pub const KW_TRUE: &str = "true";
 pub const KW_FALSE: &str = "false";
+pub const KW_NULL: &str = "null";
 pub const KW_IF: &str = "if";
 pub const KW_ELSE: &str = "else";
 pub const KW_WHILE: &str = "while";

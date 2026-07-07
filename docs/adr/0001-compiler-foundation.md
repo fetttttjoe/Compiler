@@ -107,5 +107,5 @@ rendering), CLI file input / REPL (`main.rs`).
 > **Amendment (2026-07-07):** booleans/comparisons/control flow landed (ADR
 > 0002), and caret-underline diagnostic rendering landed in
 > `Diagnostic::render` — both rows above are done. CLI file input landed with
-> multi-file compilation (ADR 0003). Remaining seats: struct runtime values,
-> codegen, REPL.
+> multi-file compilation (ADR 0003). Struct runtime values landed
+> (`Value::Struct` in `interpreter.rs`). Remaining seats: codegen, REPL.

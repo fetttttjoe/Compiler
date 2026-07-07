@@ -107,6 +107,7 @@ impl Lexer<'_> {
             syntax::QUOTE => self.scan_string(),
             syntax::AMPERSAND => self.double(syntax::AMPERSAND, TokenKind::AmpAmp),
             syntax::PIPE => self.double(syntax::PIPE, TokenKind::PipePipe),
+            syntax::QUESTION => self.scan_question(),
             syntax::SLASH => self.scan_slash_or_comment(),
             c if c.is_ascii_digit() => self.scan_number(),
             c if c.is_alphabetic() || c == syntax::UNDERSCORE => Some(self.scan_identifier()),
@@ -136,6 +137,22 @@ impl Lexer<'_> {
             Some(double)
         } else {
             Some(single)
+        }
+    }
+
+    /// `?` and its two-char forms: `??` (coalescing) and `?.` (chaining).
+    fn scan_question(&mut self) -> Option<TokenKind> {
+        self.bump();
+        match self.peek() {
+            Some(syntax::QUESTION) => {
+                self.bump();
+                Some(TokenKind::QuestionQuestion)
+            }
+            Some(syntax::DOT) => {
+                self.bump();
+                Some(TokenKind::QuestionDot)
+            }
+            _ => Some(TokenKind::Question),
         }
     }
 
@@ -288,6 +305,7 @@ impl Lexer<'_> {
         match &self.source[start..self.pos] {
             syntax::KW_FUN => TokenKind::Fun,
             syntax::KW_STRUCT => TokenKind::Struct,
+            syntax::KW_REFSTRUCT => TokenKind::RefStruct,
             syntax::KW_VAR => TokenKind::Var,
             syntax::KW_CONST => TokenKind::Const,
             syntax::KW_RETURN => TokenKind::Return,
@@ -299,6 +317,7 @@ impl Lexer<'_> {
             syntax::KW_FROM => TokenKind::From,
             syntax::KW_TRUE => TokenKind::True,
             syntax::KW_FALSE => TokenKind::False,
+            syntax::KW_NULL => TokenKind::Null,
             syntax::KW_INT => TokenKind::IntType,
             syntax::KW_FLOAT => TokenKind::FloatType,
             syntax::KW_BOOL => TokenKind::BoolType,
@@ -321,6 +340,28 @@ mod tests {
         assert_eq!(
             kinds("fun foo"),
             vec![TokenKind::Fun, TokenKind::Identifier("foo".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn refstruct_is_a_keyword_not_an_identifier() {
+        assert_eq!(
+            kinds("refstruct struct"),
+            vec![TokenKind::RefStruct, TokenKind::Struct, TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn question_operators_and_null() {
+        assert_eq!(
+            kinds("? ?? ?. null"),
+            vec![
+                TokenKind::Question,
+                TokenKind::QuestionQuestion,
+                TokenKind::QuestionDot,
+                TokenKind::Null,
+                TokenKind::Eof
+            ]
         );
     }
 

@@ -46,7 +46,7 @@ fn main() {
     }
 
     match interpreter::interpret(&graph, &resolutions) {
-        Ok(value) => println!("=> {value:?}"),
+        Ok(value) => println!("=> {}", value.render()),
         Err(diag) => exit_on_errors(&[diag], &map),
     }
 }

@@ -56,7 +56,7 @@
       "patterns": [
         {
           "name": "storage.type.ys",
-          "match": "\\b(const|fun|struct|var)\\b"
+          "match": "\\b(const|fun|refstruct|struct|var)\\b"
         },
         {
           "name": "keyword.control.ys",
@@ -68,7 +68,7 @@
         },
         {
           "name": "constant.language.ys",
-          "match": "\\b(false|true)\\b"
+          "match": "\\b(false|null|true)\\b"
         }
       ]
     },
@@ -82,7 +82,7 @@
     },
     "operators": {
       "name": "keyword.operator.ys",
-      "match": "==|!=|<=|>=|&&|\\|\\||[-+*/%=<>!]"
+      "match": "\\?\\?|\\?\\.|==|!=|<=|>=|&&|\\|\\||[-+*/%=<>!?]"
     }
   }
 }

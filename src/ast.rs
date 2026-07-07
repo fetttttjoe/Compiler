@@ -38,6 +38,9 @@ pub struct Param {
 #[derive(Debug, PartialEq)]
 pub struct Struct {
     pub exported: bool,
+    /// True for `refstruct` — reference semantics (shared, aliased) instead
+    /// of the default value semantics (copied).
+    pub by_ref: bool,
     pub name: String,
     pub fields: Vec<Field>,
     pub span: Span,
@@ -56,19 +59,26 @@ pub enum TypeAnn {
     Bool,
     Str,
     Named(String),
+    /// `T?` — T or null.
+    Optional(Box<TypeAnn>),
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Stmt {
-    /// `var`/`const` binding. `mutable` is true for `var`.
+    /// `var`/`const` binding. `mutable` is true for `var`. The annotation is
+    /// optional (`var x: Node? = null;`) — required only when the
+    /// initializer alone can't name the type (a bare `null`).
     Let {
         mutable: bool,
         name: String,
+        ty: Option<TypeAnn>,
         value: Expr,
         span: Span,
     },
+    /// `target = value;` — target is a place: a variable or a field chain
+    /// rooted at one (`x`, `p.x`, `o.i.v`). The parser rejects anything else.
     Assign {
-        name: String,
+        target: Expr,
         value: Expr,
         span: Span,
     },
@@ -98,6 +108,7 @@ pub enum Expr {
     Bool(bool, Span),
     Str(String, Span),
     Ident(String, Span),
+    Null(Span),
     Unary {
         op: UnOp,
         rhs: Box<Expr>,
@@ -117,6 +128,8 @@ pub enum Expr {
     Field {
         base: Box<Expr>,
         name: String,
+        /// True for `?.` — null short-circuits instead of erroring.
+        optional: bool,
         span: Span,
     },
     StructLit {
@@ -141,6 +154,8 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
+    /// `??` — left side unless it's null, then the (lazily evaluated) right.
+    Coalesce,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -165,6 +180,7 @@ impl BinOp {
             BinOp::Le => "<=",
             BinOp::Gt => ">",
             BinOp::Ge => ">=",
+            BinOp::Coalesce => "??",
         }
     }
 }
@@ -186,7 +202,8 @@ impl Expr {
             | Expr::Float(_, s)
             | Expr::Bool(_, s)
             | Expr::Str(_, s)
-            | Expr::Ident(_, s) => *s,
+            | Expr::Ident(_, s)
+            | Expr::Null(s) => *s,
             Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Call { span, .. }
@@ -204,6 +221,7 @@ impl Expr {
             Expr::Bool(b, _) => b.to_string(),
             Expr::Str(s, _) => format!("{s:?}"),
             Expr::Ident(name, _) => name.clone(),
+            Expr::Null(_) => "null".to_string(),
             Expr::Unary { op, rhs, .. } => format!("({} {})", op.symbol(), rhs.sexpr()),
             Expr::Binary { op, lhs, rhs, .. } => {
                 format!("({} {} {})", op.symbol(), lhs.sexpr(), rhs.sexpr())
@@ -212,7 +230,15 @@ impl Expr {
                 let args: Vec<String> = args.iter().map(Expr::sexpr).collect();
                 format!("(call {} {})", callee.sexpr(), args.join(" "))
             }
-            Expr::Field { base, name, .. } => format!("(. {} {})", base.sexpr(), name),
+            Expr::Field {
+                base,
+                name,
+                optional,
+                ..
+            } => {
+                let op = if *optional { "?." } else { "." };
+                format!("({op} {} {})", base.sexpr(), name)
+            }
             Expr::StructLit { name, fields, .. } => {
                 let fs: Vec<String> = fields
                     .iter()
