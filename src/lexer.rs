@@ -209,8 +209,12 @@ impl Lexer<'_> {
             self.bump();
             Some(both)
         } else {
+            let found = match self.peek() {
+                Some(c) => format!("'{c}'"),
+                None => "end of input".to_string(),
+            };
             self.error(
-                format!("expected '{first}{first}'"),
+                format!("expected '{first}{first}', found {found}"),
                 self.abs_span(start),
             );
             None
@@ -353,6 +357,21 @@ mod tests {
         assert_eq!(
             kinds("&& ||"),
             vec![TokenKind::AmpAmp, TokenKind::PipePipe, TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lone_ampersand_reports_what_was_found() {
+        let (_, diags) = lex("a &x");
+        assert_eq!(diags.len(), 1);
+        assert!(
+            diags[0].message.contains("expected '&&', found 'x'"),
+            "{diags:?}"
+        );
+        let (_, diags) = lex("a &");
+        assert!(
+            diags[0].message.contains("expected '&&', found end of input"),
+            "{diags:?}"
         );
     }
 

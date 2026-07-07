@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{BinOp, Expr, Function, Item, Stmt, TypeAnn, UnOp};
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{closest, Diagnostic};
 use crate::modules::ModuleGraph;
 use crate::span::Span;
 
@@ -90,20 +90,36 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
             let fn_export = target.fns.get(&binding.name).copied();
             let ty_export = target.structs.get(&binding.name).copied();
             if fn_export.is_none() && ty_export.is_none() {
-                diags.push(Diagnostic::error(
+                let mut diag = Diagnostic::error(
                     format!("module '{target_path}' has no item '{}'", binding.name),
                     binding.span,
-                ));
+                );
+                let exported_names = target
+                    .fns
+                    .iter()
+                    .chain(target.structs.iter())
+                    .filter(|(_, &exported)| exported)
+                    .map(|(n, _)| n.as_str());
+                if let Some(suggestion) = closest(&binding.name, exported_names) {
+                    diag = diag.with_help(format!("did you mean '{suggestion}'?"));
+                }
+                diags.push(diag);
                 continue;
             }
             if fn_export != Some(true) && ty_export != Some(true) {
-                diags.push(Diagnostic::error(
-                    format!(
-                        "'{}' exists in '{target_path}' but is not exported",
+                diags.push(
+                    Diagnostic::error(
+                        format!(
+                            "'{}' exists in '{target_path}' but is not exported",
+                            binding.name
+                        ),
+                        binding.span,
+                    )
+                    .with_help(format!(
+                        "add 'export' before the definition of '{}' in '{target_path}'",
                         binding.name
-                    ),
-                    binding.span,
-                ));
+                    )),
+                );
                 continue;
             }
             if fn_alias.contains_key(&binding.name) || ty_alias.contains_key(&binding.name) {
@@ -161,11 +177,13 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
     }
 
     // Pass D: check every function body against its module's view.
+    let paths: Vec<&str> = graph.modules.iter().map(|m| m.path.as_str()).collect();
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             if let Item::Function(f) = item {
                 let mut checker = Checker {
                     module: mi,
+                    paths: &paths,
                     fn_alias: &fn_aliases[mi],
                     ty_alias: &ty_aliases[mi],
                     sigs: &sigs,
@@ -225,7 +243,11 @@ fn resolve_type(
         TypeAnn::Named(name) => match ty_alias.get(name) {
             Some((m, n)) => Type::Struct(*m, n.clone()),
             None => {
-                diags.push(Diagnostic::error(format!("unknown type '{name}'"), span));
+                let mut diag = Diagnostic::error(format!("unknown type '{name}'"), span);
+                if let Some(suggestion) = closest(name, ty_alias.keys().map(String::as_str)) {
+                    diag = diag.with_help(format!("did you mean '{suggestion}'?"));
+                }
+                diags.push(diag);
                 Type::Unit // recovery
             }
         },
@@ -239,6 +261,7 @@ struct VarInfo {
 
 struct Checker<'a> {
     module: usize,
+    paths: &'a [&'a str],
     fn_alias: &'a Alias,
     ty_alias: &'a Alias,
     sigs: &'a HashMap<(usize, String), FnSig>,
@@ -251,6 +274,18 @@ struct Checker<'a> {
 impl<'a> Checker<'a> {
     fn error(&mut self, message: String, span: Span) {
         self.diagnostics.push(Diagnostic::error(message, span));
+    }
+
+    /// A type name for messages: structs from *other* modules carry their
+    /// defining file, so same-named types stay distinguishable
+    /// (`P (from a.ys)` vs `P`).
+    fn type_name(&self, t: &Type) -> String {
+        match t {
+            Type::Struct(m, n) if *m != self.module => {
+                format!("{n} (from {})", self.paths[*m])
+            }
+            _ => t.name(),
+        }
     }
 
     fn check_function(&mut self, f: &Function) {
@@ -288,7 +323,10 @@ impl<'a> Checker<'a> {
         let ty = self.type_of_expr(cond);
         if ty != Type::Bool {
             self.error(
-                format!("{keyword} condition must be bool, found {}", ty.name()),
+                format!(
+                    "{keyword} condition must be bool, found {}",
+                    self.type_name(&ty)
+                ),
                 cond.span(),
             );
         }
@@ -320,8 +358,8 @@ impl<'a> Checker<'a> {
                     self.error(
                         format!(
                             "expected return type {}, found {}",
-                            self.ret.name(),
-                            ty.name()
+                            self.type_name(&self.ret.clone()),
+                            self.type_name(&ty)
                         ),
                         *span,
                     );
@@ -360,8 +398,8 @@ impl<'a> Checker<'a> {
                             self.error(
                                 format!(
                                     "cannot assign {} to variable of type {}",
-                                    value_ty.name(),
-                                    binding_ty.name()
+                                    self.type_name(&value_ty),
+                                    self.type_name(&binding_ty)
                                 ),
                                 *span,
                             );
@@ -384,12 +422,15 @@ impl<'a> Checker<'a> {
                 match op {
                     UnOp::Neg if is_numeric(&ty) => ty,
                     UnOp::Neg => {
-                        self.error(format!("cannot negate {}", ty.name()), *span);
+                        self.error(format!("cannot negate {}", self.type_name(&ty)), *span);
                         ty
                     }
                     UnOp::Not if ty == Type::Bool => Type::Bool,
                     UnOp::Not => {
-                        self.error(format!("cannot apply '!' to {}", ty.name()), *span);
+                        self.error(
+                            format!("cannot apply '!' to {}", self.type_name(&ty)),
+                            *span,
+                        );
                         Type::Bool
                     }
                 }
@@ -425,8 +466,8 @@ impl<'a> Checker<'a> {
                 format!(
                     "cannot apply '{}' to {} and {}",
                     op.symbol(),
-                    lt.name(),
-                    rt.name()
+                    self.type_name(&lt),
+                    self.type_name(&rt)
                 ),
                 span,
             );
@@ -446,7 +487,16 @@ impl<'a> Checker<'a> {
         // independent of the `&mut self` calls below — no clone needed.
         let sigs = self.sigs;
         let Some(target) = self.fn_alias.get(&name) else {
-            self.error(format!("undefined function '{name}'"), span);
+            let mut diag = Diagnostic::error(format!("undefined function '{name}'"), span);
+            if let Some(suggestion) = closest(&name, self.fn_alias.keys().map(String::as_str)) {
+                diag = diag.with_help(format!("did you mean '{suggestion}'?"));
+            }
+            self.diagnostics.push(diag);
+            // Still check the arguments — their own errors shouldn't vanish
+            // just because the callee is unknown.
+            for arg in args {
+                self.type_of_expr(arg);
+            }
             return Type::Unit;
         };
         let sig = &sigs[target];
@@ -467,8 +517,8 @@ impl<'a> Checker<'a> {
                 self.error(
                     format!(
                         "expected argument of type {}, found {}",
-                        expected.name(),
-                        got.name()
+                        self.type_name(expected),
+                        self.type_name(&got)
                     ),
                     arg.span(),
                 );
@@ -482,7 +532,10 @@ impl<'a> Checker<'a> {
         let (sm, struct_name) = match &base_ty {
             Type::Struct(m, n) => (*m, n.clone()),
             _ => {
-                self.error(format!("type {} has no fields", base_ty.name()), span);
+                self.error(
+                    format!("type {} has no fields", self.type_name(&base_ty)),
+                    span,
+                );
                 return Type::Unit;
             }
         };
@@ -506,7 +559,11 @@ impl<'a> Checker<'a> {
     fn check_struct_lit(&mut self, name: &str, fields: &[(String, Expr)], span: Span) -> Type {
         let structs = self.structs;
         let Some(key) = self.ty_alias.get(name) else {
-            self.error(format!("unknown struct '{name}'"), span);
+            let mut diag = Diagnostic::error(format!("unknown struct '{name}'"), span);
+            if let Some(suggestion) = closest(name, self.ty_alias.keys().map(String::as_str)) {
+                diag = diag.with_help(format!("did you mean '{suggestion}'?"));
+            }
+            self.diagnostics.push(diag);
             for (_, value) in fields {
                 self.type_of_expr(value);
             }
@@ -528,8 +585,8 @@ impl<'a> Checker<'a> {
                         self.error(
                             format!(
                                 "field '{fname}' expects {}, found {}",
-                                expected.name(),
-                                got.name()
+                                self.type_name(expected),
+                                self.type_name(&got)
                             ),
                             value.span(),
                         );
@@ -558,7 +615,12 @@ impl<'a> Checker<'a> {
         if let Some(info) = self.find_var(name) {
             return info.ty.clone();
         }
-        self.error(format!("undefined variable '{name}'"), span);
+        let visible = self.scopes.iter().flat_map(|s| s.keys().map(String::as_str));
+        let mut diag = Diagnostic::error(format!("undefined variable '{name}'"), span);
+        if let Some(suggestion) = closest(name, visible) {
+            diag = diag.with_help(format!("did you mean '{suggestion}'?"));
+        }
+        self.diagnostics.push(diag);
         Type::Unit
     }
 }
@@ -881,10 +943,73 @@ mod tests {
                 "export struct P { x: int }\nexport fun take(p: P): int { return p.x; }",
             ),
         ]);
-        // a.P and b.P share a name but are different types.
+        // a.P and b.P share a name but are different types — and the message
+        // says where each one lives.
         assert!(
-            d.iter()
-                .any(|e| e.message.contains("expected argument of type P, found P")),
+            d.iter().any(|e| e
+                .message
+                .contains("expected argument of type P (from b.ys), found P (from a.ys)")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn undefined_names_suggest_close_matches() {
+        let d = diags("fun f(): int { const account = 1; return acount; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("undefined variable 'acount'")
+                && e.help.as_deref() == Some("did you mean 'account'?")),
+            "{d:?}"
+        );
+
+        let d = diags(
+            "fun fibonacci(n: int): int { return n; }\n\
+             fun main(): int { const answer = 1; return fibonaci(answr); }",
+        );
+        assert!(
+            d.iter().any(|e| e.message.contains("undefined function 'fibonaci'")
+                && e.help.as_deref() == Some("did you mean 'fibonacci'?")),
+            "{d:?}"
+        );
+        // Arguments are still checked even when the callee is unknown.
+        assert!(
+            d.iter().any(|e| e.message.contains("undefined variable 'answr'")
+                && e.help.as_deref() == Some("did you mean 'answer'?")),
+            "{d:?}"
+        );
+
+        let d = diags("struct Point { x: int } fun f(): int { const p = Pont { x: 1 }; return 1; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("unknown struct 'Pont'")
+                && e.help.as_deref() == Some("did you mean 'Point'?")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn unexported_import_gets_an_export_hint() {
+        let (_, d) = multi(&[
+            ("main.ys", "import { hidden } from \"./lib\"; fun main(): int { return 1; }"),
+            ("lib.ys", "fun hidden(): int { return 1; }"),
+        ]);
+        assert!(
+            d.iter().any(|e| e.message.contains("is not exported")
+                && e.help
+                    .as_deref()
+                    .is_some_and(|h| h.contains("add 'export' before the definition of 'hidden'"))),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn misspelled_import_suggests_an_exported_name() {
+        let (_, d) = multi(&[
+            ("main.ys", "import { doubel } from \"./lib\"; fun main(): int { return 1; }"),
+            ("lib.ys", "export fun double(n: int): int { return n * 2; }"),
+        ]);
+        assert!(
+            d.iter().any(|e| e.message.contains("has no item 'doubel'")
+                && e.help.as_deref() == Some("did you mean 'double'?")),
             "{d:?}"
         );
     }
