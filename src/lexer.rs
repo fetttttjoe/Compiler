@@ -3,8 +3,10 @@ use crate::span::Span;
 use crate::syntax;
 use crate::token::{Token, TokenKind};
 
-/// Tokenizes `source`. Always returns a stream ending in `TokenKind::Eof`.
-/// Unknown characters produce a diagnostic and are skipped (recovery).
+/// Tokenizes a standalone source string (base offset 0) — the single-file
+/// convenience used throughout the test suites; production code lexes files
+/// into the global offset space via `lex_at`.
+#[cfg(test)]
 pub fn lex(source: &str) -> (Vec<Token>, Vec<Diagnostic>) {
     lex_at(source, 0)
 }

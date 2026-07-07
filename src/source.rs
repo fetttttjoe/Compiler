@@ -10,10 +10,6 @@ pub struct SourceFile {
 }
 
 impl SourceFile {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     pub fn text(&self) -> &str {
         &self.text
     }
