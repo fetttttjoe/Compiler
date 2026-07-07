@@ -8,14 +8,40 @@ fn compiler(args: &[&str]) -> Output {
 }
 
 #[test]
-fn runs_a_multi_file_program() {
-    let out = compiler(&["examples/math.ys", "examples/main.ys"]);
+fn runs_a_program_from_its_entry_file() {
+    // examples/main.ys imports fib from examples/math.ys — discovery loads it.
+    let out = compiler(&["examples/main.ys"]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "=> Int(55)");
+}
+
+#[test]
+fn more_than_one_argument_is_a_usage_error() {
+    let out = compiler(&["examples/main.ys", "examples/math.ys"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("usage:"));
+}
+
+#[test]
+fn import_cycles_fail_with_the_cycle_path() {
+    let out = compiler(&["tests/fixtures/cycle_a.ys"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("import cycle"), "{err}");
+    assert!(err.contains("cycle_a.ys"), "{err}");
+    assert!(err.contains("cycle_b.ys"), "{err}");
+}
+
+#[test]
+fn importing_a_private_item_fails() {
+    let out = compiler(&["tests/fixtures/uses_private.ys"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("is not exported"), "{err}");
 }
 
 #[test]

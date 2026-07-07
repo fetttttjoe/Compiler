@@ -1,0 +1,5 @@
+import { b } from "./cycle_b";
+
+fun main(): int {
+    return b();
+}

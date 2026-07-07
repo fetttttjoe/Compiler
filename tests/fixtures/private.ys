@@ -1,0 +1,3 @@
+fun hidden(): int {
+    return 42;
+}

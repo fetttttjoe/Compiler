@@ -1,0 +1,5 @@
+import { hidden } from "./private";
+
+fun main(): int {
+    return hidden();
+}

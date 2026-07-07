@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Ast, BinOp, Expr, Function, Item, Stmt, TypeAnn, UnOp};
+use crate::ast::{BinOp, Expr, Function, Item, Stmt, TypeAnn, UnOp};
 use crate::diagnostic::Diagnostic;
+use crate::modules::ModuleGraph;
 use crate::span::Span;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -10,7 +11,9 @@ pub enum Type {
     Float,
     Bool,
     Str,
-    Struct(String),
+    /// A struct type identified by (defining module, name) — same-named
+    /// structs in different modules are distinct types.
+    Struct(usize, String),
     Unit,
 }
 
@@ -21,7 +24,7 @@ impl Type {
             Type::Float => "float".to_string(),
             Type::Bool => "bool".to_string(),
             Type::Str => "string".to_string(),
-            Type::Struct(n) => n.clone(),
+            Type::Struct(_, n) => n.clone(),
             Type::Unit => "unit".to_string(),
         }
     }
@@ -38,94 +41,179 @@ pub struct StructType {
     pub fields: Vec<(String, Type)>,
 }
 
-#[derive(Debug, Default)]
-pub struct SymbolTable {
-    pub functions: HashMap<String, FnSig>,
-    pub structs: HashMap<String, StructType>,
+/// A per-module view: visible name → the (module, name) that defines it.
+type Alias = HashMap<String, (usize, String)>;
+
+/// Name-resolution results — the checker's durable output. For every module,
+/// each callable name maps to its defining (module, name), locals and imports
+/// alike. Consumed by the interpreter (and later codegen).
+pub struct Resolutions {
+    pub functions: Vec<Alias>,
 }
 
-/// Static type checking. Returns the resolved symbol table (used later by
-/// codegen) and every type error found. Empty diagnostics = well-typed.
-pub fn check(ast: &Ast) -> (SymbolTable, Vec<Diagnostic>) {
-    let mut diagnostics = Vec::new();
-    let table = collect_signatures(ast, &mut diagnostics);
-    for item in ast {
-        if let Item::Function(f) = item {
-            let mut checker = Checker::new(&table, &mut diagnostics);
-            checker.check_function(f);
-        }
-    }
-    (table, diagnostics)
+/// One module's declared names with their export flags.
+struct ModuleNames {
+    fns: HashMap<String, bool>,
+    structs: HashMap<String, bool>,
 }
 
-fn collect_signatures(ast: &Ast, diags: &mut Vec<Diagnostic>) -> SymbolTable {
-    // First gather declared struct names so `Named` types can be resolved
-    // regardless of declaration order.
-    let struct_names: HashSet<String> = ast
+/// Static type checking over the whole module graph. Empty diagnostics =
+/// well-typed program.
+pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
+    let mut diags = Vec::new();
+
+    // Pass A: every module's own names + intra-file duplicate detection.
+    let names: Vec<ModuleNames> = graph
+        .modules
         .iter()
-        .filter_map(|item| match item {
-            Item::Struct(s) => Some(s.name.clone()),
-            _ => None,
-        })
+        .map(|m| collect_names(&m.ast, &mut diags))
         .collect();
 
-    let mut table = SymbolTable::default();
+    // Pass B: alias maps — locals plus imported bindings, with import errors
+    // (unknown item, not exported, collision within this file).
+    let mut fn_aliases: Vec<Alias> = Vec::new();
+    let mut ty_aliases: Vec<Alias> = Vec::new();
+    for (mi, module) in graph.modules.iter().enumerate() {
+        let mut fn_alias: Alias = names[mi]
+            .fns
+            .keys()
+            .map(|n| (n.clone(), (mi, n.clone())))
+            .collect();
+        let mut ty_alias: Alias = names[mi]
+            .structs
+            .keys()
+            .map(|n| (n.clone(), (mi, n.clone())))
+            .collect();
+        for binding in &module.imports {
+            let target = &names[binding.target];
+            let target_path = &graph.modules[binding.target].path;
+            let fn_export = target.fns.get(&binding.name).copied();
+            let ty_export = target.structs.get(&binding.name).copied();
+            if fn_export.is_none() && ty_export.is_none() {
+                diags.push(Diagnostic::error(
+                    format!("module '{target_path}' has no item '{}'", binding.name),
+                    binding.span,
+                ));
+                continue;
+            }
+            if fn_export != Some(true) && ty_export != Some(true) {
+                diags.push(Diagnostic::error(
+                    format!(
+                        "'{}' exists in '{target_path}' but is not exported",
+                        binding.name
+                    ),
+                    binding.span,
+                ));
+                continue;
+            }
+            if fn_alias.contains_key(&binding.name) || ty_alias.contains_key(&binding.name) {
+                diags.push(Diagnostic::error(
+                    format!("'{}' is already defined in this file", binding.name),
+                    binding.span,
+                ));
+                continue;
+            }
+            if fn_export == Some(true) {
+                fn_alias.insert(binding.name.clone(), (binding.target, binding.name.clone()));
+            }
+            if ty_export == Some(true) {
+                ty_alias.insert(binding.name.clone(), (binding.target, binding.name.clone()));
+            }
+        }
+        fn_aliases.push(fn_alias);
+        ty_aliases.push(ty_alias);
+    }
+
+    // Pass C: resolve signatures and struct layouts through the alias maps.
+    let mut sigs: HashMap<(usize, String), FnSig> = HashMap::new();
+    let mut structs: HashMap<(usize, String), StructType> = HashMap::new();
+    for (mi, module) in graph.modules.iter().enumerate() {
+        for item in &module.ast {
+            match item {
+                Item::Struct(s) => {
+                    let fields = s
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            (
+                                f.name.clone(),
+                                resolve_type(&f.ty, &ty_aliases[mi], s.span, &mut diags),
+                            )
+                        })
+                        .collect();
+                    structs.insert((mi, s.name.clone()), StructType { fields });
+                }
+                Item::Function(f) => {
+                    let params = f
+                        .params
+                        .iter()
+                        .map(|p| resolve_type(&p.ty, &ty_aliases[mi], f.span, &mut diags))
+                        .collect();
+                    let ret = match &f.return_type {
+                        Some(t) => resolve_type(t, &ty_aliases[mi], f.span, &mut diags),
+                        None => Type::Unit,
+                    };
+                    sigs.insert((mi, f.name.clone()), FnSig { params, ret });
+                }
+                Item::Import(_) => {}
+            }
+        }
+    }
+
+    // Pass D: check every function body against its module's view.
+    for (mi, module) in graph.modules.iter().enumerate() {
+        for item in &module.ast {
+            if let Item::Function(f) = item {
+                let mut checker = Checker {
+                    module: mi,
+                    fn_alias: &fn_aliases[mi],
+                    ty_alias: &ty_aliases[mi],
+                    sigs: &sigs,
+                    structs: &structs,
+                    diagnostics: &mut diags,
+                    scopes: Vec::new(),
+                    ret: Type::Unit,
+                };
+                checker.check_function(f);
+            }
+        }
+    }
+
+    (Resolutions { functions: fn_aliases }, diags)
+}
+
+fn collect_names(ast: &[Item], diags: &mut Vec<Diagnostic>) -> ModuleNames {
+    let mut names = ModuleNames {
+        fns: HashMap::new(),
+        structs: HashMap::new(),
+    };
     for item in ast {
         match item {
-            // Imports resolve per-module in the module-aware pass (next task).
-            Item::Import(_) => {}
-            Item::Struct(s) => {
-                let fields = s
-                    .fields
-                    .iter()
-                    .map(|f| {
-                        (
-                            f.name.clone(),
-                            resolve_type(&f.ty, &struct_names, s.span, diags),
-                        )
-                    })
-                    .collect();
-                // `insert` returns the previous value if the name was already defined.
-                if table
-                    .structs
-                    .insert(s.name.clone(), StructType { fields })
-                    .is_some()
-                {
-                    diags.push(Diagnostic::error(
-                        format!("struct '{}' is already defined", s.name),
-                        s.span,
-                    ));
-                }
-            }
             Item::Function(f) => {
-                let params = f
-                    .params
-                    .iter()
-                    .map(|p| resolve_type(&p.ty, &struct_names, f.span, diags))
-                    .collect();
-                let ret = match &f.return_type {
-                    Some(t) => resolve_type(t, &struct_names, f.span, diags),
-                    None => Type::Unit,
-                };
-                if table
-                    .functions
-                    .insert(f.name.clone(), FnSig { params, ret })
-                    .is_some()
-                {
+                if names.fns.insert(f.name.clone(), f.exported).is_some() {
                     diags.push(Diagnostic::error(
                         format!("function '{}' is already defined", f.name),
                         f.span,
                     ));
                 }
             }
+            Item::Struct(s) => {
+                if names.structs.insert(s.name.clone(), s.exported).is_some() {
+                    diags.push(Diagnostic::error(
+                        format!("struct '{}' is already defined", s.name),
+                        s.span,
+                    ));
+                }
+            }
+            Item::Import(_) => {}
         }
     }
-    table
+    names
 }
 
 fn resolve_type(
     ann: &TypeAnn,
-    structs: &HashSet<String>,
+    ty_alias: &Alias,
     span: Span,
     diags: &mut Vec<Diagnostic>,
 ) -> Type {
@@ -134,14 +222,13 @@ fn resolve_type(
         TypeAnn::Float => Type::Float,
         TypeAnn::Bool => Type::Bool,
         TypeAnn::Str => Type::Str,
-        TypeAnn::Named(name) => {
-            if structs.contains(name) {
-                Type::Struct(name.clone())
-            } else {
+        TypeAnn::Named(name) => match ty_alias.get(name) {
+            Some((m, n)) => Type::Struct(*m, n.clone()),
+            None => {
                 diags.push(Diagnostic::error(format!("unknown type '{name}'"), span));
                 Type::Unit // recovery
             }
-        }
+        },
     }
 }
 
@@ -151,28 +238,23 @@ struct VarInfo {
 }
 
 struct Checker<'a> {
-    table: &'a SymbolTable,
+    module: usize,
+    fn_alias: &'a Alias,
+    ty_alias: &'a Alias,
+    sigs: &'a HashMap<(usize, String), FnSig>,
+    structs: &'a HashMap<(usize, String), StructType>,
     diagnostics: &'a mut Vec<Diagnostic>,
     scopes: Vec<HashMap<String, VarInfo>>,
     ret: Type,
 }
 
 impl<'a> Checker<'a> {
-    fn new(table: &'a SymbolTable, diagnostics: &'a mut Vec<Diagnostic>) -> Self {
-        Checker {
-            table,
-            diagnostics,
-            scopes: Vec::new(),
-            ret: Type::Unit,
-        }
-    }
-
     fn error(&mut self, message: String, span: Span) {
         self.diagnostics.push(Diagnostic::error(message, span));
     }
 
     fn check_function(&mut self, f: &Function) {
-        let sig = self.table.functions[&f.name].clone();
+        let sig = self.sigs[&(self.module, f.name.clone())].clone();
         self.ret = sig.ret;
         let mut scope = HashMap::new();
         for (param, ty) in f.params.iter().zip(sig.params) {
@@ -360,16 +442,14 @@ impl<'a> Checker<'a> {
                 return Type::Unit;
             }
         };
-        // Copy the table reference out of `self` so the signature borrow is
+        // Copy the map references out of `self` so the signature borrow is
         // independent of the `&mut self` calls below — no clone needed.
-        let table = self.table;
-        let sig = match table.functions.get(&name) {
-            Some(sig) => sig,
-            None => {
-                self.error(format!("undefined function '{name}'"), span);
-                return Type::Unit;
-            }
+        let sigs = self.sigs;
+        let Some(target) = self.fn_alias.get(&name) else {
+            self.error(format!("undefined function '{name}'"), span);
+            return Type::Unit;
         };
+        let sig = &sigs[target];
         if args.len() != sig.params.len() {
             self.error(
                 format!(
@@ -399,17 +479,16 @@ impl<'a> Checker<'a> {
 
     fn check_field(&mut self, base: &Expr, field: &str, span: Span) -> Type {
         let base_ty = self.type_of_expr(base);
-        let struct_name = match &base_ty {
-            Type::Struct(n) => n.clone(),
+        let (sm, struct_name) = match &base_ty {
+            Type::Struct(m, n) => (*m, n.clone()),
             _ => {
                 self.error(format!("type {} has no fields", base_ty.name()), span);
                 return Type::Unit;
             }
         };
         let field_ty = self
-            .table
             .structs
-            .get(&struct_name)
+            .get(&(sm, struct_name.clone()))
             .and_then(|st| st.fields.iter().find(|(fname, _)| fname == field))
             .map(|(_, ty)| ty.clone());
         match field_ty {
@@ -425,17 +504,15 @@ impl<'a> Checker<'a> {
     }
 
     fn check_struct_lit(&mut self, name: &str, fields: &[(String, Expr)], span: Span) -> Type {
-        let table = self.table;
-        let decl = match table.structs.get(name) {
-            Some(st) => st,
-            None => {
-                self.error(format!("unknown struct '{name}'"), span);
-                for (_, value) in fields {
-                    self.type_of_expr(value);
-                }
-                return Type::Unit;
+        let structs = self.structs;
+        let Some(key) = self.ty_alias.get(name) else {
+            self.error(format!("unknown struct '{name}'"), span);
+            for (_, value) in fields {
+                self.type_of_expr(value);
             }
+            return Type::Unit;
         };
+        let decl = &structs[key];
         let mut seen = HashSet::new();
         for (fname, value) in fields {
             if !seen.insert(fname.clone()) {
@@ -469,7 +546,7 @@ impl<'a> Checker<'a> {
                 self.error(format!("missing field '{dn}' in struct '{name}'"), span);
             }
         }
-        Type::Struct(name.to_string())
+        Type::Struct(key.0, key.1.clone())
     }
 
     /// The innermost binding for `name`, searching scopes inside-out.
@@ -512,40 +589,67 @@ fn always_returns(stmts: &[Stmt]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::{load_program, Module};
+    use crate::source::SourceMap;
     use crate::{lexer::lex, parser::parse};
 
-    fn table(src: &str) -> (SymbolTable, Vec<Diagnostic>) {
+    fn graph_of(src: &str) -> ModuleGraph {
         let (tokens, ld) = lex(src);
         assert!(ld.is_empty(), "lex: {ld:?}");
         let (ast, pd) = parse(&tokens);
         assert!(pd.is_empty(), "parse: {pd:?}");
-        check(&ast)
+        ModuleGraph {
+            modules: vec![Module {
+                path: "test.ys".to_string(),
+                ast,
+                imports: Vec::new(),
+            }],
+        }
+    }
+
+    /// Checks a multi-file program (first file = entry) through the real
+    /// module loader.
+    fn multi(files: &[(&str, &str)]) -> (Resolutions, Vec<Diagnostic>) {
+        let store: HashMap<String, String> = files
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut read = |p: &str| {
+            store
+                .get(p)
+                .cloned()
+                .ok_or_else(|| "no such file".to_string())
+        };
+        let mut map = SourceMap::new();
+        let (graph, fd) = load_program(files[0].0, &mut read, &mut map).unwrap();
+        assert!(fd.is_empty(), "front-end: {fd:?}");
+        check(&graph)
     }
 
     #[test]
-    fn collects_function_and_struct_signatures() {
-        let (t, d) = table("struct P { x: int } fun f(a: int): float { return 1.0; }");
+    fn resolves_local_names_to_the_defining_module() {
+        let (res, d) = check(&graph_of(
+            "struct P { x: int } fun f(a: int): float { return 1.0; }",
+        ));
         assert!(d.is_empty(), "unexpected diagnostics: {d:?}");
-        assert_eq!(t.functions["f"].params, vec![Type::Int]);
-        assert_eq!(t.functions["f"].ret, Type::Float);
-        assert_eq!(t.structs["P"].fields, vec![("x".to_string(), Type::Int)]);
+        assert_eq!(res.functions[0]["f"], (0, "f".to_string()));
     }
 
     #[test]
     fn duplicate_function_is_an_error() {
-        let (_, d) = table("fun f(): int { return 1; } fun f(): int { return 2; }");
+        let d = diags("fun f(): int { return 1; } fun f(): int { return 2; }");
         assert_eq!(d.len(), 1);
         assert!(d[0].message.contains("already defined"));
     }
 
     #[test]
     fn unknown_type_is_an_error() {
-        let (_, d) = table("fun f(a: Missing): int { return 1; }");
+        let (_, d) = check(&graph_of("fun f(a: Missing): int { return 1; }"));
         assert!(d.iter().any(|e| e.message.contains("unknown type 'Missing'")));
     }
 
     fn diags(src: &str) -> Vec<Diagnostic> {
-        table(src).1
+        check(&graph_of(src)).1
     }
 
     #[test]
@@ -673,6 +777,116 @@ mod tests {
     fn both_branches_returning_satisfies_definite_return() {
         let d = diags("fun f(a: bool): int { if a { return 1; } else { return 2; } }");
         assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn imported_functions_and_structs_are_usable() {
+        let (_, d) = multi(&[
+            (
+                "main.ys",
+                "import { make, Point } from \"./geo\";\n\
+                 fun main(): int { const p = make(); const q = Point { x: p.x }; return q.x; }",
+            ),
+            (
+                "geo.ys",
+                "export struct Point { x: int }\n\
+                 export fun make(): Point { return Point { x: 7 }; }",
+            ),
+        ]);
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn unknown_and_unexported_imports_have_distinct_errors() {
+        let (_, d) = multi(&[
+            ("main.ys", "import { nope } from \"./lib\"; fun main(): int { return 1; }"),
+            ("lib.ys", "fun hidden(): int { return 1; }"),
+        ]);
+        assert!(
+            d.iter().any(|e| e.message.contains("has no item 'nope'")),
+            "{d:?}"
+        );
+
+        let (_, d) = multi(&[
+            ("main.ys", "import { hidden } from \"./lib\"; fun main(): int { return 1; }"),
+            ("lib.ys", "fun hidden(): int { return 1; }"),
+        ]);
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("'hidden' exists in 'lib.ys' but is not exported")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn import_collisions_within_one_file_are_errors() {
+        // Import colliding with a local definition.
+        let (_, d) = multi(&[
+            (
+                "main.ys",
+                "import { f } from \"./lib\";\nfun f(): int { return 2; }\nfun main(): int { return f(); }",
+            ),
+            ("lib.ys", "export fun f(): int { return 1; }"),
+        ]);
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("'f' is already defined in this file")),
+            "{d:?}"
+        );
+
+        // Import colliding with another import.
+        let (_, d) = multi(&[
+            (
+                "main.ys",
+                "import { f } from \"./a\"; import { f } from \"./b\"; fun main(): int { return f(); }",
+            ),
+            ("a.ys", "export fun f(): int { return 1; }"),
+            ("b.ys", "export fun f(): int { return 2; }"),
+        ]);
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("'f' is already defined in this file")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn same_names_in_different_modules_coexist() {
+        let (_, d) = multi(&[
+            (
+                "main.ys",
+                "import { a } from \"./a\"; import { b } from \"./b\";\n\
+                 fun main(): int { return a() + b(); }",
+            ),
+            ("a.ys", "fun helper(): int { return 1; } export fun a(): int { return helper(); }"),
+            ("b.ys", "fun helper(): int { return 2; } export fun b(): int { return helper(); }"),
+        ]);
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn same_named_structs_in_different_modules_are_distinct_types() {
+        let (_, d) = multi(&[
+            (
+                "main.ys",
+                "import { make } from \"./a\"; import { take } from \"./b\";\n\
+                 fun main(): int { return take(make()); }",
+            ),
+            (
+                "a.ys",
+                "export struct P { x: int }\nexport fun make(): P { return P { x: 1 }; }",
+            ),
+            (
+                "b.ys",
+                "export struct P { x: int }\nexport fun take(p: P): int { return p.x; }",
+            ),
+        ]);
+        // a.P and b.P share a name but are different types.
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("expected argument of type P, found P")),
+            "{d:?}"
+        );
     }
 
     #[test]

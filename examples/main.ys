@@ -1,3 +1,5 @@
+import { fib } from "./math";
+
 fun main(): int {
     return fib(10);
 }

@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
-use crate::ast::{Ast, BinOp, Expr, Function, Item, Stmt, UnOp};
+use crate::ast::{BinOp, Expr, Function, Item, Stmt, UnOp};
+use crate::check::Resolutions;
 use crate::diagnostic::Diagnostic;
+use crate::modules::ModuleGraph;
 use crate::span::Span;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,20 +27,25 @@ impl Value {
     }
 }
 
-/// Runs the program's `main()` (no arguments). Returns `Unit` if there is none.
-pub fn interpret(ast: &Ast) -> Result<Value, Diagnostic> {
-    let mut functions = HashMap::new();
-    for item in ast {
-        if let Item::Function(f) = item {
-            functions.insert(f.name.clone(), f);
+/// Runs `main()` from the entry module (graph index 0), resolving every call
+/// through its module's alias map. Returns `Unit` when there is no `main`.
+pub fn interpret(graph: &ModuleGraph, resolutions: &Resolutions) -> Result<Value, Diagnostic> {
+    let mut functions: HashMap<(usize, &str), &Function> = HashMap::new();
+    for (mi, module) in graph.modules.iter().enumerate() {
+        for item in &module.ast {
+            if let Item::Function(f) = item {
+                functions.insert((mi, f.name.as_str()), f);
+            }
         }
     }
     let mut interp = Interp {
         functions,
+        resolutions,
+        module: 0,
         scopes: Vec::new(),
     };
-    match interp.functions.get("main").copied() {
-        Some(main) => interp.call(main, Vec::new(), Span::new(0, 0)),
+    match interp.functions.get(&(0, "main")).copied() {
+        Some(main) => interp.call(main, 0, Vec::new(), Span::new(0, 0)),
         None => Ok(Value::Unit),
     }
 }
@@ -49,7 +56,11 @@ enum Flow {
 }
 
 struct Interp<'a> {
-    functions: HashMap<String, &'a Function>,
+    functions: HashMap<(usize, &'a str), &'a Function>,
+    resolutions: &'a Resolutions,
+    /// The module whose alias map resolves calls in the currently executing
+    /// function — saved/restored around every call.
+    module: usize,
     scopes: Vec<HashMap<String, Value>>,
 }
 
@@ -57,6 +68,7 @@ impl<'a> Interp<'a> {
     fn call(
         &mut self,
         func: &'a Function,
+        module: usize,
         args: Vec<Value>,
         _span: Span,
     ) -> Result<Value, Diagnostic> {
@@ -64,9 +76,12 @@ impl<'a> Interp<'a> {
         for (param, value) in func.params.iter().zip(args) {
             scope.insert(param.name.clone(), value);
         }
+        let prev_module = self.module;
+        self.module = module;
         self.scopes.push(scope);
         let result = self.exec_block(&func.body);
         self.scopes.pop();
+        self.module = prev_module;
         Ok(match result? {
             Flow::Return(v) => v,
             Flow::Normal => Value::Unit,
@@ -212,7 +227,19 @@ impl<'a> Interp<'a> {
                         ))
                     }
                 };
-                let func = match self.functions.get(name.as_str()).copied() {
+                let Some((target_module, target_name)) =
+                    self.resolutions.functions[self.module].get(name.as_str()).cloned()
+                else {
+                    return Err(Diagnostic::error(
+                        format!("undefined function '{name}'"),
+                        *span,
+                    ));
+                };
+                let func = match self
+                    .functions
+                    .get(&(target_module, target_name.as_str()))
+                    .copied()
+                {
                     Some(f) => f,
                     None => {
                         return Err(Diagnostic::error(
@@ -225,7 +252,7 @@ impl<'a> Interp<'a> {
                 for arg in args {
                     argv.push(self.eval(arg)?);
                 }
-                self.call(func, argv, *span)
+                self.call(func, target_module, argv, *span)
             }
             // Struct runtime values are deferred (they still parse and type-check).
             Expr::Field { span, .. } | Expr::StructLit { span, .. } => Err(Diagnostic::error(
@@ -352,6 +379,8 @@ fn bool_op(op: BinOp, a: bool, b: bool, span: Span) -> Result<Value, Diagnostic>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::{load_program, Module};
+    use crate::source::SourceMap;
     use crate::{check::check, lexer::lex, parser::parse};
 
     fn run(src: &str) -> Result<Value, Diagnostic> {
@@ -359,9 +388,71 @@ mod tests {
         assert!(ld.is_empty(), "lex: {ld:?}");
         let (ast, pd) = parse(&tokens);
         assert!(pd.is_empty(), "parse: {pd:?}");
-        let (_t, cd) = check(&ast);
+        let graph = ModuleGraph {
+            modules: vec![Module {
+                path: "test.ys".to_string(),
+                ast,
+                imports: Vec::new(),
+            }],
+        };
+        let (res, cd) = check(&graph);
         assert!(cd.is_empty(), "check: {cd:?}");
-        interpret(&ast)
+        interpret(&graph, &res)
+    }
+
+    /// Full pipeline over in-memory files; the first file is the entry.
+    fn run_multi(files: &[(&str, &str)]) -> Result<Value, Diagnostic> {
+        let store: HashMap<String, String> = files
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut read = |p: &str| {
+            store
+                .get(p)
+                .cloned()
+                .ok_or_else(|| "no such file".to_string())
+        };
+        let mut map = SourceMap::new();
+        let (graph, fd) = load_program(files[0].0, &mut read, &mut map).unwrap();
+        assert!(fd.is_empty(), "front-end: {fd:?}");
+        let (res, cd) = check(&graph);
+        assert!(cd.is_empty(), "check: {cd:?}");
+        interpret(&graph, &res)
+    }
+
+    #[test]
+    fn cross_module_calls_execute() {
+        assert_eq!(
+            run_multi(&[
+                (
+                    "main.ys",
+                    "import { double } from \"./lib\";\nfun main(): int { return double(21); }"
+                ),
+                ("lib.ys", "export fun double(n: int): int { return n * 2; }"),
+            ]),
+            Ok(Value::Int(42))
+        );
+    }
+
+    #[test]
+    fn same_named_functions_resolve_within_their_own_module() {
+        // Both modules define `helper`; each function must call its own.
+        assert_eq!(
+            run_multi(&[
+                (
+                    "main.ys",
+                    "import { a } from \"./a\";\n\
+                     fun helper(): int { return 2; }\n\
+                     fun main(): int { return a() + helper(); }"
+                ),
+                (
+                    "a.ys",
+                    "fun helper(): int { return 1; }\n\
+                     export fun a(): int { return helper(); }"
+                ),
+            ]),
+            Ok(Value::Int(3))
+        );
     }
 
     #[test]
