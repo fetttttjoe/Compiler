@@ -10,7 +10,7 @@ mod syntax;
 mod token;
 
 use diagnostic::Diagnostic;
-use span::LineIndex;
+use source::SourceMap;
 
 fn main() {
     let source = r#"
@@ -30,29 +30,30 @@ fun main(): int {
 }
 "#;
 
-    let index = LineIndex::new(source);
+    let mut map = SourceMap::new();
+    map.add("demo.lang", source);
 
     let (tokens, mut diags) = lexer::lex(source);
     let (ast, parse_diags) = parser::parse(&tokens);
     diags.extend(parse_diags);
-    exit_on_errors(&diags, source, &index);
+    exit_on_errors(&diags, &map);
 
     let (_table, check_diags) = check::check(&ast);
-    exit_on_errors(&check_diags, source, &index);
+    exit_on_errors(&check_diags, &map);
 
     match interpreter::interpret(&ast) {
         Ok(value) => println!("=> {value:?}"),
-        Err(diag) => exit_on_errors(&[diag], source, &index),
+        Err(diag) => exit_on_errors(&[diag], &map),
     }
 }
 
 /// Renders every diagnostic to stderr and exits nonzero — no-op when empty.
-fn exit_on_errors(diags: &[Diagnostic], source: &str, index: &LineIndex) {
+fn exit_on_errors(diags: &[Diagnostic], map: &SourceMap) {
     if diags.is_empty() {
         return;
     }
     for diag in diags {
-        eprintln!("{}", diag.render(source, index));
+        eprintln!("{}", diag.render(map));
     }
     std::process::exit(1);
 }
