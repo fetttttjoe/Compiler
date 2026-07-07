@@ -6,9 +6,16 @@ use crate::token::{Token, TokenKind};
 /// Tokenizes `source`. Always returns a stream ending in `TokenKind::Eof`.
 /// Unknown characters produce a diagnostic and are skipped (recovery).
 pub fn lex(source: &str) -> (Vec<Token>, Vec<Diagnostic>) {
+    lex_at(source, 0)
+}
+
+/// Like `lex`, but every span is offset by `base` — the file's position in
+/// the `SourceMap`'s global offset space.
+pub fn lex_at(source: &str, base: usize) -> (Vec<Token>, Vec<Diagnostic>) {
     let mut lexer = Lexer {
         source,
         pos: 0,
+        base,
         diagnostics: Vec::new(),
     };
     let mut tokens = Vec::new();
@@ -26,6 +33,7 @@ pub fn lex(source: &str) -> (Vec<Token>, Vec<Diagnostic>) {
 struct Lexer<'a> {
     source: &'a str,
     pos: usize,
+    base: usize,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -38,6 +46,12 @@ impl Lexer<'_> {
         let c = self.peek()?;
         self.pos += c.len_utf8();
         Some(c)
+    }
+
+    /// A span from a local `start` to the current position, in global
+    /// (base-offset) coordinates.
+    fn abs_span(&self, start: usize) -> Span {
+        Span::new(self.base + start, self.base + self.pos)
     }
 
     fn error(&mut self, message: String, span: Span) {
@@ -57,14 +71,14 @@ impl Lexer<'_> {
             let Some(c) = self.peek() else {
                 return Token {
                     kind: TokenKind::Eof,
-                    span: Span::new(start, start),
+                    span: self.abs_span(start),
                 };
             };
             // `None` means trivia was consumed (comment / unknown char) — retry.
             if let Some(kind) = self.scan(c) {
                 return Token {
                     kind,
-                    span: Span::new(start, self.pos),
+                    span: self.abs_span(start),
                 };
             }
         }
@@ -99,7 +113,7 @@ impl Lexer<'_> {
                 self.bump();
                 self.error(
                     format!("unexpected character '{other}'"),
-                    Span::new(start, self.pos),
+                    self.abs_span(start),
                 );
                 None
             }
@@ -134,14 +148,14 @@ impl Lexer<'_> {
                 None => {
                     self.error(
                         "unterminated string literal".to_string(),
-                        Span::new(start, self.pos),
+                        self.abs_span(start),
                     );
                     return None;
                 }
                 Some(c) if syntax::is_line_break(c) => {
                     self.error(
                         "unterminated string literal".to_string(),
-                        Span::new(start, self.pos),
+                        self.abs_span(start),
                     );
                     return None;
                 }
@@ -162,14 +176,14 @@ impl Lexer<'_> {
                         Some(c) if syntax::is_line_break(c) => {
                             self.error(
                                 "unterminated string literal".to_string(),
-                                Span::new(start, self.pos),
+                                self.abs_span(start),
                             );
                             return None;
                         }
                         Some(other) => {
                             self.error(
                                 format!("unknown escape '\\{other}'"),
-                                Span::new(escape_start, self.pos + other.len_utf8()),
+                                Span::new(self.base + escape_start, self.base + self.pos + other.len_utf8()),
                             );
                             text.push(other); // recover with the raw character
                         }
@@ -195,7 +209,7 @@ impl Lexer<'_> {
         } else {
             self.error(
                 format!("expected '{first}{first}'"),
-                Span::new(start, self.pos),
+                self.abs_span(start),
             );
             None
         }
@@ -241,7 +255,7 @@ impl Lexer<'_> {
                 Err(_) => {
                     self.error(
                         format!("invalid float literal '{text}'"),
-                        Span::new(start, self.pos),
+                        self.abs_span(start),
                     );
                     None
                 }
@@ -252,7 +266,7 @@ impl Lexer<'_> {
                 Err(_) => {
                     self.error(
                         format!("integer literal '{text}' out of range"),
-                        Span::new(start, self.pos),
+                        self.abs_span(start),
                     );
                     Some(TokenKind::IntLiteral(0)) // recover with a placeholder value
                 }
@@ -356,6 +370,14 @@ mod tests {
     fn spans_cover_the_token_text() {
         let (tokens, _) = lex("fun");
         assert_eq!(tokens[0].span, Span::new(0, 3));
+    }
+
+    #[test]
+    fn lex_at_offsets_all_spans_by_the_base() {
+        let (tokens, diags) = lex_at("fun #", 100);
+        assert_eq!(tokens[0].span, Span::new(100, 103));
+        assert_eq!(tokens.last().unwrap().span, Span::new(105, 105)); // Eof
+        assert_eq!(diags[0].span, Span::new(104, 105)); // the '#'
     }
 
     #[test]
