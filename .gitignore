@@ -6,3 +6,6 @@
 
 # Editor configs stay local.
 /.vscode/
+
+# Claude session tooling stays local.
+/.claude/
