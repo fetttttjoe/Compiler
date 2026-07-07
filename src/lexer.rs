@@ -157,6 +157,15 @@ impl Lexer<'_> {
                         Some(syntax::BACKSLASH) => text.push(syntax::BACKSLASH),
                         Some(syntax::ESCAPE_LF) => text.push(syntax::LF),
                         Some(syntax::ESCAPE_TAB) => text.push(syntax::TAB),
+                        // A real line break right after `\` ends the line —
+                        // the string is unterminated, same as the outer loop.
+                        Some(c) if syntax::is_line_break(c) => {
+                            self.error(
+                                "unterminated string literal".to_string(),
+                                Span::new(start, self.pos),
+                            );
+                            return None;
+                        }
                         Some(other) => {
                             self.error(
                                 format!("unknown escape '\\{other}'"),
@@ -404,6 +413,21 @@ mod tests {
         assert_eq!(
             tokens.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
             vec![TokenKind::Identifier("x".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn backslash_before_a_newline_is_an_unterminated_string() {
+        // Regression: `\` + newline used to report "unknown escape" and let
+        // the string swallow the line break, violating single-line semantics.
+        let (tokens, diags) = lex("\"ab\\\ncd\"");
+        assert_eq!(diags.len(), 2, "{diags:?}");
+        assert!(diags
+            .iter()
+            .all(|d| d.message.contains("unterminated string")));
+        assert_eq!(
+            tokens.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+            vec![TokenKind::Identifier("cd".into()), TokenKind::Eof]
         );
     }
 

@@ -13,9 +13,41 @@ pub struct Parser<'a> {
     /// read as identifier-then-block, not a struct literal. Parentheses
     /// re-enable it.
     pub struct_literals_allowed: bool,
+    /// Current expression/statement nesting depth (see `MAX_NESTING`).
+    pub depth: u32,
 }
 
-impl Parser<'_> {
+/// Recursion ceiling for nested expressions and statements — a stack-safety
+/// guard, not a language limit. Pathological nesting (deep parens, huge
+/// `else if` chains) gets a diagnostic instead of a stack overflow.
+const MAX_NESTING: u32 = 128;
+
+impl<'a> Parser<'a> {
+    pub fn new(tokens: &'a [Token]) -> Parser<'a> {
+        Parser {
+            tokens,
+            pos: 0,
+            diagnostics: Vec::new(),
+            struct_literals_allowed: true,
+            depth: 0,
+        }
+    }
+
+    /// Claims one level of nesting. On overflow: reports a diagnostic,
+    /// consumes a token (guaranteeing progress), and returns false so the
+    /// caller bails out with a placeholder.
+    fn enter_nested(&mut self) -> bool {
+        if self.depth >= MAX_NESTING {
+            let span = self.peek().span;
+            self.error(format!("nesting exceeds {MAX_NESTING} levels"), span);
+            self.bump();
+            false
+        } else {
+            self.depth += 1;
+            true
+        }
+    }
+
     fn peek(&self) -> &Token {
         // Safe: the token stream always ends with an Eof sentinel.
         &self.tokens[self.pos]
@@ -192,6 +224,15 @@ impl Parser<'_> {
     /// Pratt / precedence-climbing expression parser. `min_bp` is the binding
     /// power the current expression must exceed to keep absorbing operators.
     pub fn parse_expr(&mut self, min_bp: u8) -> Expr {
+        if !self.enter_nested() {
+            return Expr::Int(0, self.peek().span); // recovery placeholder
+        }
+        let expr = self.parse_expr_inner(min_bp);
+        self.depth -= 1;
+        expr
+    }
+
+    fn parse_expr_inner(&mut self, min_bp: u8) -> Expr {
         let mut lhs = self.parse_prefix();
         loop {
             // Postfix (call `(`, field `.`) binds tighter than every operator.
@@ -276,6 +317,10 @@ impl Parser<'_> {
         match self.peek().kind {
             TokenKind::LeftParen => {
                 self.bump();
+                // Call parentheses re-enable struct literals inside a
+                // condition, same as grouping parentheses.
+                let prev = self.struct_literals_allowed;
+                self.struct_literals_allowed = true;
                 let mut args = Vec::new();
                 while !self.check(&TokenKind::RightParen) && !self.at_eof() {
                     args.push(self.parse_expr(0));
@@ -283,6 +328,7 @@ impl Parser<'_> {
                         break;
                     }
                 }
+                self.struct_literals_allowed = prev;
                 let end = self.expect(TokenKind::RightParen);
                 let span = lhs.span().to(end);
                 Expr::Call {
@@ -352,9 +398,16 @@ impl Parser<'_> {
         self.expect(TokenKind::LeftBrace);
         let mut stmts = Vec::new();
         while !self.check(&TokenKind::RightBrace) && !self.at_eof() {
-            let diags_before = self.diagnostics.len();
             stmts.push(self.parse_stmt());
-            if self.diagnostics.len() > diags_before {
+            // A statement that ended cleanly consumed through its `;` (or a
+            // nested block's `}`). Anything else means parse_stmt stopped
+            // mid-statement — skip to a boundary before continuing.
+            let clean = self.pos > 0
+                && matches!(
+                    self.tokens[self.pos - 1].kind,
+                    TokenKind::Semicolon | TokenKind::RightBrace
+                );
+            if !clean {
                 self.synchronize_stmt();
             }
         }
@@ -384,6 +437,16 @@ impl Parser<'_> {
     }
 
     fn parse_if(&mut self) -> Stmt {
+        // `else if` chains recurse here directly, so they claim depth too.
+        if !self.enter_nested() {
+            return Stmt::Expr(Expr::Int(0, self.peek().span)); // recovery placeholder
+        }
+        let stmt = self.parse_if_inner();
+        self.depth -= 1;
+        stmt
+    }
+
+    fn parse_if_inner(&mut self) -> Stmt {
         let start = self.peek().span;
         self.bump(); // 'if'
         let cond = self.parse_condition();
@@ -392,12 +455,13 @@ impl Parser<'_> {
         let mut else_body = None;
         if self.eat(&TokenKind::Else) {
             if self.check(&TokenKind::If) {
-                // `else if …` nests as an else body with a single If.
+                // `else if …` nests as an else body with a single If. (The
+                // depth guard can substitute a placeholder, which has no span
+                // to extend — keep the chain's span as-is then.)
                 let nested = self.parse_if();
-                let Stmt::If { span: nested_span, .. } = &nested else {
-                    unreachable!("parse_if always returns Stmt::If");
-                };
-                span = start.to(*nested_span);
+                if let Stmt::If { span: nested_span, .. } = &nested {
+                    span = start.to(*nested_span);
+                }
                 else_body = Some(vec![nested]);
             } else {
                 let (body, else_end) = self.parse_block();
@@ -414,6 +478,15 @@ impl Parser<'_> {
     }
 
     pub fn parse_stmt(&mut self) -> Stmt {
+        if !self.enter_nested() {
+            return Stmt::Expr(Expr::Int(0, self.peek().span)); // recovery placeholder
+        }
+        let stmt = self.parse_stmt_inner();
+        self.depth -= 1;
+        stmt
+    }
+
+    fn parse_stmt_inner(&mut self) -> Stmt {
         let tok = self.peek().clone();
         match tok.kind {
             TokenKind::If => self.parse_if(),
@@ -586,12 +659,7 @@ fn describe(kind: &TokenKind) -> &'static str {
 /// collecting diagnostics and recovering at item boundaries instead of failing
 /// on the first error.
 pub fn parse(tokens: &[Token]) -> (Ast, Vec<Diagnostic>) {
-    let mut parser = Parser {
-        tokens,
-        pos: 0,
-        diagnostics: Vec::new(),
-        struct_literals_allowed: true,
-    };
+    let mut parser = Parser::new(tokens);
     let mut items = Vec::new();
     while !parser.at_eof() {
         match parser.peek().kind {
@@ -619,12 +687,7 @@ mod tests {
     fn expr(src: &str) -> Expr {
         let (tokens, diags) = lex(src);
         assert!(diags.is_empty(), "lex errors: {diags:?}");
-        let mut p = Parser {
-            tokens: &tokens,
-            pos: 0,
-            diagnostics: Vec::new(),
-            struct_literals_allowed: true,
-        };
+        let mut p = Parser::new(&tokens);
         let e = p.parse_expr(0);
         assert!(p.diagnostics.is_empty(), "parse errors: {:?}", p.diagnostics);
         e
@@ -676,12 +739,7 @@ mod tests {
     fn stmt(src: &str) -> Stmt {
         let (tokens, diags) = lex(src);
         assert!(diags.is_empty(), "lex errors: {diags:?}");
-        let mut p = Parser {
-            tokens: &tokens,
-            pos: 0,
-            diagnostics: Vec::new(),
-            struct_literals_allowed: true,
-        };
+        let mut p = Parser::new(&tokens);
         let s = p.parse_stmt();
         assert!(p.diagnostics.is_empty(), "parse errors: {:?}", p.diagnostics);
         s
@@ -848,6 +906,57 @@ mod tests {
         let s = stmt("if (P { x: 1 }).x == 1 { return 1; }");
         let Stmt::If { cond, .. } = s else { panic!("expected If") };
         assert_eq!(cond.sexpr(), "(== (. (struct P x=1) x) 1)");
+    }
+
+    #[test]
+    fn nested_block_error_does_not_eat_the_following_statement() {
+        // Regression: the outer block used to see the nested block's (already
+        // recovered) diagnostic and synchronize again, swallowing `x = 5;`.
+        let (tokens, _) =
+            lex("fun f(): int { var x = 0; if true { const = 1; } x = 5; return x; }");
+        let (ast, pd) = parse(&tokens);
+        assert_eq!(pd.len(), 1, "{pd:?}");
+        let Item::Function(f) = &ast[0] else { panic!("expected function") };
+        assert_eq!(f.body.len(), 4, "x = 5; must survive: {:?}", f.body);
+        assert!(matches!(f.body[2], Stmt::Assign { .. }));
+    }
+
+    #[test]
+    fn struct_literal_allowed_in_call_arguments_inside_condition() {
+        let s = stmt("if eq(P { x: 1 }) { return 1; }");
+        let Stmt::If { cond, .. } = s else { panic!("expected If") };
+        assert_eq!(cond.sexpr(), "(call eq (struct P x=1))");
+    }
+
+    #[test]
+    fn pathological_nesting_errors_instead_of_overflowing_the_stack() {
+        // 500 nested parens.
+        let src = format!(
+            "fun f(): int {{ return {}1{}; }}",
+            "(".repeat(500),
+            ")".repeat(500)
+        );
+        let (tokens, _) = lex(&src);
+        let (_, pd) = parse(&tokens);
+        assert!(
+            pd.iter().any(|e| e.message.contains("nesting exceeds")),
+            "expected a nesting diagnostic: {} diags",
+            pd.len()
+        );
+
+        // A 500-deep `else if` chain.
+        let mut src = String::from("fun f(a: bool): int { if a { return 1; }");
+        for _ in 0..500 {
+            src.push_str(" else if a { return 1; }");
+        }
+        src.push_str(" else { return 0; } }");
+        let (tokens, _) = lex(&src);
+        let (_, pd) = parse(&tokens);
+        assert!(
+            pd.iter().any(|e| e.message.contains("nesting exceeds")),
+            "expected a nesting diagnostic: {} diags",
+            pd.len()
+        );
     }
 
     #[test]
