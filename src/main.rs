@@ -3,6 +3,7 @@ mod check;
 mod diagnostic;
 mod interpreter;
 mod lexer;
+mod modules;
 mod parser;
 mod source;
 mod span;
