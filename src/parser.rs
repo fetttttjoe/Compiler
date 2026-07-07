@@ -125,12 +125,46 @@ impl<'a> Parser<'a> {
         self.diagnostics.push(Diagnostic::error(message, span));
     }
 
+    /// A base type with postfix suffixes: `?` (optional) and `[]` (array),
+    /// composable left to right — `int?[]` is an array of optional ints,
+    /// `int[]?` an optional array. Doubling the optional is rejected with a
+    /// dedicated message (the lexer reads `??` greedily as one token).
     fn parse_type(&mut self) -> TypeAnn {
-        let base = self.parse_base_type();
-        if self.eat(&TokenKind::Question) {
-            TypeAnn::Optional(Box::new(base))
-        } else {
-            base
+        let mut ty = self.parse_base_type();
+        loop {
+            match self.peek().kind {
+                TokenKind::Question | TokenKind::QuestionQuestion => {
+                    let mut doubled = self.peek().kind == TokenKind::QuestionQuestion
+                        || matches!(ty, TypeAnn::Optional(_));
+                    let span = self.peek().span;
+                    self.bump();
+                    // Swallow any further question tokens — however many
+                    // the user typed, one mistake reports once.
+                    while matches!(
+                        self.peek().kind,
+                        TokenKind::Question | TokenKind::QuestionQuestion
+                    ) {
+                        doubled = true;
+                        self.bump();
+                    }
+                    if doubled {
+                        self.error(
+                            "nested optionals are not allowed — 'T??' is just 'T?'"
+                                .to_string(),
+                            span,
+                        );
+                    }
+                    if !matches!(ty, TypeAnn::Optional(_)) {
+                        ty = TypeAnn::Optional(Box::new(ty));
+                    }
+                }
+                TokenKind::LeftBracket => {
+                    self.bump();
+                    self.expect(TokenKind::RightBracket);
+                    ty = TypeAnn::Array(Box::new(ty));
+                }
+                _ => return ty,
+            }
         }
     }
 
@@ -267,7 +301,10 @@ impl<'a> Parser<'a> {
             // Postfix (call `(`, field `.`/`?.`) binds tighter than every operator.
             if matches!(
                 self.peek().kind,
-                TokenKind::LeftParen | TokenKind::Dot | TokenKind::QuestionDot
+                TokenKind::LeftParen
+                    | TokenKind::LeftBracket
+                    | TokenKind::Dot
+                    | TokenKind::QuestionDot
             ) {
                 if POSTFIX_BP < min_bp {
                     break;
@@ -336,6 +373,25 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::RightParen);
                 inner
             }
+            TokenKind::LeftBracket => {
+                // Array literal brackets re-enable struct literals, same as
+                // grouping parentheses.
+                let prev = self.struct_literals_allowed;
+                self.struct_literals_allowed = true;
+                let mut elements = Vec::new();
+                while !self.check(&TokenKind::RightBracket) && !self.at_eof() {
+                    elements.push(self.parse_expr(0));
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.struct_literals_allowed = prev;
+                let end = self.expect(TokenKind::RightBracket);
+                Expr::ArrayLit {
+                    elements,
+                    span: tok.span.to(end),
+                }
+            }
             other => {
                 self.error(
                     format!("expected an expression, found {}", describe(&other)),
@@ -367,6 +423,22 @@ impl<'a> Parser<'a> {
                 Expr::Call {
                     callee: Box::new(lhs),
                     args,
+                    span,
+                }
+            }
+            TokenKind::LeftBracket => {
+                self.bump();
+                // Index brackets re-enable struct literals inside a
+                // condition, same as call parentheses.
+                let prev = self.struct_literals_allowed;
+                self.struct_literals_allowed = true;
+                let index = self.parse_expr(0);
+                self.struct_literals_allowed = prev;
+                let end = self.expect(TokenKind::RightBracket);
+                let span = lhs.span().to(end);
+                Expr::Index {
+                    base: Box::new(lhs),
+                    index: Box::new(index),
                     span,
                 }
             }
@@ -623,7 +695,7 @@ impl<'a> Parser<'a> {
                 if self.check(&TokenKind::Equals) {
                     // Only places (a variable or plain field chain) can be
                     // assigned to; `?.` links are excluded by place_path.
-                    if expr.place_path().is_none() {
+                    if !expr.is_place() {
                         self.error("invalid assignment target".to_string(), expr.span());
                     }
                     let start = expr.span();
@@ -752,6 +824,8 @@ fn describe(kind: &TokenKind) -> &'static str {
         LessEq => "'<='",
         Greater => "'>'",
         GreaterEq => "'>='",
+        LeftBracket => "'['",
+        RightBracket => "']'",
         Question => "'?'",
         QuestionQuestion => "'??'",
         QuestionDot => "'?.'",
@@ -966,6 +1040,62 @@ mod tests {
             }
             other => panic!("expected Let, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn array_types_and_literals_parse() {
+        match stmt("var xs: int[] = [1, 2, 3];") {
+            Stmt::Let { ty, value, .. } => {
+                assert_eq!(ty, Some(TypeAnn::Array(Box::new(TypeAnn::Int))));
+                assert_eq!(value.sexpr(), "[1 2 3]");
+            }
+            other => panic!("expected Let, got {other:?}"),
+        }
+        // Suffixes compose: array of optionals vs optional array.
+        let (tokens, _) = lex("fun f(a: int?[], b: int[]?) { }");
+        let (ast, pd) = parse(&tokens);
+        assert!(pd.is_empty(), "parse errors: {pd:?}");
+        let Item::Function(f) = &ast[0] else { panic!() };
+        assert_eq!(
+            f.params[0].ty,
+            TypeAnn::Array(Box::new(TypeAnn::Optional(Box::new(TypeAnn::Int))))
+        );
+        assert_eq!(
+            f.params[1].ty,
+            TypeAnn::Optional(Box::new(TypeAnn::Array(Box::new(TypeAnn::Int))))
+        );
+    }
+
+    #[test]
+    fn indexing_parses_as_postfix() {
+        assert_eq!(expr("a[i + 1]").sexpr(), "(idx a (+ i 1))");
+        assert_eq!(expr("a[0][1]").sexpr(), "(idx (idx a 0) 1)");
+        assert_eq!(expr("xs[0].f").sexpr(), "(. (idx xs 0) f)");
+    }
+
+    #[test]
+    fn index_targets_are_places() {
+        match stmt("a[0] = 5;") {
+            Stmt::Assign { target, value, .. } => {
+                assert_eq!(target.sexpr(), "(idx a 0)");
+                assert_eq!(value.sexpr(), "5");
+            }
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_optionals_get_a_dedicated_error() {
+        let (tokens, _) = lex("fun f(x: int??) { }");
+        let (_, pd) = parse(&tokens);
+        assert!(
+            pd.iter().any(|e| e.message.contains("nested optionals")),
+            "{pd:?}"
+        );
+        // However many question marks, one mistake reports once.
+        let (tokens, _) = lex("fun f(x: int???) { }");
+        let (_, pd) = parse(&tokens);
+        assert_eq!(pd.len(), 1, "{pd:?}");
     }
 
     #[test]

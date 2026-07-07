@@ -53,6 +53,8 @@ pub enum TokenKind {
     GreaterEq,
     AmpAmp,
     PipePipe,
+    LeftBracket,
+    RightBracket,
     /// `?` — only valid as a postfix type modifier (`int?`).
     Question,
     /// `??` — null coalescing.

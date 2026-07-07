@@ -61,6 +61,8 @@ pub enum TypeAnn {
     Named(String),
     /// `T?` — T or null.
     Optional(Box<TypeAnn>),
+    /// `T[]` — a growable array of T, reference semantics like refstruct.
+    Array(Box<TypeAnn>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -137,6 +139,15 @@ pub enum Expr {
         fields: Vec<(String, Expr)>,
         span: Span,
     },
+    ArrayLit {
+        elements: Vec<Expr>,
+        span: Span,
+    },
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -196,9 +207,22 @@ impl UnOp {
 }
 
 impl Expr {
+    /// Can this expression be assigned to? Places are variables, plain
+    /// field chains, and index expressions rooted at one. `?.` links are
+    /// excluded — a target that might not exist can't be written to.
+    pub fn is_place(&self) -> bool {
+        match self {
+            Expr::Ident(..) => true,
+            Expr::Field { base, optional, .. } => !optional && base.is_place(),
+            Expr::Index { base, .. } => base.is_place(),
+            _ => false,
+        }
+    }
+
     /// The textual path of a plain place expression (`cur.left` →
-    /// "cur.left"). `?.` links and non-places yield `None` — a place that
-    /// might not exist can't be assigned to or narrowed.
+    /// "cur.left") — the key format for narrowing facts. Index expressions
+    /// yield `None` (element identity is dynamic, so they can't be
+    /// narrowed), as do `?.` links and non-places.
     pub fn place_path(&self) -> Option<String> {
         match self {
             Expr::Ident(n, _) => Some(n.clone()),
@@ -224,7 +248,9 @@ impl Expr {
             | Expr::Binary { span, .. }
             | Expr::Call { span, .. }
             | Expr::Field { span, .. }
-            | Expr::StructLit { span, .. } => *span,
+            | Expr::StructLit { span, .. }
+            | Expr::ArrayLit { span, .. }
+            | Expr::Index { span, .. } => *span,
         }
     }
 
@@ -261,6 +287,13 @@ impl Expr {
                     .map(|(k, v)| format!("{}={}", k, v.sexpr()))
                     .collect();
                 format!("(struct {} {})", name, fs.join(" "))
+            }
+            Expr::ArrayLit { elements, .. } => {
+                let es: Vec<String> = elements.iter().map(Expr::sexpr).collect();
+                format!("[{}]", es.join(" "))
+            }
+            Expr::Index { base, index, .. } => {
+                format!("(idx {} {})", base.sexpr(), index.sexpr())
             }
         }
     }

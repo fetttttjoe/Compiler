@@ -92,6 +92,8 @@ impl Lexer<'_> {
             syntax::RPAREN => self.single(TokenKind::RightParen),
             syntax::LBRACE => self.single(TokenKind::LeftBrace),
             syntax::RBRACE => self.single(TokenKind::RightBrace),
+            syntax::LBRACKET => self.single(TokenKind::LeftBracket),
+            syntax::RBRACKET => self.single(TokenKind::RightBracket),
             syntax::COLON => self.single(TokenKind::Colon),
             syntax::SEMICOLON => self.single(TokenKind::Semicolon),
             syntax::COMMA => self.single(TokenKind::Comma),

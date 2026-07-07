@@ -7,6 +7,10 @@ use crate::check::Resolutions;
 use crate::diagnostic::Diagnostic;
 use crate::modules::ModuleGraph;
 use crate::span::Span;
+use crate::syntax;
+
+/// The shared buffer behind a `Value::Array` handle.
+pub type SharedArray = Rc<RefCell<Vec<Value>>>;
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -25,6 +29,8 @@ pub enum Value {
     /// A `refstruct` instance: one shared object (always a `Value::Struct`
     /// inside), aliased by every copy of the handle.
     Ref(Rc<RefCell<Value>>),
+    /// An array: one shared, growable buffer, aliased like a refstruct.
+    Array(SharedArray),
     /// The `null` literal — the empty state of a `T?` slot.
     Null,
     Unit,
@@ -44,6 +50,7 @@ impl PartialEq for Value {
                 Value::Struct { name: bn, fields: bf },
             ) => an == bn && af == bf,
             (Value::Ref(a), Value::Ref(b)) => Rc::ptr_eq(a, b),
+            (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
             (Value::Null, Value::Null) => true,
             (Value::Unit, Value::Unit) => true,
             _ => false,
@@ -52,6 +59,43 @@ impl PartialEq for Value {
 }
 
 impl Value {
+    /// Human-facing rendering for `print`: scalars and strings raw, structs
+    /// and arrays in source-like shape, refs printed through the handle.
+    /// Depth-capped like `render` (cycles print `...`).
+    pub fn display(&self) -> String {
+        self.display_depth(8)
+    }
+
+    fn display_depth(&self, depth: usize) -> String {
+        if depth == 0 {
+            return "...".to_string();
+        }
+        match self {
+            Value::Int(n) => n.to_string(),
+            Value::Float(f) => f.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Str(s) => s.clone(),
+            Value::Null => "null".to_string(),
+            Value::Unit => "unit".to_string(),
+            Value::Ref(cell) => cell.borrow().display_depth(depth - 1),
+            Value::Array(items) => {
+                let items: Vec<String> = items
+                    .borrow()
+                    .iter()
+                    .map(|v| v.display_depth(depth - 1))
+                    .collect();
+                format!("[{}]", items.join(", "))
+            }
+            Value::Struct { name, fields } => {
+                let fields: Vec<String> = fields
+                    .iter()
+                    .map(|(f, v)| format!("{f}: {}", v.display_depth(depth - 1)))
+                    .collect();
+                format!("{name} {{ {} }}", fields.join(", "))
+            }
+        }
+    }
+
     /// Debug-style rendering with a depth cap — cyclic refstruct values
     /// (constructible since optionals landed) would recurse forever under
     /// derived `Debug`.
@@ -67,6 +111,14 @@ impl Value {
         }
         match self {
             Value::Ref(cell) => format!("Ref({})", cell.borrow().render_depth(depth - 1)),
+            Value::Array(items) => {
+                let items: Vec<String> = items
+                    .borrow()
+                    .iter()
+                    .map(|v| v.render_depth(depth - 1))
+                    .collect();
+                format!("[{}]", items.join(", "))
+            }
             Value::Struct { name, fields } => {
                 let fields: Vec<String> = fields
                     .iter()
@@ -86,6 +138,7 @@ impl Value {
             Value::Str(_) => "string",
             Value::Struct { .. } => "struct",
             Value::Ref(_) => "refstruct",
+            Value::Array(_) => "array",
             Value::Null => "null",
             Value::Unit => "unit",
         }
@@ -293,6 +346,39 @@ impl<'a> Interp<'a> {
                 let Some((target_module, target_name)) =
                     self.resolutions.functions[self.module].get(name.as_str()).cloned()
                 else {
+                    // Builtins run only when no user definition shadows them
+                    // — mirrors the checker's resolution order. Shape errors
+                    // are defensive; the checker validated arities and types.
+                    if name == syntax::BUILTIN_PRINT && args.len() == 1 {
+                        let v = self.eval(&args[0])?;
+                        println!("{}", v.display());
+                        return Ok(Value::Unit);
+                    }
+                    if name == syntax::BUILTIN_LEN && args.len() == 1 {
+                        return match self.eval(&args[0])? {
+                            Value::Array(items) => {
+                                Ok(Value::Int(items.borrow().len() as i64))
+                            }
+                            other => Err(Diagnostic::error(
+                                format!("'len' expects an array, found {}", other.type_name()),
+                                *span,
+                            )),
+                        };
+                    }
+                    if name == syntax::BUILTIN_PUSH && args.len() == 2 {
+                        let array = self.eval(&args[0])?;
+                        let value = self.eval(&args[1])?;
+                        return match array {
+                            Value::Array(items) => {
+                                items.borrow_mut().push(value);
+                                Ok(Value::Unit)
+                            }
+                            other => Err(Diagnostic::error(
+                                format!("'push' expects an array, found {}", other.type_name()),
+                                *span,
+                            )),
+                        };
+                    }
                     return Err(Diagnostic::error(
                         format!("undefined function '{name}'"),
                         *span,
@@ -349,6 +435,18 @@ impl<'a> Interp<'a> {
                 Value::Null if *optional => Ok(Value::Null),
                 v => get_field(&v, name, *span),
             },
+            Expr::ArrayLit { elements, .. } => {
+                let mut items = Vec::with_capacity(elements.len());
+                for element in elements {
+                    items.push(self.eval(element)?);
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(items))))
+            }
+            Expr::Index { base, index, span } => {
+                let (items, i) = index_array(self.eval(base)?, self.eval(index)?, *span)?;
+                let v = items.borrow()[i].clone();
+                Ok(v)
+            }
         }
     }
 
@@ -380,6 +478,11 @@ impl<'a> Interp<'a> {
                     self.assign_place(base, owned)
                 }
             },
+            Expr::Index { base, index, span } => {
+                let (items, i) = index_array(self.eval(base)?, self.eval(index)?, *span)?;
+                items.borrow_mut()[i] = v;
+                Ok(())
+            }
             _ => Err(Diagnostic::error(
                 "invalid assignment target",
                 target.span(),
@@ -398,6 +501,31 @@ impl<'a> Interp<'a> {
             .rev()
             .find_map(|s| s.get_mut(name))
             .ok_or_else(|| Diagnostic::error(format!("undefined variable '{name}'"), span))
+    }
+}
+
+/// Bounds-checked array/index extraction shared by element reads and
+/// writes. The value/type shapes are checker-guaranteed; the bounds aren't.
+fn index_array(
+    array: Value,
+    index: Value,
+    span: Span,
+) -> Result<(SharedArray, usize), Diagnostic> {
+    match (array, index) {
+        (Value::Array(items), Value::Int(i)) => {
+            let len = items.borrow().len();
+            match usize::try_from(i).ok().filter(|&i| i < len) {
+                Some(i) => Ok((items, i)),
+                None => Err(Diagnostic::error(
+                    format!("index {i} out of bounds (length {len})"),
+                    span,
+                )),
+            }
+        }
+        (a, b) => Err(Diagnostic::error(
+            format!("cannot index {} with {}", a.type_name(), b.type_name()),
+            span,
+        )),
     }
 }
 
@@ -654,6 +782,73 @@ mod tests {
     #[test]
     fn no_main_returns_unit() {
         assert_eq!(run("fun other(): int { return 1; }"), Ok(Value::Unit));
+    }
+
+    #[test]
+    fn arrays_roundtrip_with_builtins() {
+        let program = "\
+fun main(): int {
+    var xs: int[] = [];
+    push(xs, 10);
+    push(xs, 20);
+    push(xs, 12);
+    xs[2] = xs[2] + 0;
+    var i = 0;
+    var sum = 0;
+    while i < len(xs) { sum = sum + xs[i]; i = i + 1; }
+    return sum;
+}";
+        assert_eq!(run(program), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn arrays_alias_and_compare_by_identity() {
+        let program = "\
+fun main(): bool {
+    const a = [1, 2];
+    const b = a;
+    b[0] = 9;
+    return a[0] == 9 && a == b && a != [1, 2];
+}";
+        assert_eq!(run(program), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn out_of_bounds_indexing_is_a_runtime_error() {
+        let result = run("fun main(): int { const xs = [1]; return xs[5]; }");
+        assert!(
+            result.as_ref().is_err_and(|e| e.message.contains("out of bounds")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn value_structs_in_arrays_write_back_through_the_index() {
+        let program = "\
+struct P { x: int }
+fun main(): int {
+    var ps = [P { x: 1 }];
+    ps[0].x = 7;
+    return ps[0].x;
+}";
+        assert_eq!(run(program), Ok(Value::Int(7)));
+    }
+
+    #[test]
+    fn print_runs_and_returns_unit() {
+        assert_eq!(
+            run("fun main() { print(\"hi\"); print(1 + 1); print(null == null); }"),
+            Ok(Value::Unit)
+        );
+    }
+
+    #[test]
+    fn user_print_shadows_the_builtin_at_runtime() {
+        assert_eq!(
+            run("fun print(n: int): int { return n * 2; }\n\
+                 fun main(): int { return print(21); }"),
+            Ok(Value::Int(42))
+        );
     }
 
     #[test]
@@ -1035,6 +1230,26 @@ fun main(): Node {
     fn scalar_rendering_matches_debug() {
         assert_eq!(Value::Int(55).render(), "Int(55)");
         assert_eq!(Value::Bool(true).render(), "Bool(true)");
+    }
+
+    #[test]
+    fn display_shows_user_values_not_enum_internals() {
+        let array = Value::Array(Rc::new(RefCell::new(vec![
+            Value::Int(1),
+            Value::Str("x".into()),
+            Value::Null,
+        ])));
+        assert_eq!(array.display(), "[1, x, null]");
+        let s = Value::Struct {
+            name: "P".into(),
+            fields: vec![("x".into(), Value::Int(1))],
+        };
+        assert_eq!(s.display(), "P { x: 1 }");
+        let r = Value::Ref(Rc::new(RefCell::new(Value::Struct {
+            name: "N".into(),
+            fields: vec![("v".into(), Value::Bool(true))],
+        })));
+        assert_eq!(r.display(), "N { v: true }");
     }
 
     /// The kitchen-sink program: a binary search tree combining refstruct

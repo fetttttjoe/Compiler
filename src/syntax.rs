@@ -14,6 +14,8 @@ pub const LPAREN: char = '(';
 pub const RPAREN: char = ')';
 pub const LBRACE: char = '{';
 pub const RBRACE: char = '}';
+pub const LBRACKET: char = '[';
+pub const RBRACKET: char = ']';
 pub const COLON: char = ':';
 pub const SEMICOLON: char = ';';
 pub const COMMA: char = ',';
@@ -61,6 +63,13 @@ pub const KW_WHILE: &str = "while";
 pub const KW_IMPORT: &str = "import";
 pub const KW_EXPORT: &str = "export";
 pub const KW_FROM: &str = "from";
+
+// --- Builtin function names ---
+// Not keywords: a user definition of the same name shadows the builtin,
+// so these resolve last in both the checker and the interpreter.
+pub const BUILTIN_PRINT: &str = "print";
+pub const BUILTIN_LEN: &str = "len";
+pub const BUILTIN_PUSH: &str = "push";
 
 /// True for a source line break (`\n` or `\r`). CRLF is handled by the caller
 /// consuming the trailing `\n`.

@@ -4,6 +4,7 @@ use crate::ast::{BinOp, Expr, Function, Item, Stmt, TypeAnn, UnOp};
 use crate::diagnostic::Diagnostic;
 use crate::modules::ModuleGraph;
 use crate::span::Span;
+use crate::syntax;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
@@ -16,9 +17,41 @@ pub enum Type {
     Struct(usize, String),
     /// `T?` — T or null.
     Optional(Box<Type>),
+    /// `T[]` — growable array, reference semantics (aliased, identity
+    /// equality), like refstruct.
+    Array(Box<Type>),
     /// The type of the `null` literal; fits only into `T?` slots.
     Null,
     Unit,
+    /// Poisoned recovery: an expression that already produced a diagnostic.
+    /// Fits everything and compares with everything (structurally — a
+    /// `T?`/`T[]` wrapper keeps the property), so one mistake yields one
+    /// error instead of a cascade. Never printed in messages.
+    Error,
+    /// The element type of an empty array literal: nothing constrains it
+    /// yet. Unlike `Error`, no diagnostic exists — it fits only array
+    /// shapes, and a binding can't keep it (annotation required).
+    Unknown,
+}
+
+/// Structurally poisoned: a diagnostic was already emitted somewhere inside
+/// this type, so every further check stays silent.
+fn poisoned(t: &Type) -> bool {
+    match t {
+        Type::Error => true,
+        Type::Optional(inner) | Type::Array(inner) => poisoned(inner),
+        _ => false,
+    }
+}
+
+/// An element type that imposes no constraint yet — `[]`, or nested empties
+/// like `[[]]`.
+fn unconstrained(t: &Type) -> bool {
+    match t {
+        Type::Unknown => true,
+        Type::Array(inner) => unconstrained(inner),
+        _ => false,
+    }
 }
 
 impl Type {
@@ -30,8 +63,12 @@ impl Type {
             Type::Str => "string".to_string(),
             Type::Struct(_, n) => n.clone(),
             Type::Optional(inner) => format!("{}?", inner.name()),
+            Type::Array(inner) if unconstrained(inner) => "[]".to_string(),
+            Type::Array(inner) => format!("{}[]", inner.name()),
             Type::Null => "null".to_string(),
             Type::Unit => "unit".to_string(),
+            Type::Error => "<error>".to_string(),
+            Type::Unknown => "unknown".to_string(),
         }
     }
 }
@@ -40,12 +77,22 @@ impl Type {
 /// Exact match, or `T`/`null` into `T?`. Never an implicit conversion —
 /// optionality is spelled in the target's type.
 fn fits(value: &Type, target: &Type) -> bool {
-    if value == target {
+    if value == target || poisoned(value) || poisoned(target) {
         return true;
     }
-    match target {
-        Type::Optional(inner) => {
-            matches!(value, Type::Null) || value == inner.as_ref()
+    match (value, target) {
+        // An unconstrained target (an empty literal's element slot)
+        // accepts anything; only transient literals ever have it — a
+        // binding can't keep `unknown` (annotation required at `let`).
+        (_, Type::Unknown) => true,
+        (_, Type::Optional(inner)) => {
+            matches!(value, Type::Null) || fits(value, inner)
+        }
+        // Arrays are invariant — int[] into int?[] would let an alias push
+        // null into the int[] — except unconstrained elements on either
+        // side: `[]` fits any array slot and accepts any element type.
+        (Type::Array(v), Type::Array(t)) => {
+            unconstrained(v) || unconstrained(t) || v == t
         }
         _ => false,
     }
@@ -293,6 +340,9 @@ fn resolve_type(
         TypeAnn::Optional(inner) => {
             Type::Optional(Box::new(resolve_type(inner, ty_alias, span, diags)))
         }
+        TypeAnn::Array(inner) => {
+            Type::Array(Box::new(resolve_type(inner, ty_alias, span, diags)))
+        }
         TypeAnn::Named(name) => match ty_alias.get(name) {
             Some((m, n)) => Type::Struct(*m, n.clone()),
             None => {
@@ -300,7 +350,7 @@ fn resolve_type(
                     Diagnostic::error(format!("unknown type '{name}'"), span)
                         .suggest(name, ty_alias.keys().map(String::as_str)),
                 );
-                Type::Unit // recovery
+                Type::Error // recovery: already reported
             }
         },
     }
@@ -366,6 +416,8 @@ impl<'a> Checker<'a> {
                 format!("{n} (from {})", self.paths[*m])
             }
             Type::Optional(inner) => format!("{}?", self.type_name(inner)),
+            Type::Array(inner) if unconstrained(inner) => "[]".to_string(),
+            Type::Array(inner) => format!("{}[]", self.type_name(inner)),
             _ => t.name(),
         }
     }
@@ -383,7 +435,7 @@ impl<'a> Checker<'a> {
         }
         self.scopes.pop();
 
-        if self.ret != Type::Unit && !always_returns(&f.body) {
+        if self.ret != Type::Unit && !poisoned(&self.ret) && !always_returns(&f.body) {
             self.error(
                 format!("not all paths in function '{}' return a value", f.name),
                 f.span,
@@ -443,7 +495,7 @@ impl<'a> Checker<'a> {
 
     fn check_condition(&mut self, keyword: &str, cond: &Expr) {
         let ty = self.type_of_expr(cond);
-        if ty != Type::Bool {
+        if !fits(&ty, &Type::Bool) {
             self.error(
                 format!(
                     "{keyword} condition must be bool, found {}",
@@ -480,6 +532,18 @@ impl<'a> Checker<'a> {
                         }
                         declared
                     }
+                    None if unconstrained(&init_ty) => {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                format!("cannot infer an element type for '{name}' from '[]'"),
+                                *span,
+                            )
+                            .with_help(format!(
+                                "add an annotation, e.g. 'var {name}: int[] = [];'"
+                            )),
+                        );
+                        Type::Error // recovery: already reported
+                    }
                     None if init_ty == Type::Null => {
                         self.diagnostics.push(
                             Diagnostic::error(
@@ -490,7 +554,7 @@ impl<'a> Checker<'a> {
                                 "add an annotation, e.g. 'var {name}: T? = null;'"
                             )),
                         );
-                        Type::Unit // recovery
+                        Type::Error // recovery: already reported
                     }
                     None => init_ty,
                 };
@@ -591,10 +655,10 @@ impl<'a> Checker<'a> {
                 // intact, so crosses_ref's re-typing sees exactly what the
                 // typing pass above saw and emits nothing new.
                 let allowed = !clean || mutable || self.crosses_ref(target);
-                // A write through a field may reach aliased state — field
-                // facts don't survive it. Dropped only now, after every
-                // check that re-reads the place.
-                if matches!(target, Expr::Field { .. }) {
+                // A write through a field or index may reach aliased state —
+                // field facts don't survive it. Dropped only now, after
+                // every check that re-reads the place.
+                if !matches!(target, Expr::Ident(..)) {
                     self.unnarrow_field_paths();
                 }
                 if !clean {
@@ -634,10 +698,11 @@ impl<'a> Checker<'a> {
             Expr::Unary { op, rhs, span } => {
                 let ty = self.type_of_expr(rhs);
                 match op {
+                    _ if poisoned(&ty) => Type::Error,
                     UnOp::Neg if is_numeric(&ty) => ty,
                     UnOp::Neg => {
                         self.error(format!("cannot negate {}", self.type_name(&ty)), *span);
-                        ty
+                        Type::Error
                     }
                     UnOp::Not if ty == Type::Bool => Type::Bool,
                     UnOp::Not => {
@@ -645,7 +710,7 @@ impl<'a> Checker<'a> {
                             format!("cannot apply '!' to {}", self.type_name(&ty)),
                             *span,
                         );
-                        Type::Bool
+                        Type::Error
                     }
                 }
             }
@@ -677,11 +742,98 @@ impl<'a> Checker<'a> {
                 span,
             } => self.check_field(base, name, *optional, *span),
             Expr::StructLit { name, fields, span } => self.check_struct_lit(name, fields, *span),
+            Expr::ArrayLit { elements, .. } => {
+                // The first element names the type; a later `null` widens
+                // it to optional; `[]` is unconstrained and fits any array
+                // slot (but a binding then needs an annotation).
+                // ponytail: first-element inference — `[null, x]` needs
+                // reordering; real unification when evidence demands it.
+                let mut rest = elements.iter();
+                let mut elem_ty = match rest.next().map(|e| (e, self.type_of_expr(e))) {
+                    None => Type::Unknown,
+                    Some((e, Type::Null)) => {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "array element type cannot be inferred from 'null'"
+                                    .to_string(),
+                                e.span(),
+                            )
+                            .with_help(
+                                "start with a non-null element, e.g. [x, null]".to_string(),
+                            ),
+                        );
+                        Type::Error
+                    }
+                    Some((_, ty)) => ty,
+                };
+                for element in rest {
+                    let ty = self.type_of_expr(element);
+                    if ty == Type::Null && !matches!(elem_ty, Type::Optional(_)) {
+                        elem_ty = Type::Optional(Box::new(elem_ty));
+                        continue;
+                    }
+                    // A later element can pin down what a leading `[]`
+                    // left open: `[[], [1]]` is int[][].
+                    if unconstrained(&elem_ty) && !unconstrained(&ty) {
+                        elem_ty = ty;
+                        continue;
+                    }
+                    if !fits(&ty, &elem_ty) {
+                        self.error(
+                            format!(
+                                "array elements must share one type: expected {}, found {}",
+                                self.type_name(&elem_ty),
+                                self.type_name(&ty)
+                            ),
+                            element.span(),
+                        );
+                    }
+                }
+                Type::Array(Box::new(elem_ty))
+            }
+            Expr::Index { base, index, span } => {
+                let base_ty = self.type_of_expr(base);
+                let index_ty = self.type_of_expr(index);
+                if !fits(&index_ty, &Type::Int) {
+                    self.error(
+                        format!("index must be int, found {}", self.type_name(&index_ty)),
+                        index.span(),
+                    );
+                }
+                match base_ty {
+                    Type::Array(elem) => *elem,
+                    ref t if poisoned(t) => Type::Error,
+                    Type::Optional(_) => {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                format!(
+                                    "{} may be null — it can't be indexed directly",
+                                    self.type_name(&base_ty)
+                                ),
+                                *span,
+                            )
+                            .with_help("check '!= null' first".to_string()),
+                        );
+                        Type::Error
+                    }
+                    other => {
+                        self.error(
+                            format!("cannot index into {}", self.type_name(&other)),
+                            *span,
+                        );
+                        Type::Error
+                    }
+                }
+            }
         }
     }
 
     fn check_binary(&mut self, op: BinOp, lt: Type, rt: Type, span: Span) -> Type {
         use BinOp::*;
+        // A poisoned operand already produced its diagnostic — stay silent.
+        if poisoned(&lt) || poisoned(&rt) {
+            return Type::Error;
+        }
         let (ok, result) = match op {
             // Arithmetic on matching numerics; `+` also concatenates strings.
             Add | Sub | Mul | Div | Rem => {
@@ -719,6 +871,7 @@ impl<'a> Checker<'a> {
                 ),
                 span,
             );
+            return Type::Error;
         }
         result
     }
@@ -728,13 +881,79 @@ impl<'a> Checker<'a> {
             Expr::Ident(n, _) => n.clone(),
             _ => {
                 self.error("only named functions can be called".to_string(), span);
-                return Type::Unit;
+                return Type::Error;
             }
         };
         // Copy the map references out of `self` so the signature borrow is
         // independent of the `&mut self` calls below — no clone needed.
         let sigs = self.sigs;
         let Some(target) = self.fn_alias.get(&name) else {
+            // Builtins resolve only when no user definition shadows them.
+            if name == syntax::BUILTIN_PRINT {
+                if args.len() != 1 {
+                    self.error(
+                        format!("'print' expects 1 argument, found {}", args.len()),
+                        span,
+                    );
+                }
+                for arg in args {
+                    self.type_of_expr(arg); // any type prints
+                }
+                return Type::Unit;
+            }
+            if name == syntax::BUILTIN_LEN {
+                if args.len() != 1 {
+                    self.error(
+                        format!("'len' expects 1 argument, found {}", args.len()),
+                        span,
+                    );
+                }
+                for arg in args {
+                    let ty = self.type_of_expr(arg);
+                    if !matches!(ty, Type::Array(_)) && !poisoned(&ty) {
+                        self.error(
+                            format!("'len' expects an array, found {}", self.type_name(&ty)),
+                            arg.span(),
+                        );
+                    }
+                }
+                return Type::Int;
+            }
+            if name == syntax::BUILTIN_PUSH {
+                if args.len() != 2 {
+                    self.error(
+                        format!("'push' expects 2 arguments, found {}", args.len()),
+                        span,
+                    );
+                    for arg in args {
+                        self.type_of_expr(arg);
+                    }
+                    return Type::Unit;
+                }
+                let array_ty = self.type_of_expr(&args[0]);
+                let value_ty = self.type_of_expr(&args[1]);
+                match array_ty {
+                    Type::Array(elem) => {
+                        if !fits(&value_ty, &elem) {
+                            self.error(
+                                format!(
+                                    "'push' into {}[]: expected {}, found {}",
+                                    self.type_name(&elem),
+                                    self.type_name(&elem),
+                                    self.type_name(&value_ty)
+                                ),
+                                args[1].span(),
+                            );
+                        }
+                    }
+                    ref t if poisoned(t) => {}
+                    other => self.error(
+                        format!("'push' expects an array, found {}", self.type_name(&other)),
+                        args[0].span(),
+                    ),
+                }
+                return Type::Unit;
+            }
             self.diagnostics.push(
                 Diagnostic::error(format!("undefined function '{name}'"), span)
                     .suggest(&name, self.fn_alias.keys().map(String::as_str)),
@@ -744,7 +963,7 @@ impl<'a> Checker<'a> {
             for arg in args {
                 self.type_of_expr(arg);
             }
-            return Type::Unit;
+            return Type::Error;
         };
         let sig = &sigs[target];
         if args.len() != sig.params.len() {
@@ -779,6 +998,8 @@ impl<'a> Checker<'a> {
         // Stage 1: the optional layer — `?.` must strip one, `.` must not
         // have one to strip.
         let inner = match (&base_ty, optional) {
+            // A poisoned base already produced its diagnostic.
+            (t, _) if poisoned(t) => return Type::Error,
             (Type::Optional(inner), true) => inner.as_ref(),
             (Type::Optional(_), false) => {
                 self.diagnostics.push(
@@ -791,7 +1012,7 @@ impl<'a> Checker<'a> {
                     )
                     .with_help("use '?.', or check '!= null' first".to_string()),
                 );
-                return Type::Unit;
+                return Type::Error;
             }
             (_, true) => {
                 self.diagnostics.push(
@@ -804,7 +1025,7 @@ impl<'a> Checker<'a> {
                     )
                     .with_help("use '.'".to_string()),
                 );
-                return Type::Unit;
+                return Type::Error;
             }
             (ty, false) => ty,
         };
@@ -814,7 +1035,7 @@ impl<'a> Checker<'a> {
                 format!("type {} has no fields", self.type_name(&base_ty)),
                 span,
             );
-            return Type::Unit;
+            return Type::Error;
         };
         let field_ty = self
             .structs
@@ -843,7 +1064,7 @@ impl<'a> Checker<'a> {
                     format!("struct '{struct_name}' has no field '{field}'"),
                     span,
                 );
-                Type::Unit
+                Type::Error
             }
         }
     }
@@ -858,7 +1079,7 @@ impl<'a> Checker<'a> {
             for (_, value) in fields {
                 self.type_of_expr(value);
             }
-            return Type::Unit;
+            return Type::Error;
         };
         let decl = &structs[key];
         let mut seen = HashSet::new();
@@ -907,6 +1128,8 @@ impl<'a> Checker<'a> {
                 let base_ty = self.type_of_expr(base);
                 self.is_by_ref(&base_ty) || self.crosses_ref(base)
             }
+            // Arrays are references — element writes never touch the binding.
+            Expr::Index { .. } => true,
             _ => false,
         }
     }
@@ -940,7 +1163,7 @@ impl<'a> Checker<'a> {
         self.diagnostics.push(
             Diagnostic::error(format!("undefined variable '{name}'"), span).suggest(name, visible),
         );
-        Type::Unit
+        Type::Error
     }
 }
 
@@ -986,6 +1209,8 @@ fn contains_call(e: &Expr) -> bool {
         Expr::Binary { lhs, rhs, .. } => contains_call(lhs) || contains_call(rhs),
         Expr::Field { base, .. } => contains_call(base),
         Expr::StructLit { fields, .. } => fields.iter().any(|(_, v)| contains_call(v)),
+        Expr::ArrayLit { elements, .. } => elements.iter().any(contains_call),
+        Expr::Index { base, index, .. } => contains_call(base) || contains_call(index),
         Expr::Int(..)
         | Expr::Float(..)
         | Expr::Bool(..)
@@ -1005,7 +1230,7 @@ fn body_effects(stmts: &[Stmt], assigned: &mut HashSet<String>, kills_fields: &m
                 if let Some(path) = target.place_path() {
                     assigned.insert(path);
                 }
-                if matches!(target, Expr::Field { .. }) || contains_call(value) {
+                if !matches!(target, Expr::Ident(..)) || contains_call(value) {
                     *kills_fields = true;
                 }
             }
@@ -1054,7 +1279,7 @@ fn place_vs_null(a: &Expr, b: &Expr) -> Option<String> {
 fn root_ident(e: &Expr) -> Option<(&str, Span)> {
     match e {
         Expr::Ident(n, s) => Some((n, *s)),
-        Expr::Field { base, .. } => root_ident(base),
+        Expr::Field { base, .. } | Expr::Index { base, .. } => root_ident(base),
         _ => None,
     }
 }
@@ -1167,6 +1392,180 @@ mod tests {
                 .any(|e| e.message.contains("undefined variable 'missing'")),
             "{d:?}"
         );
+    }
+
+    // --- Recovery must not cascade: one mistake, one error ---
+
+    #[test]
+    fn recovery_does_not_cascade_into_return_checks() {
+        let d = diags("fun f(): int { return missing; }");
+        assert_eq!(d.len(), 1, "{d:?}");
+    }
+
+    #[test]
+    fn recovery_does_not_cascade_through_operators() {
+        let d = diags("fun f(): int { return missing + 1 * 2; }");
+        assert_eq!(d.len(), 1, "{d:?}");
+    }
+
+    #[test]
+    fn null_deref_reports_exactly_one_error() {
+        let d = diags("refstruct P { x: int } fun f(p: P?): int { return p.x; }");
+        assert_eq!(d.len(), 1, "{d:?}");
+    }
+
+    #[test]
+    fn unknown_callee_still_checks_arguments_without_cascading() {
+        // The bad callee is one error; the bad argument is a second, real
+        // one — but no third from the return-type check.
+        let d = diags("fun f(): int { return nope(missing); }");
+        assert_eq!(d.len(), 2, "{d:?}");
+    }
+
+    // --- Empty literals, poison structure, cascades (review findings) ---
+
+    #[test]
+    fn unannotated_empty_array_requires_an_annotation() {
+        let d = diags("fun main() { var xs = []; push(xs, 1); push(xs, \"a\"); }");
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot infer")
+                && e.help.as_deref().is_some_and(|h| h.contains("[]"))),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn empty_literal_fits_optional_array_slots() {
+        let d = diags("fun f(xs: int[]?) { } fun main() { var x: int[]? = []; f([]); }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn empty_literals_nest_in_either_position() {
+        let d = diags(
+            "fun main() { const a = [[1], []]; const b: int[][] = [[], [1]]; }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn null_elements_widen_arrays_to_optional() {
+        let d = diags("fun main() { const xs: int?[] = [1, null, 2]; }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn unknown_types_poison_structurally_without_cascades() {
+        let d = diags("fun main() { var xs: Missing[] = [1, 2]; }");
+        assert_eq!(d.len(), 1, "{d:?}");
+        let d = diags("fun f(x: Foo?) { } fun main() { f(1); }");
+        assert_eq!(d.len(), 1, "{d:?}");
+        let d = diags("fun f(): Missing { }");
+        assert_eq!(d.len(), 1, "{d:?}");
+    }
+
+    #[test]
+    fn operator_errors_do_not_cascade() {
+        let d = diags("fun f(): int { return -\"a\"; }");
+        assert_eq!(d.len(), 1, "{d:?}");
+        let d = diags("fun f(xs: int[]?): int[] { return xs ?? 1; }");
+        assert_eq!(d.len(), 1, "{d:?}");
+    }
+
+    #[test]
+    fn empty_literal_into_a_non_array_names_it_cleanly() {
+        let d = diags("fun f(a: int) { } fun main() { f([]); }");
+        assert!(
+            d.iter().any(|e| e.message.contains("found []")),
+            "{d:?}"
+        );
+    }
+
+    // --- Builtins ---
+
+    #[test]
+    fn print_accepts_any_single_value() {
+        let d = diags(
+            "struct P { x: int }\n\
+             fun main() { print(1); print(\"x\"); print(true); print(P { x: 1 }); }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn print_arity_is_checked() {
+        let d = diags("fun main() { print(); }");
+        assert!(
+            d.iter().any(|e| e.message.contains("expects 1 argument")),
+            "{d:?}"
+        );
+    }
+
+    // --- Arrays ---
+
+    #[test]
+    fn array_literals_indexing_and_builtins_are_typed() {
+        let d = diags(
+            "fun f(): int { const xs = [1, 2, 3]; return xs[0] + len(xs); }\n\
+             fun g() { var ys: int[] = []; push(ys, 4); }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn array_elements_must_share_one_type() {
+        let d = diags("fun f() { const xs = [1, \"a\"]; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("expected int, found string")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn index_must_be_int_and_base_must_be_array() {
+        let d = diags("fun f(xs: int[]): int { return xs[\"a\"]; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("index must be int")),
+            "{d:?}"
+        );
+        let d = diags("fun f(): int { return 1[0]; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot index into int")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn push_checks_the_element_type() {
+        let d = diags("fun f(xs: int[]) { push(xs, \"a\"); }");
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("expected int, found string")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn arrays_are_references_for_mutability() {
+        // Writing an element goes through the array reference — fine on a
+        // const binding. Rebinding the const is still an error.
+        let d = diags("fun f() { const xs = [1]; xs[0] = 2; }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+        let d = diags("fun f() { const xs = [1]; xs = [2]; }");
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("cannot assign to const 'xs'")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn user_definitions_shadow_builtins() {
+        let d = diags(
+            "fun print(n: int): int { return n; }\n\
+             fun main(): int { return print(3); }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
     }
 
     #[test]
