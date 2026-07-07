@@ -80,14 +80,15 @@ impl Lexer<'_> {
             syntax::SEMICOLON => self.single(TokenKind::Semicolon),
             syntax::COMMA => self.single(TokenKind::Comma),
             syntax::DOT => self.single(TokenKind::Dot),
-            syntax::EQUALS => self.single(TokenKind::Equals),
+            syntax::EQUALS => self.maybe_eq(TokenKind::Equals, TokenKind::EqEq),
             syntax::PLUS => self.single(TokenKind::Plus),
             syntax::MINUS => self.single(TokenKind::Minus),
             syntax::STAR => self.single(TokenKind::Asterisk),
             syntax::PERCENT => self.single(TokenKind::Percent),
-            syntax::BANG => self.single(TokenKind::Bang),
-            syntax::LESS => self.single(TokenKind::Less),
-            syntax::GREATER => self.single(TokenKind::Greater),
+            syntax::BANG => self.maybe_eq(TokenKind::Bang, TokenKind::BangEq),
+            syntax::LESS => self.maybe_eq(TokenKind::Less, TokenKind::LessEq),
+            syntax::GREATER => self.maybe_eq(TokenKind::Greater, TokenKind::GreaterEq),
+            syntax::QUOTE => self.scan_string(),
             syntax::AMPERSAND => self.double(syntax::AMPERSAND, TokenKind::AmpAmp),
             syntax::PIPE => self.double(syntax::PIPE, TokenKind::PipePipe),
             syntax::SLASH => self.scan_slash_or_comment(),
@@ -108,6 +109,71 @@ impl Lexer<'_> {
     fn single(&mut self, kind: TokenKind) -> Option<TokenKind> {
         self.bump();
         Some(kind)
+    }
+
+    /// Consumes one char; a following `=` upgrades `single` to `double`
+    /// (`=`→`==`, `!`→`!=`, `<`→`<=`, `>`→`>=`).
+    fn maybe_eq(&mut self, single: TokenKind, double: TokenKind) -> Option<TokenKind> {
+        self.bump();
+        if self.peek() == Some(syntax::EQUALS) {
+            self.bump();
+            Some(double)
+        } else {
+            Some(single)
+        }
+    }
+
+    /// A double-quoted, single-line string literal with `\"`, `\\`, `\n`, `\t`
+    /// escapes. Unterminated or unknown-escape input produces a diagnostic.
+    fn scan_string(&mut self) -> Option<TokenKind> {
+        let start = self.pos;
+        self.bump(); // opening quote
+        let mut text = String::new();
+        loop {
+            match self.peek() {
+                None => {
+                    self.error(
+                        "unterminated string literal".to_string(),
+                        Span::new(start, self.pos),
+                    );
+                    return None;
+                }
+                Some(c) if syntax::is_line_break(c) => {
+                    self.error(
+                        "unterminated string literal".to_string(),
+                        Span::new(start, self.pos),
+                    );
+                    return None;
+                }
+                Some(syntax::QUOTE) => {
+                    self.bump();
+                    return Some(TokenKind::StringLiteral(text));
+                }
+                Some(syntax::BACKSLASH) => {
+                    let escape_start = self.pos;
+                    self.bump();
+                    match self.peek() {
+                        Some(syntax::QUOTE) => text.push(syntax::QUOTE),
+                        Some(syntax::BACKSLASH) => text.push(syntax::BACKSLASH),
+                        Some(syntax::ESCAPE_LF) => text.push(syntax::LF),
+                        Some(syntax::ESCAPE_TAB) => text.push(syntax::TAB),
+                        Some(other) => {
+                            self.error(
+                                format!("unknown escape '\\{other}'"),
+                                Span::new(escape_start, self.pos + other.len_utf8()),
+                            );
+                            text.push(other); // recover with the raw character
+                        }
+                        None => continue, // EOF: the loop reports unterminated
+                    }
+                    self.bump();
+                }
+                Some(c) => {
+                    text.push(c);
+                    self.bump();
+                }
+            }
+        }
     }
 
     /// `first` is the current char and must be doubled (e.g. `&&`, `||`).
@@ -196,8 +262,15 @@ impl Lexer<'_> {
             syntax::KW_VAR => TokenKind::Var,
             syntax::KW_CONST => TokenKind::Const,
             syntax::KW_RETURN => TokenKind::Return,
+            syntax::KW_IF => TokenKind::If,
+            syntax::KW_ELSE => TokenKind::Else,
+            syntax::KW_WHILE => TokenKind::While,
+            syntax::KW_TRUE => TokenKind::True,
+            syntax::KW_FALSE => TokenKind::False,
             syntax::KW_INT => TokenKind::IntType,
             syntax::KW_FLOAT => TokenKind::FloatType,
+            syntax::KW_BOOL => TokenKind::BoolType,
+            syntax::KW_STRING => TokenKind::StringType,
             other => TokenKind::Identifier(other.to_string()),
         }
     }
@@ -274,6 +347,75 @@ mod tests {
     fn spans_cover_the_token_text() {
         let (tokens, _) = lex("fun");
         assert_eq!(tokens[0].span, Span::new(0, 3));
+    }
+
+    #[test]
+    fn comparison_operators_single_and_double() {
+        assert_eq!(
+            kinds("== != <= >= = ! < >"),
+            vec![
+                TokenKind::EqEq,
+                TokenKind::BangEq,
+                TokenKind::LessEq,
+                TokenKind::GreaterEq,
+                TokenKind::Equals,
+                TokenKind::Bang,
+                TokenKind::Less,
+                TokenKind::Greater,
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn base_type_and_control_flow_keywords() {
+        assert_eq!(
+            kinds("true false if else while bool string"),
+            vec![
+                TokenKind::True,
+                TokenKind::False,
+                TokenKind::If,
+                TokenKind::Else,
+                TokenKind::While,
+                TokenKind::BoolType,
+                TokenKind::StringType,
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn string_literal_with_escapes() {
+        assert_eq!(
+            kinds(r#""a\"b\\c\nd\te""#),
+            vec![
+                TokenKind::StringLiteral("a\"b\\c\nd\te".to_string()),
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn unterminated_string_reports_a_diagnostic() {
+        let (tokens, diags) = lex("\"abc\nx");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("unterminated string"), "{diags:?}");
+        // Recovery: lexing continues on the next line.
+        assert_eq!(
+            tokens.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+            vec![TokenKind::Identifier("x".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn unknown_escape_reports_a_diagnostic_and_recovers() {
+        let (tokens, diags) = lex(r#""a\qb""#);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("unknown escape"), "{diags:?}");
+        assert_eq!(
+            tokens[0].kind,
+            TokenKind::StringLiteral("aqb".to_string())
+        );
     }
 
     #[test]

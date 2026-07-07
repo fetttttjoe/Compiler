@@ -33,6 +33,13 @@ pub const AMPERSAND: char = '&';
 pub const PIPE: char = '|';
 pub const UNDERSCORE: char = '_';
 
+// --- String literals ---
+pub const QUOTE: char = '"';
+pub const BACKSLASH: char = '\\';
+/// Escape names: `\n` and `\t` inside a string literal.
+pub const ESCAPE_LF: char = 'n';
+pub const ESCAPE_TAB: char = 't';
+
 // --- Keyword spellings ---
 pub const KW_FUN: &str = "fun";
 pub const KW_STRUCT: &str = "struct";
@@ -41,6 +48,13 @@ pub const KW_CONST: &str = "const";
 pub const KW_RETURN: &str = "return";
 pub const KW_INT: &str = "int";
 pub const KW_FLOAT: &str = "float";
+pub const KW_BOOL: &str = "bool";
+pub const KW_STRING: &str = "string";
+pub const KW_TRUE: &str = "true";
+pub const KW_FALSE: &str = "false";
+pub const KW_IF: &str = "if";
+pub const KW_ELSE: &str = "else";
+pub const KW_WHILE: &str = "while";
 
 /// True for a source line break (`\n` or `\r`). CRLF is handled by the caller
 /// consuming the trailing `\n`.
