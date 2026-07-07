@@ -1,0 +1,26 @@
+{
+  "name": "ys-language",
+  "displayName": "Ys Language",
+  "description": "Syntax highlighting for the Ys language (.ys)",
+  "version": "0.0.1",
+  "publisher": "yanneck",
+  "engines": { "vscode": "^1.60.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "ys",
+        "aliases": ["Ys", "ys"],
+        "extensions": [".ys"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "ys",
+        "scopeName": "source.ys",
+        "path": "./syntaxes/ys.tmLanguage.json"
+      }
+    ]
+  }
+}

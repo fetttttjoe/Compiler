@@ -1,0 +1,88 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Ys",
+  "scopeName": "source.ys",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#function-definition"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#function-call"
+    },
+    {
+      "include": "#operators"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "name": "comment.line.double-slash.ys",
+      "match": "//.*$"
+    },
+    "strings": {
+      "name": "string.quoted.double.ys",
+      "begin": "\"",
+      "end": "\"|$",
+      "patterns": [
+        {
+          "name": "constant.character.escape.ys",
+          "match": "\\\\[\"\\\\nt]"
+        }
+      ]
+    },
+    "function-definition": {
+      "match": "\\b(fun)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "storage.type.function.ys"
+        },
+        "2": {
+          "name": "entity.name.function.ys"
+        }
+      }
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "storage.type.ys",
+          "match": "\\b(const|fun|struct|var)\\b"
+        },
+        {
+          "name": "keyword.control.ys",
+          "match": "\\b(else|export|from|if|import|return|while)\\b"
+        },
+        {
+          "name": "support.type.primitive.ys",
+          "match": "\\b(bool|float|int|string)\\b"
+        },
+        {
+          "name": "constant.language.ys",
+          "match": "\\b(false|true)\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "name": "constant.numeric.ys",
+      "match": "\\b[0-9]+(\\.[0-9]+)?\\b"
+    },
+    "function-call": {
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+      "name": "entity.name.function.call.ys"
+    },
+    "operators": {
+      "name": "keyword.operator.ys",
+      "match": "==|!=|<=|>=|&&|\\|\\||[-+*/%=<>!]"
+    }
+  }
+}
