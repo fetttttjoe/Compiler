@@ -40,6 +40,8 @@ pub struct Field {
 pub enum TypeAnn {
     Int,
     Float,
+    Bool,
+    Str,
     Named(String),
 }
 
@@ -61,6 +63,18 @@ pub enum Stmt {
         value: Option<Expr>,
         span: Span,
     },
+    If {
+        cond: Expr,
+        then_body: Vec<Stmt>,
+        /// `else if …` parses as an else body containing a single nested `If`.
+        else_body: Option<Vec<Stmt>>,
+        span: Span,
+    },
+    While {
+        cond: Expr,
+        body: Vec<Stmt>,
+        span: Span,
+    },
     Expr(Expr),
 }
 
@@ -68,6 +82,8 @@ pub enum Stmt {
 pub enum Expr {
     Int(i64, Span),
     Float(f64, Span),
+    Bool(bool, Span),
+    Str(String, Span),
     Ident(String, Span),
     Unary {
         op: UnOp,
@@ -106,8 +122,12 @@ pub enum BinOp {
     Rem,
     And,
     Or,
+    Eq,
+    Ne,
     Lt,
+    Le,
     Gt,
+    Ge,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -126,8 +146,12 @@ impl BinOp {
             BinOp::Rem => "%",
             BinOp::And => "&&",
             BinOp::Or => "||",
+            BinOp::Eq => "==",
+            BinOp::Ne => "!=",
             BinOp::Lt => "<",
+            BinOp::Le => "<=",
             BinOp::Gt => ">",
+            BinOp::Ge => ">=",
         }
     }
 }
@@ -145,7 +169,11 @@ impl UnOp {
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
-            Expr::Int(_, s) | Expr::Float(_, s) | Expr::Ident(_, s) => *s,
+            Expr::Int(_, s)
+            | Expr::Float(_, s)
+            | Expr::Bool(_, s)
+            | Expr::Str(_, s)
+            | Expr::Ident(_, s) => *s,
             Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Call { span, .. }
@@ -160,6 +188,8 @@ impl Expr {
         match self {
             Expr::Int(n, _) => n.to_string(),
             Expr::Float(f, _) => f.to_string(),
+            Expr::Bool(b, _) => b.to_string(),
+            Expr::Str(s, _) => format!("{s:?}"),
             Expr::Ident(name, _) => name.clone(),
             Expr::Unary { op, rhs, .. } => format!("({} {})", op.symbol(), rhs.sexpr()),
             Expr::Binary { op, lhs, rhs, .. } => {

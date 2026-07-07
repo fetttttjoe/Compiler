@@ -13,13 +13,19 @@ use span::LineIndex;
 
 fn main() {
     let source = r#"
-fun substract(a: int, b: int): int {
-    const result = a - b;
-    return result;
+fun fib(n: int): int {
+    if n <= 1 { return n; }
+    return fib(n - 1) + fib(n - 2);
 }
 
 fun main(): int {
-    return substract(10, 4);
+    var i = 0;
+    var sum = 0;
+    while i < 10 {
+        i = i + 1;
+        if i % 2 == 0 { sum = sum + fib(i); }
+    }
+    return sum;
 }
 "#;
 

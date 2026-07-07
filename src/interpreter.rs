@@ -8,6 +8,8 @@ use crate::span::Span;
 pub enum Value {
     Int(i64),
     Float(f64),
+    Bool(bool),
+    Str(String),
     Unit,
 }
 
@@ -16,6 +18,8 @@ impl Value {
         match self {
             Value::Int(_) => "int",
             Value::Float(_) => "float",
+            Value::Bool(_) => "bool",
+            Value::Str(_) => "string",
             Value::Unit => "unit",
         }
     }
@@ -92,6 +96,28 @@ impl<'a> Interp<'a> {
                 };
                 Ok(Flow::Return(v))
             }
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+                ..
+            } => {
+                if self.eval_condition(cond)? {
+                    self.exec_block_scoped(then_body)
+                } else if let Some(else_body) = else_body {
+                    self.exec_block_scoped(else_body)
+                } else {
+                    Ok(Flow::Normal)
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                while self.eval_condition(cond)? {
+                    if let Flow::Return(v) = self.exec_block_scoped(body)? {
+                        return Ok(Flow::Return(v));
+                    }
+                }
+                Ok(Flow::Normal)
+            }
             Stmt::Expr(e) => {
                 self.eval(e)?;
                 Ok(Flow::Normal)
@@ -112,20 +138,70 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Runs a nested block in its own scope: bindings made inside die at the
+    /// closing brace (mirrors the checker's scoping).
+    fn exec_block_scoped(&mut self, body: &'a [Stmt]) -> Result<Flow, Diagnostic> {
+        self.scopes.push(HashMap::new());
+        let flow = self.exec_block(body);
+        self.scopes.pop();
+        flow
+    }
+
+    fn eval_condition(&mut self, cond: &'a Expr) -> Result<bool, Diagnostic> {
+        match self.eval(cond)? {
+            Value::Bool(b) => Ok(b),
+            other => Err(Diagnostic::error(
+                format!("condition must be bool, found {}", other.type_name()),
+                cond.span(),
+            )),
+        }
+    }
+
+    /// `&&` / `||` evaluate lazily: the right side runs only when the left
+    /// side hasn't already decided the result.
+    fn eval_logical(
+        &mut self,
+        op: BinOp,
+        lhs: &'a Expr,
+        rhs: &'a Expr,
+    ) -> Result<Value, Diagnostic> {
+        let l = self.eval_bool_operand(lhs, op)?;
+        match (op, l) {
+            (BinOp::And, false) => Ok(Value::Bool(false)),
+            (BinOp::Or, true) => Ok(Value::Bool(true)),
+            _ => Ok(Value::Bool(self.eval_bool_operand(rhs, op)?)),
+        }
+    }
+
+    fn eval_bool_operand(&mut self, expr: &'a Expr, op: BinOp) -> Result<bool, Diagnostic> {
+        match self.eval(expr)? {
+            Value::Bool(b) => Ok(b),
+            other => Err(Diagnostic::error(
+                format!("cannot apply '{}' to {}", op.symbol(), other.type_name()),
+                expr.span(),
+            )),
+        }
+    }
+
     fn eval(&mut self, expr: &'a Expr) -> Result<Value, Diagnostic> {
         match expr {
             Expr::Int(n, _) => Ok(Value::Int(*n)),
             Expr::Float(f, _) => Ok(Value::Float(*f)),
+            Expr::Bool(b, _) => Ok(Value::Bool(*b)),
+            Expr::Str(s, _) => Ok(Value::Str(s.clone())),
             Expr::Ident(name, span) => self.lookup(name, *span),
             Expr::Unary { op, rhs, span } => {
                 let v = self.eval(rhs)?;
                 eval_unary(*op, v, *span)
             }
-            Expr::Binary { op, lhs, rhs, span } => {
-                let l = self.eval(lhs)?;
-                let r = self.eval(rhs)?;
-                eval_binary(*op, l, r, *span)
-            }
+            Expr::Binary { op, lhs, rhs, span } => match op {
+                BinOp::And | BinOp::Or => self.eval_logical(*op, lhs, rhs),
+                _ => {
+                    let l = self.eval(lhs)?;
+                    let r = self.eval(rhs)?;
+                    eval_binary(*op, l, r, *span)
+                }
+            },
             Expr::Call { callee, args, span } => {
                 let name = match callee.as_ref() {
                     Expr::Ident(n, _) => n.clone(),
@@ -176,73 +252,101 @@ fn eval_unary(op: UnOp, v: Value, span: Span) -> Result<Value, Diagnostic> {
     match (op, v) {
         (UnOp::Neg, Value::Int(n)) => Ok(Value::Int(-n)),
         (UnOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
-        (UnOp::Not, _) => Err(Diagnostic::error(
-            "operator '!' is not yet supported",
-            span,
-        )),
+        (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
         (UnOp::Neg, other) => Err(Diagnostic::error(
             format!("cannot negate {}", other.type_name()),
             span,
         )),
-    }
-}
-
-fn eval_binary(op: BinOp, l: Value, r: Value, span: Span) -> Result<Value, Diagnostic> {
-    match op {
-        BinOp::And | BinOp::Or | BinOp::Lt | BinOp::Gt => Err(Diagnostic::error(
-            format!("operator '{}' is not yet supported", op.symbol()),
+        (UnOp::Not, other) => Err(Diagnostic::error(
+            format!("cannot apply '!' to {}", other.type_name()),
             span,
         )),
-        _ => match (l, r) {
-            (Value::Int(a), Value::Int(b)) => int_arith(op, a, b, span),
-            (Value::Float(a), Value::Float(b)) => float_arith(op, a, b, span),
-            (a, b) => Err(Diagnostic::error(
-                format!(
-                    "cannot apply '{}' to {} and {}",
-                    op.symbol(),
-                    a.type_name(),
-                    b.type_name()
-                ),
-                span,
-            )),
-        },
     }
 }
 
-fn int_arith(op: BinOp, a: i64, b: i64, span: Span) -> Result<Value, Diagnostic> {
-    let v = match op {
-        BinOp::Add => a.wrapping_add(b),
-        BinOp::Sub => a.wrapping_sub(b),
-        BinOp::Mul => a.wrapping_mul(b),
-        BinOp::Div => {
-            if b == 0 {
-                return Err(Diagnostic::error("division by zero", span));
-            }
-            a / b
-        }
-        BinOp::Rem => {
-            if b == 0 {
-                return Err(Diagnostic::error("division by zero", span));
-            }
-            a % b
-        }
-        _ => unreachable!("non-arithmetic operator reached int_arith"),
-    };
-    Ok(Value::Int(v))
+/// Strict binary evaluation; `&&`/`||` never reach here (they short-circuit
+/// in `eval_logical`).
+fn eval_binary(op: BinOp, l: Value, r: Value, span: Span) -> Result<Value, Diagnostic> {
+    match (l, r) {
+        (Value::Int(a), Value::Int(b)) => int_op(op, a, b, span),
+        (Value::Float(a), Value::Float(b)) => float_op(op, a, b, span),
+        (Value::Str(a), Value::Str(b)) => str_op(op, a, b, span),
+        (Value::Bool(a), Value::Bool(b)) => bool_op(op, a, b, span),
+        (a, b) => Err(Diagnostic::error(
+            format!(
+                "cannot apply '{}' to {} and {}",
+                op.symbol(),
+                a.type_name(),
+                b.type_name()
+            ),
+            span,
+        )),
+    }
 }
 
-// `_span` kept for signature symmetry with `int_arith`; floats have no
-// erroring operations (division by zero is IEEE infinity).
-fn float_arith(op: BinOp, a: f64, b: f64, _span: Span) -> Result<Value, Diagnostic> {
+fn int_op(op: BinOp, a: i64, b: i64, span: Span) -> Result<Value, Diagnostic> {
+    use BinOp::*;
     let v = match op {
-        BinOp::Add => a + b,
-        BinOp::Sub => a - b,
-        BinOp::Mul => a * b,
-        BinOp::Div => a / b,
-        BinOp::Rem => a % b,
-        _ => unreachable!("non-arithmetic operator reached float_arith"),
+        Add => Value::Int(a.wrapping_add(b)),
+        Sub => Value::Int(a.wrapping_sub(b)),
+        Mul => Value::Int(a.wrapping_mul(b)),
+        Div | Rem if b == 0 => return Err(Diagnostic::error("division by zero", span)),
+        Div => Value::Int(a / b),
+        Rem => Value::Int(a % b),
+        Eq => Value::Bool(a == b),
+        Ne => Value::Bool(a != b),
+        Lt => Value::Bool(a < b),
+        Le => Value::Bool(a <= b),
+        Gt => Value::Bool(a > b),
+        Ge => Value::Bool(a >= b),
+        And | Or => unreachable!("logical operators short-circuit in eval_logical"),
     };
-    Ok(Value::Float(v))
+    Ok(v)
+}
+
+// `_span` kept for signature symmetry with `int_op`; float division by zero
+// follows IEEE (infinity/NaN), so floats have no erroring operations.
+fn float_op(op: BinOp, a: f64, b: f64, _span: Span) -> Result<Value, Diagnostic> {
+    use BinOp::*;
+    let v = match op {
+        // Division by zero follows IEEE (infinity/NaN), so no error arm here.
+        Add => Value::Float(a + b),
+        Sub => Value::Float(a - b),
+        Mul => Value::Float(a * b),
+        Div => Value::Float(a / b),
+        Rem => Value::Float(a % b),
+        Eq => Value::Bool(a == b),
+        Ne => Value::Bool(a != b),
+        Lt => Value::Bool(a < b),
+        Le => Value::Bool(a <= b),
+        Gt => Value::Bool(a > b),
+        Ge => Value::Bool(a >= b),
+        And | Or => unreachable!("logical operators short-circuit in eval_logical"),
+    };
+    Ok(v)
+}
+
+fn str_op(op: BinOp, a: String, b: String, span: Span) -> Result<Value, Diagnostic> {
+    match op {
+        BinOp::Add => Ok(Value::Str(a + &b)),
+        BinOp::Eq => Ok(Value::Bool(a == b)),
+        BinOp::Ne => Ok(Value::Bool(a != b)),
+        _ => Err(Diagnostic::error(
+            format!("cannot apply '{}' to string and string", op.symbol()),
+            span,
+        )),
+    }
+}
+
+fn bool_op(op: BinOp, a: bool, b: bool, span: Span) -> Result<Value, Diagnostic> {
+    match op {
+        BinOp::Eq => Ok(Value::Bool(a == b)),
+        BinOp::Ne => Ok(Value::Bool(a != b)),
+        _ => Err(Diagnostic::error(
+            format!("cannot apply '{}' to bool and bool", op.symbol()),
+            span,
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -313,5 +417,95 @@ fun main(): int {
 fun inc(n: int): int { return n + 1; }
 fun main(): int { return inc(inc(inc(0))); }";
         assert_eq!(run(program), Ok(Value::Int(3)));
+    }
+
+    #[test]
+    fn comparisons_and_equality_evaluate() {
+        assert_eq!(
+            run("fun main(): bool { return 1 + 2 == 3; }"),
+            Ok(Value::Bool(true))
+        );
+        assert_eq!(
+            run("fun main(): bool { return 2.0 <= 1.5; }"),
+            Ok(Value::Bool(false))
+        );
+        assert_eq!(
+            run("fun main(): bool { return \"a\" != \"b\"; }"),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn logical_operators_short_circuit() {
+        // The right side would divide by zero — short-circuiting must skip it.
+        assert_eq!(
+            run("fun main(): bool { return false && 1 / 0 == 0; }"),
+            Ok(Value::Bool(false))
+        );
+        assert_eq!(
+            run("fun main(): bool { return true || 1 / 0 == 0; }"),
+            Ok(Value::Bool(true))
+        );
+        // And without short-circuit conditions, both sides evaluate.
+        assert_eq!(
+            run("fun main(): bool { return true && !false; }"),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn string_concatenation() {
+        assert_eq!(
+            run("fun main(): string { return \"foo\" + \"bar\"; }"),
+            Ok(Value::Str("foobar".to_string()))
+        );
+    }
+
+    #[test]
+    fn if_else_selects_the_right_branch() {
+        let abs = "\
+fun abs(n: int): int {
+    if n < 0 { return -n; } else { return n; }
+}
+fun main(): int { return abs(-7) + abs(7); }";
+        assert_eq!(run(abs), Ok(Value::Int(14)));
+    }
+
+    #[test]
+    fn while_loop_accumulates() {
+        let program = "\
+fun main(): int {
+    var i = 0;
+    var acc = 0;
+    while i < 5 {
+        i = i + 1;
+        acc = acc + i;
+    }
+    return acc;
+}";
+        assert_eq!(run(program), Ok(Value::Int(15)));
+    }
+
+    #[test]
+    fn block_scopes_shadow_and_expire() {
+        // The inner `const x` shadows the outer `var x` inside the block only.
+        let program = "\
+fun main(): int {
+    var x = 1;
+    if true { const x = 10; }
+    return x;
+}";
+        assert_eq!(run(program), Ok(Value::Int(1)));
+    }
+
+    #[test]
+    fn recursion_with_control_flow() {
+        let fib = "\
+fun fib(n: int): int {
+    if n <= 1 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+fun main(): int { return fib(10); }";
+        assert_eq!(run(fib), Ok(Value::Int(55)));
     }
 }

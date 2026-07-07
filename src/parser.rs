@@ -9,6 +9,10 @@ pub struct Parser<'a> {
     pub tokens: &'a [Token],
     pub pos: usize,
     pub diagnostics: Vec<Diagnostic>,
+    /// False while parsing an `if`/`while` condition, where `x { … }` must
+    /// read as identifier-then-block, not a struct literal. Parentheses
+    /// re-enable it.
+    pub struct_literals_allowed: bool,
 }
 
 impl Parser<'_> {
@@ -92,6 +96,14 @@ impl Parser<'_> {
                 self.bump();
                 TypeAnn::Float
             }
+            TokenKind::BoolType => {
+                self.bump();
+                TypeAnn::Bool
+            }
+            TokenKind::StringType => {
+                self.bump();
+                TypeAnn::Str
+            }
             TokenKind::Identifier(n) => {
                 self.bump();
                 TypeAnn::Named(n)
@@ -126,12 +138,7 @@ impl Parser<'_> {
         } else {
             None
         };
-        self.expect(TokenKind::LeftBrace);
-        let mut body = Vec::new();
-        while !self.check(&TokenKind::RightBrace) && !self.at_eof() {
-            body.push(self.parse_stmt());
-        }
-        let end = self.expect(TokenKind::RightBrace);
+        let (body, end) = self.parse_block();
         Function {
             name,
             params,
@@ -236,17 +243,22 @@ impl Parser<'_> {
         match tok.kind {
             TokenKind::IntLiteral(n) => Expr::Int(n, tok.span),
             TokenKind::FloatLiteral(f) => Expr::Float(f, tok.span),
+            TokenKind::True => Expr::Bool(true, tok.span),
+            TokenKind::False => Expr::Bool(false, tok.span),
+            TokenKind::StringLiteral(s) => Expr::Str(s, tok.span),
             TokenKind::Identifier(name) => {
-                // ponytail: `Ident {` in expression position is a struct literal.
-                // Revisit this disambiguation when `if cond { … }` control flow lands.
-                if self.check(&TokenKind::LeftBrace) {
+                if self.struct_literals_allowed && self.check(&TokenKind::LeftBrace) {
                     self.parse_struct_literal(name, tok.span)
                 } else {
                     Expr::Ident(name, tok.span)
                 }
             }
             TokenKind::LeftParen => {
+                // Parentheses re-enable struct literals inside a condition.
+                let prev = self.struct_literals_allowed;
+                self.struct_literals_allowed = true;
                 let inner = self.parse_expr(0);
+                self.struct_literals_allowed = prev;
                 self.expect(TokenKind::RightParen);
                 inner
             }
@@ -323,9 +335,98 @@ impl Parser<'_> {
         }
     }
 
+    /// Parses an `if`/`while` condition: struct literals are disallowed so
+    /// `if x { … }` reads `x` as the condition, not a struct literal `x {}`.
+    fn parse_condition(&mut self) -> Expr {
+        let prev = self.struct_literals_allowed;
+        self.struct_literals_allowed = false;
+        let cond = self.parse_expr(0);
+        self.struct_literals_allowed = prev;
+        cond
+    }
+
+    /// Parses `{ stmt* }`, synchronizing after a malformed statement so one
+    /// error doesn't cascade across the rest of the block. Returns the
+    /// statements and the span of the closing brace.
+    fn parse_block(&mut self) -> (Vec<Stmt>, Span) {
+        self.expect(TokenKind::LeftBrace);
+        let mut stmts = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.at_eof() {
+            let diags_before = self.diagnostics.len();
+            stmts.push(self.parse_stmt());
+            if self.diagnostics.len() > diags_before {
+                self.synchronize_stmt();
+            }
+        }
+        let end = self.expect(TokenKind::RightBrace);
+        (stmts, end)
+    }
+
+    /// Statement-level recovery: skip past the next `;`, or stop before a
+    /// token that can start a statement or close the block. A no-op when the
+    /// parser is already at such a boundary.
+    fn synchronize_stmt(&mut self) {
+        while !self.at_eof() {
+            match self.peek().kind {
+                TokenKind::Semicolon => {
+                    self.bump();
+                    return;
+                }
+                TokenKind::RightBrace
+                | TokenKind::Var
+                | TokenKind::Const
+                | TokenKind::Return
+                | TokenKind::If
+                | TokenKind::While => return,
+                _ => self.bump(),
+            }
+        }
+    }
+
+    fn parse_if(&mut self) -> Stmt {
+        let start = self.peek().span;
+        self.bump(); // 'if'
+        let cond = self.parse_condition();
+        let (then_body, then_end) = self.parse_block();
+        let mut span = start.to(then_end);
+        let mut else_body = None;
+        if self.eat(&TokenKind::Else) {
+            if self.check(&TokenKind::If) {
+                // `else if …` nests as an else body with a single If.
+                let nested = self.parse_if();
+                let Stmt::If { span: nested_span, .. } = &nested else {
+                    unreachable!("parse_if always returns Stmt::If");
+                };
+                span = start.to(*nested_span);
+                else_body = Some(vec![nested]);
+            } else {
+                let (body, else_end) = self.parse_block();
+                span = start.to(else_end);
+                else_body = Some(body);
+            }
+        }
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+            span,
+        }
+    }
+
     pub fn parse_stmt(&mut self) -> Stmt {
         let tok = self.peek().clone();
         match tok.kind {
+            TokenKind::If => self.parse_if(),
+            TokenKind::While => {
+                self.bump();
+                let cond = self.parse_condition();
+                let (body, end) = self.parse_block();
+                Stmt::While {
+                    cond,
+                    body,
+                    span: tok.span.to(end),
+                }
+            }
             TokenKind::Var | TokenKind::Const => {
                 let mutable = matches!(tok.kind, TokenKind::Var);
                 self.bump();
@@ -384,7 +485,8 @@ impl Parser<'_> {
 enum Precedence {
     Or,         // ||
     And,        // &&
-    Comparison, // < >
+    Equality,   // == !=
+    Comparison, // < <= > >=
     Sum,        // + -
     Product,    // * / %
 }
@@ -396,8 +498,12 @@ impl Precedence {
         Some(match kind {
             TokenKind::PipePipe => (Precedence::Or, BinOp::Or),
             TokenKind::AmpAmp => (Precedence::And, BinOp::And),
+            TokenKind::EqEq => (Precedence::Equality, BinOp::Eq),
+            TokenKind::BangEq => (Precedence::Equality, BinOp::Ne),
             TokenKind::Less => (Precedence::Comparison, BinOp::Lt),
+            TokenKind::LessEq => (Precedence::Comparison, BinOp::Le),
             TokenKind::Greater => (Precedence::Comparison, BinOp::Gt),
+            TokenKind::GreaterEq => (Precedence::Comparison, BinOp::Ge),
             TokenKind::Plus => (Precedence::Sum, BinOp::Add),
             TokenKind::Minus => (Precedence::Sum, BinOp::Sub),
             TokenKind::Asterisk => (Precedence::Product, BinOp::Mul),
@@ -409,20 +515,24 @@ impl Precedence {
 
     /// Left binding power — higher binds tighter. Scaled by 2 to leave a slot for
     /// the right binding power; left-associative means `right = left + 1`.
-    fn left_bp(self) -> u8 {
+    const fn left_bp(self) -> u8 {
         (self as u8 + 1) * 2
     }
 
-    fn right_bp(self) -> u8 {
+    const fn right_bp(self) -> u8 {
         self.left_bp() + 1
     }
 }
 
 /// Unary prefix operators bind tighter than every binary operator.
-const PREFIX_BP: u8 = 12;
+const PREFIX_BP: u8 = 14;
 
 /// Postfix (call `(`, field `.`) binds tighter than everything, including prefix.
-const POSTFIX_BP: u8 = 14;
+const POSTFIX_BP: u8 = 16;
+
+// Adding a Precedence level shifts the derived binding powers — this guard
+// keeps prefix/postfix above every infix level at compile time.
+const _: () = assert!(PREFIX_BP > Precedence::Product.right_bp() && POSTFIX_BP > PREFIX_BP);
 
 fn describe(kind: &TokenKind) -> &'static str {
     use TokenKind::*;
@@ -480,6 +590,7 @@ pub fn parse(tokens: &[Token]) -> (Ast, Vec<Diagnostic>) {
         tokens,
         pos: 0,
         diagnostics: Vec::new(),
+        struct_literals_allowed: true,
     };
     let mut items = Vec::new();
     while !parser.at_eof() {
@@ -512,6 +623,7 @@ mod tests {
             tokens: &tokens,
             pos: 0,
             diagnostics: Vec::new(),
+            struct_literals_allowed: true,
         };
         let e = p.parse_expr(0);
         assert!(p.diagnostics.is_empty(), "parse errors: {:?}", p.diagnostics);
@@ -568,6 +680,7 @@ mod tests {
             tokens: &tokens,
             pos: 0,
             diagnostics: Vec::new(),
+            struct_literals_allowed: true,
         };
         let s = p.parse_stmt();
         assert!(p.diagnostics.is_empty(), "parse errors: {:?}", p.diagnostics);
@@ -675,5 +788,76 @@ mod tests {
         let (ast, pd) = parse(&tokens);
         assert_eq!(pd.len(), 1);
         assert_eq!(ast.len(), 1);
+    }
+
+    #[test]
+    fn equality_binds_looser_than_comparison_tighter_than_logic() {
+        assert_eq!(
+            expr("a == b && c < d").sexpr(),
+            "(&& (== a b) (< c d))"
+        );
+        assert_eq!(expr("a < b == c >= d").sexpr(), "(== (< a b) (>= c d))");
+    }
+
+    #[test]
+    fn bool_and_string_atoms() {
+        assert_eq!(expr("true").sexpr(), "true");
+        assert_eq!(expr("!false").sexpr(), "(! false)");
+        assert_eq!(expr("\"hi\" + \"!\"").sexpr(), "(+ \"hi\" \"!\")");
+    }
+
+    #[test]
+    fn if_with_else_if_chain() {
+        let s = stmt("if a { return 1; } else if b { return 2; } else { return 3; }");
+        let Stmt::If { cond, then_body, else_body, .. } = s else {
+            panic!("expected If, got something else");
+        };
+        assert_eq!(cond.sexpr(), "a");
+        assert_eq!(then_body.len(), 1);
+        // The `else if` is a single nested If in the else body.
+        let else_body = else_body.expect("else body");
+        assert_eq!(else_body.len(), 1);
+        let Stmt::If { cond: nested_cond, else_body: nested_else, .. } = &else_body[0] else {
+            panic!("expected nested If in else body");
+        };
+        assert_eq!(nested_cond.sexpr(), "b");
+        assert!(nested_else.is_some());
+    }
+
+    #[test]
+    fn while_statement() {
+        let s = stmt("while i < n { i = i + 1; }");
+        let Stmt::While { cond, body, .. } = s else {
+            panic!("expected While");
+        };
+        assert_eq!(cond.sexpr(), "(< i n)");
+        assert_eq!(body.len(), 1);
+    }
+
+    #[test]
+    fn condition_is_never_a_struct_literal() {
+        // `if x { … }` must read `x` as an identifier condition, not the
+        // struct literal `x { }`.
+        let s = stmt("if x { return 1; }");
+        let Stmt::If { cond, .. } = s else { panic!("expected If") };
+        assert_eq!(cond.sexpr(), "x");
+    }
+
+    #[test]
+    fn parenthesized_condition_allows_struct_literals_again() {
+        let s = stmt("if (P { x: 1 }).x == 1 { return 1; }");
+        let Stmt::If { cond, .. } = s else { panic!("expected If") };
+        assert_eq!(cond.sexpr(), "(== (. (struct P x=1) x) 1)");
+    }
+
+    #[test]
+    fn malformed_statement_recovers_at_statement_boundary() {
+        // `const = 1 2 3;` is broken; recovery skips to the `;` so the
+        // following statement parses cleanly instead of cascading.
+        let (tokens, _) = lex("fun f(): int { const = 1 2 3; return 7; }");
+        let (ast, pd) = parse(&tokens);
+        assert_eq!(pd.len(), 2, "one missing-name error + one at the `2`: {pd:?}");
+        let Item::Function(f) = &ast[0] else { panic!("expected function") };
+        assert!(matches!(f.body.last(), Some(Stmt::Return { .. })));
     }
 }

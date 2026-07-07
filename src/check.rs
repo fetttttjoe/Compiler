@@ -8,6 +8,8 @@ use crate::span::Span;
 pub enum Type {
     Int,
     Float,
+    Bool,
+    Str,
     Struct(String),
     Unit,
 }
@@ -17,6 +19,8 @@ impl Type {
         match self {
             Type::Int => "int".to_string(),
             Type::Float => "float".to_string(),
+            Type::Bool => "bool".to_string(),
+            Type::Str => "string".to_string(),
             Type::Struct(n) => n.clone(),
             Type::Unit => "unit".to_string(),
         }
@@ -126,6 +130,8 @@ fn resolve_type(
     match ann {
         TypeAnn::Int => Type::Int,
         TypeAnn::Float => Type::Float,
+        TypeAnn::Bool => Type::Bool,
+        TypeAnn::Str => Type::Str,
         TypeAnn::Named(name) => {
             if structs.contains(name) {
                 Type::Struct(name.clone())
@@ -175,6 +181,33 @@ impl<'a> Checker<'a> {
             self.check_stmt(stmt);
         }
         self.scopes.pop();
+
+        if self.ret != Type::Unit && !always_returns(&f.body) {
+            self.error(
+                format!("not all paths in function '{}' return a value", f.name),
+                f.span,
+            );
+        }
+    }
+
+    /// Type-checks a nested block in its own scope: bindings made inside die
+    /// at the closing brace.
+    fn check_block(&mut self, stmts: &[Stmt]) {
+        self.scopes.push(HashMap::new());
+        for stmt in stmts {
+            self.check_stmt(stmt);
+        }
+        self.scopes.pop();
+    }
+
+    fn check_condition(&mut self, keyword: &str, cond: &Expr) {
+        let ty = self.type_of_expr(cond);
+        if ty != Type::Bool {
+            self.error(
+                format!("{keyword} condition must be bool, found {}", ty.name()),
+                cond.span(),
+            );
+        }
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) {
@@ -210,6 +243,22 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+                ..
+            } => {
+                self.check_condition("if", cond);
+                self.check_block(then_body);
+                if let Some(else_body) = else_body {
+                    self.check_block(else_body);
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                self.check_condition("while", cond);
+                self.check_block(body);
+            }
             Stmt::Expr(e) => {
                 self.type_of_expr(e);
             }
@@ -243,6 +292,8 @@ impl<'a> Checker<'a> {
         match expr {
             Expr::Int(_, _) => Type::Int,
             Expr::Float(_, _) => Type::Float,
+            Expr::Bool(_, _) => Type::Bool,
+            Expr::Str(_, _) => Type::Str,
             Expr::Ident(name, span) => self.lookup(name, *span),
             Expr::Unary { op, rhs, span } => {
                 let ty = self.type_of_expr(rhs);
@@ -252,9 +303,10 @@ impl<'a> Checker<'a> {
                         self.error(format!("cannot negate {}", ty.name()), *span);
                         ty
                     }
+                    UnOp::Not if ty == Type::Bool => Type::Bool,
                     UnOp::Not => {
-                        self.error("operator '!' is not yet supported".to_string(), *span);
-                        Type::Int
+                        self.error(format!("cannot apply '!' to {}", ty.name()), *span);
+                        Type::Bool
                     }
                 }
             }
@@ -270,28 +322,32 @@ impl<'a> Checker<'a> {
     }
 
     fn check_binary(&mut self, op: BinOp, lt: Type, rt: Type, span: Span) -> Type {
-        match op {
-            BinOp::And | BinOp::Or | BinOp::Lt | BinOp::Gt => {
-                self.error(
-                    format!("operator '{}' is not yet supported", op.symbol()),
-                    span,
-                );
-                Type::Int
+        use BinOp::*;
+        let (ok, result) = match op {
+            // Arithmetic on matching numerics; `+` also concatenates strings.
+            Add | Sub | Mul | Div | Rem => {
+                let ok = lt == rt && (is_numeric(&lt) || (op == Add && lt == Type::Str));
+                (ok, lt.clone())
             }
-            _ if lt == rt && is_numeric(&lt) => lt,
-            _ => {
-                self.error(
-                    format!(
-                        "cannot apply '{}' to {} and {}",
-                        op.symbol(),
-                        lt.name(),
-                        rt.name()
-                    ),
-                    span,
-                );
-                lt
-            }
+            // Ordering on matching numerics.
+            Lt | Le | Gt | Ge => (lt == rt && is_numeric(&lt), Type::Bool),
+            // Equality on any matching primitive type.
+            Eq | Ne => (lt == rt && is_primitive(&lt), Type::Bool),
+            // Logic on bools.
+            And | Or => (lt == Type::Bool && rt == Type::Bool, Type::Bool),
+        };
+        if !ok {
+            self.error(
+                format!(
+                    "cannot apply '{}' to {} and {}",
+                    op.symbol(),
+                    lt.name(),
+                    rt.name()
+                ),
+                span,
+            );
         }
+        result
     }
 
     fn check_call(&mut self, callee: &Expr, args: &[Expr], span: Span) -> Type {
@@ -432,6 +488,25 @@ fn is_numeric(t: &Type) -> bool {
     matches!(t, Type::Int | Type::Float)
 }
 
+fn is_primitive(t: &Type) -> bool {
+    matches!(t, Type::Int | Type::Float | Type::Bool | Type::Str)
+}
+
+/// Definite-return analysis: does this statement list guarantee a `return` on
+/// every path? An `if` guarantees it only when both branches exist and both
+/// return; a `while` never does (its condition can be false on entry).
+fn always_returns(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Return { .. } => true,
+        Stmt::If {
+            then_body,
+            else_body: Some(else_body),
+            ..
+        } => always_returns(then_body) && always_returns(else_body),
+        _ => false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,13 +572,111 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_operator_is_reported() {
-        let d = diags("fun f(a: int, b: int): int { const c = a < b; return a; }");
+    fn comparisons_equality_and_logic_are_well_typed() {
+        let d = diags(
+            "fun f(a: int, b: int): bool { return a < b && a != b || !(a >= b); }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn logical_operators_require_bools() {
+        let d = diags("fun f(a: int, b: int): bool { return a && b; }");
         assert!(
             d.iter()
-                .any(|e| e.message.contains("'<' is not yet supported")),
+                .any(|e| e.message.contains("cannot apply '&&' to int and int")),
             "{d:?}"
         );
+    }
+
+    #[test]
+    fn equality_requires_matching_types() {
+        let d = diags("fun f(): bool { return 1 == 1.0; }");
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("cannot apply '==' to int and float")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn not_requires_bool() {
+        let d = diags("fun f(a: int): bool { return !a; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot apply '!' to int")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn string_concat_is_well_typed_and_mixed_concat_is_not() {
+        let d = diags("fun f(s: string): string { return s + \"!\"; }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+        let d = diags("fun f(s: string): string { return s + 1; }");
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("cannot apply '+' to string and int")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn if_and_while_conditions_must_be_bool() {
+        let d = diags("fun f(a: int): int { if a { return 1; } return 0; }");
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("if condition must be bool, found int")),
+            "{d:?}"
+        );
+        let d = diags("fun f(a: int): int { while a { a = a - 1; } return a; }");
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("while condition must be bool, found int")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn block_bindings_do_not_escape_their_scope() {
+        let d = diags("fun f(a: bool): int { if a { const x = 1; } return x; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("undefined variable 'x'")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn missing_return_paths_are_errors() {
+        // Empty body.
+        let d = diags("fun f(): int { }");
+        assert!(
+            d.iter().any(|e| e.message.contains("not all paths in function 'f' return")),
+            "{d:?}"
+        );
+        // If without else can fall through.
+        let d = diags("fun f(a: bool): int { if a { return 1; } }");
+        assert!(
+            d.iter().any(|e| e.message.contains("not all paths")),
+            "{d:?}"
+        );
+        // While may run zero times.
+        let d = diags("fun f(): int { while true { return 1; } }");
+        assert!(
+            d.iter().any(|e| e.message.contains("not all paths")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn both_branches_returning_satisfies_definite_return() {
+        let d = diags("fun f(a: bool): int { if a { return 1; } else { return 2; } }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn unit_functions_need_no_return() {
+        let d = diags("fun f(a: int) { f(a - 1); }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
     }
 
     #[test]
