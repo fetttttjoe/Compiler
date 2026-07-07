@@ -1044,6 +1044,65 @@ fun main(): Node {
         assert_eq!(Value::Bool(true).render(), "Bool(true)");
     }
 
+    /// The kitchen-sink program: a binary search tree combining refstruct
+    /// mutation through const/param bindings, optional args and returns,
+    /// else-branch narrowing, recursion, `??` laziness, and ref identity.
+    #[test]
+    fn binary_search_tree_end_to_end() {
+        let program = "\
+refstruct Tree { v: int, left: Tree?, right: Tree? }
+fun insert(t: Tree?, v: int): Tree {
+    if t == null {
+        return Tree { v: v, left: null, right: null };
+    } else {
+        if v < t.v { t.left = insert(t.left, v); } else { t.right = insert(t.right, v); }
+        return t;
+    }
+}
+fun sum(t: Tree?): int {
+    if t == null { return 0; } else { return sum(t.left) + t.v + sum(t.right); }
+}
+fun min(t: Tree): int {
+    var best = t.v;
+    var cur: Tree? = t.left;
+    while cur != null { best = cur.v; cur = cur.left; }
+    return best;
+}
+fun main(): bool {
+    var root: Tree? = null;
+    root = insert(root, 5);
+    const keep = root;
+    root = insert(root, 3);
+    root = insert(root, 8);
+    root = insert(root, 1);
+    return sum(root) == 17 && keep == root && min(keep ?? insert(null, 0)) == 1;
+}";
+        assert_eq!(run(program), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn coalesce_chains_left_associatively() {
+        let program = "\
+fun main(): int {
+    var a: int? = null;
+    var b: int? = null;
+    return (a ?? b ?? 7) + (a ?? 1);
+}";
+        assert_eq!(run(program), Ok(Value::Int(8)));
+    }
+
+    #[test]
+    fn returned_refstruct_keeps_identity() {
+        let program = "\
+refstruct P { x: int }
+fun same(p: P): P { return p; }
+fun main(): bool {
+    const a = P { x: 1 };
+    return same(a) == a;
+}";
+        assert_eq!(run(program), Ok(Value::Bool(true)));
+    }
+
     #[test]
     fn recursion_with_control_flow() {
         let fib = "\

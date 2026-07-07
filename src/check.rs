@@ -1634,6 +1634,114 @@ mod tests {
         assert!(d.is_empty(), "unexpected: {d:?}");
     }
 
+    // --- Narrowing edges: what v1 must NOT accept, pinned deliberately ---
+
+    #[test]
+    fn or_conditions_do_not_narrow() {
+        // If the left of `||` is false, p IS null — narrowing the right
+        // side would be unsound.
+        let d = diags(
+            "refstruct P { x: int }\n\
+             fun f(p: P?): bool { return p != null || p.x > 0; }",
+        );
+        assert!(d.iter().any(|e| e.message.contains("may be null")), "{d:?}");
+    }
+
+    #[test]
+    fn early_return_does_not_narrow_after_the_if() {
+        // v1 ceiling: `if p == null { return 0; }` doesn't narrow the
+        // statements after the if — only an else branch is narrowed.
+        let d = diags(
+            "refstruct P { x: int }\n\
+             fun f(p: P?): int { if p == null { return 0; } return p.x; }",
+        );
+        assert!(d.iter().any(|e| e.message.contains("may be null")), "{d:?}");
+    }
+
+    #[test]
+    fn reassignment_inside_a_narrowed_block_unnarrows() {
+        let d = diags(
+            "refstruct P { x: int }\n\
+             fun f(q: P?): int {\n\
+                 var p = q;\n\
+                 if p != null { p = null; return p.x; }\n\
+                 return 0;\n\
+             }",
+        );
+        assert!(d.iter().any(|e| e.message.contains("may be null")), "{d:?}");
+    }
+
+    #[test]
+    fn shadowing_inside_a_narrowed_block_unnarrows() {
+        let d = diags(
+            "refstruct P { x: int }\n\
+             fun get(): P? { return null; }\n\
+             fun f(p: P?): int {\n\
+                 if p != null { const p = get(); return p.x; }\n\
+                 return 0;\n\
+             }",
+        );
+        assert!(d.iter().any(|e| e.message.contains("may be null")), "{d:?}");
+    }
+
+    #[test]
+    fn while_conditions_narrow_through_extra_checks() {
+        let d = diags(
+            "refstruct Node { v: int, next: Node? }\n\
+             fun f(head: Node?): int {\n\
+                 var cur = head;\n\
+                 var n = 0;\n\
+                 while cur != null && cur.v < 5 { n = n + 1; cur = cur.next; }\n\
+                 return n;\n\
+             }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn narrowed_value_type_optionals_support_arithmetic() {
+        let d = diags(
+            "fun f(x: int?): int { if x != null { return x + 1; } else { return 0; } }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    // --- Optional-chaining edges ---
+
+    #[test]
+    fn optional_chaining_flattens_already_optional_fields() {
+        // n?.next is Node?, not Node?? — there is no double optional.
+        let d = diags(
+            "refstruct Node { v: int, next: Node? }\n\
+             fun f(n: Node?): Node? { return n?.next; }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn plain_dot_into_an_optional_field_errors_with_a_hint() {
+        // n.next is fine to read, but chaining `.v` through it is not.
+        let d = diags(
+            "refstruct Node { v: int, next: Node? }\n\
+             fun f(n: Node): int { return n.next.v; }",
+        );
+        assert!(
+            d.iter().any(|e| e.message.contains("may be null")
+                && e.help.as_deref().is_some_and(|h| h.contains("?."))),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn coalescing_an_already_unwrapped_value_is_rejected() {
+        // (a ?? 1) is int; a second ?? has nothing left to unwrap.
+        let d = diags("fun f(a: int?): int { return a ?? 1 ?? 9; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot apply '??'")),
+            "{d:?}"
+        );
+    }
+
     #[test]
     fn assigning_to_const_is_an_error() {
         let d = diags("fun f(): int { const x = 1; x = 2; return x; }");
