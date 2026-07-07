@@ -37,6 +37,18 @@ impl LineIndex {
             .saturating_sub(1);
         (line + 1, offset - self.line_starts[line] + 1)
     }
+
+    /// The text of a 1-based line, without its trailing line break — used by
+    /// diagnostics to show the offending source line.
+    pub fn line_text<'s>(&self, source: &'s str, line: usize) -> &'s str {
+        let start = self.line_starts[line - 1];
+        let end = self
+            .line_starts
+            .get(line)
+            .copied()
+            .unwrap_or(source.len());
+        source[start..end].trim_end_matches([crate::syntax::LF, crate::syntax::CR])
+    }
 }
 
 #[cfg(test)]
