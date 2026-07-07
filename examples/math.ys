@@ -1,4 +1,4 @@
-// Math helpers — used by main.lang to show a cross-file call.
+// Math helpers — used by main.ys to show a cross-file call.
 fun fib(n: int): int {
     if n <= 1 { return n; }
     return fib(n - 1) + fib(n - 2);
