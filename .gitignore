@@ -3,3 +3,6 @@
 # Skill-generated plans/specs — scratch, not tracked.
 # Durable decisions get promoted to an ADR (docs/adr/) when the work lands.
 /docs/superpowers/
+
+# Editor configs stay local.
+/.vscode/
