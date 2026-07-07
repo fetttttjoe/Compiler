@@ -2,6 +2,14 @@ use crate::source::SourceMap;
 use crate::span::Span;
 use crate::syntax;
 
+/// The ANSI palette for error output, shared by every path that prints an
+/// `error:` label (diagnostics here, top-level errors in `main`): bold red
+/// severity, bold blue gutter accents, bold cyan help.
+pub const ANSI_ERROR: &str = "\x1b[1;31m";
+const ANSI_ACCENT: &str = "\x1b[1;34m";
+const ANSI_HELP: &str = "\x1b[1;36m";
+pub const ANSI_RESET: &str = "\x1b[0m";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     Error,
@@ -31,6 +39,13 @@ impl Diagnostic {
         self
     }
 
+    /// Plain-text convenience over `render_styled` — the form the test
+    /// suites assert against; production renders via `render_styled`.
+    #[cfg(test)]
+    pub fn render(&self, map: &SourceMap) -> String {
+        self.render_styled(map, false)
+    }
+
     /// Renders the diagnostic with its source line and a caret underline:
     ///
     /// ```text
@@ -43,7 +58,19 @@ impl Diagnostic {
     ///
     /// Spans reaching past the line are clamped to it; the underline padding
     /// mirrors the line's own tabs so carets stay aligned in a terminal.
-    pub fn render(&self, map: &SourceMap) -> String {
+    ///
+    /// When `color` is true the label, gutter, carets, and help are wrapped
+    /// in ANSI color; with `color = false` the output is byte-for-byte the
+    /// plain form above, so the caller enables color only for a real
+    /// terminal (see `main`). ANSI codes are zero-width, so caret alignment
+    /// is unaffected either way.
+    pub fn render_styled(&self, map: &SourceMap, color: bool) -> String {
+        // (severity, accent for gutter/arrow, help, reset). Empty when off.
+        let (sev, accent, help_style, reset) = if color {
+            (ANSI_ERROR, ANSI_ACCENT, ANSI_HELP, ANSI_RESET)
+        } else {
+            ("", "", "", "")
+        };
         let label = match self.severity {
             Severity::Error => "error",
         };
@@ -69,7 +96,11 @@ impl Diagnostic {
         let num = loc.line.to_string();
         let gutter = " ".repeat(num.len());
         let mut rendered = format!(
-            "{label}: {msg}\n{gutter}--> {file}:{line}:{col}\n{gutter} |\n{num} | {text}\n{gutter} | {pad}{carets}",
+            "{sev}{label}{reset}: {msg}\n\
+             {gutter}{accent}-->{reset} {file}:{line}:{col}\n\
+             {gutter} {accent}|{reset}\n\
+             {accent}{num}{reset} {accent}|{reset} {text}\n\
+             {gutter} {accent}|{reset} {pad}{sev}{carets}{reset}",
             msg = self.message,
             file = loc.file,
             line = loc.line,
@@ -77,7 +108,9 @@ impl Diagnostic {
             text = loc.line_text,
         );
         if let Some(help) = &self.help {
-            rendered.push_str(&format!("\n{gutter} = help: {help}"));
+            rendered.push_str(&format!(
+                "\n{gutter} {accent}={reset} {help_style}help:{reset} {help}"
+            ));
         }
         rendered
     }
@@ -157,6 +190,42 @@ mod tests {
             diag.render(&map),
             "error: undefined variable 'bad'\n --> main.ys:1:1\n  |\n1 | bad\n  | ^^^\n  = help: did you mean 'bat'?"
         );
+    }
+
+    #[test]
+    fn render_styled_colors_with_only_zero_width_codes() {
+        let mut map = SourceMap::new();
+        map.add("main.ys", "bad");
+        let diag = Diagnostic::error("undefined variable 'bad'", Span::new(0, 3))
+            .with_help("did you mean 'bat'?");
+
+        let plain = diag.render(&map);
+        // color=false is byte-for-byte the plain form the other tests assert.
+        assert_eq!(diag.render_styled(&map, false), plain);
+
+        let colored = diag.render_styled(&map, true);
+        // It actually colors: label and carets carry the error (red) code.
+        assert!(
+            colored.contains(&format!("{ANSI_ERROR}error{ANSI_RESET}")),
+            "{colored:?}"
+        );
+        assert!(
+            colored.contains(&format!("{ANSI_ERROR}^^^{ANSI_RESET}")),
+            "{colored:?}"
+        );
+        // ...and adds nothing but zero-width codes — stripping every ANSI
+        // escape (`\x1b...m`) recovers the plain form, so caret alignment is
+        // identical in a terminal. Palette-agnostic on purpose: new colors
+        // must not require touching this test.
+        let mut stripped = String::new();
+        let mut rest = colored.as_str();
+        while let Some(i) = rest.find('\x1b') {
+            stripped.push_str(&rest[..i]);
+            let end = rest[i..].find('m').expect("unterminated ANSI escape");
+            rest = &rest[i + end + 1..];
+        }
+        stripped.push_str(rest);
+        assert_eq!(stripped, plain);
     }
 
     #[test]
