@@ -103,3 +103,8 @@ properly.
 (parser + check + interpret), struct values at runtime (`Value::Struct`),
 codegen (reserved contract), pretty caret diagnostics (`diagnostic.rs`
 rendering), CLI file input / REPL (`main.rs`).
+
+> **Amendment (2026-07-07):** booleans/comparisons/control flow landed (ADR
+> 0002), and caret-underline diagnostic rendering landed in
+> `Diagnostic::render` — both rows above are done. Remaining seats: struct
+> runtime values, codegen, CLI/REPL.
