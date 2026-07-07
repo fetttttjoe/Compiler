@@ -621,7 +621,9 @@ impl<'a> Parser<'a> {
                 // `place = expr;` is an assignment; anything else is an
                 // expression statement.
                 if self.check(&TokenKind::Equals) {
-                    if !is_place(&expr) {
+                    // Only places (a variable or plain field chain) can be
+                    // assigned to; `?.` links are excluded by place_path.
+                    if expr.place_path().is_none() {
                         self.error("invalid assignment target".to_string(), expr.span());
                     }
                     let start = expr.span();
@@ -644,16 +646,6 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// A place expression can be assigned to: a variable or a field chain rooted
-/// at one. `?.` links are excluded — a target that might not exist can't be
-/// written to.
-fn is_place(e: &Expr) -> bool {
-    match e {
-        Expr::Ident(..) => true,
-        Expr::Field { base, optional, .. } => !optional && is_place(base),
-        _ => false,
-    }
-}
 
 /// Operator precedence, lowest to highest. Declaration order *is* the ranking —
 /// the Pratt binding powers are derived from it, so adding a level means adding

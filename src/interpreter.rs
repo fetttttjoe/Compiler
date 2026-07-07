@@ -364,16 +364,8 @@ impl<'a> Interp<'a> {
     fn assign_place(&mut self, target: &'a Expr, v: Value) -> Result<(), Diagnostic> {
         match target {
             Expr::Ident(name, span) => {
-                match self.scopes.iter_mut().rev().find_map(|s| s.get_mut(name)) {
-                    Some(slot) => {
-                        *slot = v;
-                        Ok(())
-                    }
-                    None => Err(Diagnostic::error(
-                        format!("undefined variable '{name}'"),
-                        *span,
-                    )),
-                }
+                *self.slot_mut(name, *span)? = v;
+                Ok(())
             }
             Expr::Field {
                 base, name, span, ..
@@ -395,16 +387,17 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn lookup(&self, name: &str, span: Span) -> Result<Value, Diagnostic> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(v) = scope.get(name) {
-                return Ok(v.clone());
-            }
-        }
-        Err(Diagnostic::error(
-            format!("undefined variable '{name}'"),
-            span,
-        ))
+    fn lookup(&mut self, name: &str, span: Span) -> Result<Value, Diagnostic> {
+        self.slot_mut(name, span).map(|v| v.clone())
+    }
+
+    /// The scope slot holding `name`, innermost first.
+    fn slot_mut(&mut self, name: &str, span: Span) -> Result<&mut Value, Diagnostic> {
+        self.scopes
+            .iter_mut()
+            .rev()
+            .find_map(|s| s.get_mut(name))
+            .ok_or_else(|| Diagnostic::error(format!("undefined variable '{name}'"), span))
     }
 }
 
@@ -1063,10 +1056,9 @@ fun sum(t: Tree?): int {
     if t == null { return 0; } else { return sum(t.left) + t.v + sum(t.right); }
 }
 fun min(t: Tree): int {
-    var best = t.v;
-    var cur: Tree? = t.left;
-    while cur != null { best = cur.v; cur = cur.left; }
-    return best;
+    var cur = t;
+    while cur.left != null { cur = cur.left; }
+    return cur.v;
 }
 fun main(): bool {
     var root: Tree? = null;
@@ -1078,6 +1070,21 @@ fun main(): bool {
     return sum(root) == 17 && keep == root && min(keep ?? insert(null, 0)) == 1;
 }";
         assert_eq!(run(program), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn field_narrowed_traversal_runs() {
+        let program = "\
+refstruct Node { v: int, next: Node? }
+fun last(head: Node): int {
+    var cur = head;
+    while cur.next != null { cur = cur.next; }
+    return cur.v;
+}
+fun main(): int {
+    return last(Node { v: 1, next: Node { v: 2, next: Node { v: 3, next: null } } });
+}";
+        assert_eq!(run(program), Ok(Value::Int(3)));
     }
 
     #[test]

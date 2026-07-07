@@ -35,12 +35,27 @@ the type.
 6. **`??` coalescing** is the unwrap: `a ?? b` takes `a` unless null, else
    the lazily-evaluated `b`. Lowest precedence; left side must be optional;
    the result unwraps when `b: T`, stays optional when `b: T?`/null.
-7. **Narrowing, v1 ceiling:** `x != null` narrows `x` in `if`/`while`
-   bodies, `x == null` narrows the `else` branch, a leading `x != null &&`
+7. **Narrowing:** `x != null` narrows `x` in `if`/`while` bodies,
+   `x == null` narrows the `else` branch, a leading `x != null &&`
    narrows the rest of the condition. Rebinding or shadowing un-narrows
    (typed before the rebind, so `cur = cur.next` inside the loop works).
-   Only direct checks on local names — no field narrowing, no
-   cross-function inference. Documented limit, not an accident.
+   No cross-function inference. Documented limit, not an accident.
+
+   > **Amendment (2026-07-07):** narrowing extended from bare names to
+   > place paths — `while cur.left != null { cur = cur.left; }` now
+   > checks. Soundness under aliasing is kept by invalidation, not
+   > tracking: a field-path fact dies on any call, any write through any
+   > field, or rebinding of any prefix; bare-variable facts survive calls
+   > (a callee cannot rebind the caller's locals). Invalidation is
+   > position-aware: a call in the right side of `&&` kills the left
+   > side's field facts before they reach the body; entering a `while`
+   > body drops enclosing facts the body can invalidate (they would be
+   > stale on iteration 2 — the loop's own condition re-checks, outer
+   > guards don't); shadowing only hides a fact while the shadow's scope
+   > lives, while reassignment kills it permanently. This is stricter
+   > than TypeScript (which keeps property narrowing across calls,
+   > unsoundly) and preserves the invariant that checked programs cannot
+   > hit runtime null errors.
 
 ## Consequences
 

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{BinOp, Expr, Function, Item, Stmt, TypeAnn, UnOp};
-use crate::diagnostic::{closest, Diagnostic};
+use crate::diagnostic::Diagnostic;
 use crate::modules::ModuleGraph;
 use crate::span::Span;
 
@@ -117,20 +117,19 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
             let fn_export = target.fns.get(&binding.name).copied();
             let ty_export = target.structs.get(&binding.name).copied();
             if fn_export.is_none() && ty_export.is_none() {
-                let mut diag = Diagnostic::error(
-                    format!("module '{target_path}' has no item '{}'", binding.name),
-                    binding.span,
-                );
                 let exported_names = target
                     .fns
                     .iter()
                     .chain(target.structs.iter())
                     .filter(|(_, &exported)| exported)
                     .map(|(n, _)| n.as_str());
-                if let Some(suggestion) = closest(&binding.name, exported_names) {
-                    diag = diag.with_help(format!("did you mean '{suggestion}'?"));
-                }
-                diags.push(diag);
+                diags.push(
+                    Diagnostic::error(
+                        format!("module '{target_path}' has no item '{}'", binding.name),
+                        binding.span,
+                    )
+                    .suggest(&binding.name, exported_names),
+                );
                 continue;
             }
             if fn_export != Some(true) && ty_export != Some(true) {
@@ -297,11 +296,10 @@ fn resolve_type(
         TypeAnn::Named(name) => match ty_alias.get(name) {
             Some((m, n)) => Type::Struct(*m, n.clone()),
             None => {
-                let mut diag = Diagnostic::error(format!("unknown type '{name}'"), span);
-                if let Some(suggestion) = closest(name, ty_alias.keys().map(String::as_str)) {
-                    diag = diag.with_help(format!("did you mean '{suggestion}'?"));
-                }
-                diags.push(diag);
+                diags.push(
+                    Diagnostic::error(format!("unknown type '{name}'"), span)
+                        .suggest(name, ty_alias.keys().map(String::as_str)),
+                );
                 Type::Unit // recovery
             }
         },
@@ -313,6 +311,29 @@ struct VarInfo {
     mutable: bool,
 }
 
+/// One narrowing region: facts proven non-null on entry, plus places whose
+/// facts are hidden for the region's duration because a new binding shadows
+/// the name — hiding ends automatically when the frame pops.
+struct NarrowFrame {
+    facts: HashSet<String>,
+    shadowed: HashSet<String>,
+}
+
+impl NarrowFrame {
+    fn new(facts: HashSet<String>) -> NarrowFrame {
+        NarrowFrame {
+            facts,
+            shadowed: HashSet::new(),
+        }
+    }
+}
+
+/// Is `path` the same place as `prefix`, or reached through it
+/// (`covers("cur", "cur.left")` is true; `covers("cur", "curx")` is not)?
+fn covers(prefix: &str, path: &str) -> bool {
+    path == prefix || (path.starts_with(prefix) && path[prefix.len()..].starts_with('.'))
+}
+
 struct Checker<'a> {
     module: usize,
     paths: &'a [&'a str],
@@ -322,10 +343,12 @@ struct Checker<'a> {
     structs: &'a HashMap<(usize, String), StructType>,
     diagnostics: &'a mut Vec<Diagnostic>,
     scopes: Vec<HashMap<String, VarInfo>>,
-    /// Narrowing stack: names proven non-null by an enclosing `!= null`
-    /// check. A narrowed `T?` reads as `T`; rebinding or shadowing a name
-    /// removes it from every set.
-    nonnull: Vec<HashSet<String>>,
+    /// Narrowing stack: place paths (`cur`, `cur.left`) proven non-null by
+    /// an enclosing `!= null` check. A narrowed `T?` reads as `T`. Rebinding
+    /// removes a path and its extensions permanently; shadowing only hides
+    /// it while the shadow's frame lives; field paths are also dropped on
+    /// any call or field write, since aliases can reach them.
+    nonnull: Vec<NarrowFrame>,
     ret: Type,
 }
 
@@ -369,10 +392,10 @@ impl<'a> Checker<'a> {
     }
 
     /// Type-checks a nested block in its own scope (bindings made inside die
-    /// at the closing brace), with a set of names proven non-null for its
-    /// duration.
-    fn check_block_narrowed(&mut self, stmts: &[Stmt], nonnull: HashSet<String>) {
-        self.nonnull.push(nonnull);
+    /// at the closing brace), with a set of place paths proven non-null for
+    /// its duration.
+    fn check_block_narrowed(&mut self, stmts: &[Stmt], facts: HashSet<String>) {
+        self.nonnull.push(NarrowFrame::new(facts));
         self.scopes.push(HashMap::new());
         for stmt in stmts {
             self.check_stmt(stmt);
@@ -381,15 +404,40 @@ impl<'a> Checker<'a> {
         self.nonnull.pop();
     }
 
-    fn is_nonnull(&self, name: &str) -> bool {
-        self.nonnull.iter().any(|set| set.contains(name))
+    /// Any narrowing facts at all? The cheap gate for the common,
+    /// un-narrowed path — skips fact bookkeeping entirely.
+    fn has_facts(&self) -> bool {
+        self.nonnull.iter().any(|f| !f.facts.is_empty())
     }
 
-    /// Drops `name` from every narrowing set — used when it's rebound or
-    /// shadowed and might be null again.
-    fn unnarrow(&mut self, name: &str) {
-        for set in &mut self.nonnull {
-            set.remove(name);
+    fn is_nonnull(&self, path: &str) -> bool {
+        // Innermost first: a shadow hides outer facts for its own region,
+        // but a re-established inner fact wins over an outer shadow.
+        for frame in self.nonnull.iter().rev() {
+            if frame.shadowed.iter().any(|s| covers(s, path)) {
+                return false;
+            }
+            if frame.facts.contains(path) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Permanently drops a place path — and everything reached through it —
+    /// from every narrowing frame. Used when the place is reassigned.
+    fn unnarrow(&mut self, path: &str) {
+        for frame in &mut self.nonnull {
+            frame.facts.retain(|q| !covers(path, q));
+        }
+    }
+
+    /// Field-path facts don't survive calls or writes through fields — any
+    /// of those can reach the checked object through an alias. Bare
+    /// variable facts do survive: a callee can't rebind the caller's locals.
+    fn unnarrow_field_paths(&mut self) {
+        for frame in &mut self.nonnull {
+            frame.facts.retain(|q| !q.contains('.'));
         }
     }
 
@@ -453,8 +501,11 @@ impl<'a> Checker<'a> {
                         mutable: *mutable,
                     },
                 );
-                // A new binding shadows any narrowing of the same name.
-                self.unnarrow(name);
+                // A new binding hides any narrowing of the same name for
+                // the rest of this block; outer facts return when it ends.
+                if let Some(frame) = self.nonnull.last_mut() {
+                    frame.shadowed.insert(name.clone());
+                }
             }
             Stmt::Return { value, span } => {
                 let ty = match value {
@@ -465,7 +516,7 @@ impl<'a> Checker<'a> {
                     self.error(
                         format!(
                             "expected return type {}, found {}",
-                            self.type_name(&self.ret.clone()),
+                            self.type_name(&self.ret),
                             self.type_name(&ty)
                         ),
                         *span,
@@ -488,6 +539,22 @@ impl<'a> Checker<'a> {
             Stmt::While { cond, body, .. } => {
                 self.check_condition("while", cond);
                 let (if_true, _) = null_checks(cond);
+                // Facts from OUTSIDE the loop go stale on iteration 2 if
+                // the body can invalidate them (only the loop's own
+                // condition is re-checked each pass). Drop what the body
+                // can touch before checking it; the condition's own facts
+                // are pushed fresh and stay safe.
+                if self.has_facts() {
+                    let mut assigned = HashSet::new();
+                    let mut kills_fields = false;
+                    body_effects(body, &mut assigned, &mut kills_fields);
+                    for path in &assigned {
+                        self.unnarrow(path);
+                    }
+                    if kills_fields {
+                        self.unnarrow_field_paths();
+                    }
+                }
                 self.check_block_narrowed(body, if_true);
             }
             Stmt::Expr(e) => {
@@ -503,24 +570,37 @@ impl<'a> Checker<'a> {
                     self.lookup(root, root_span); // emits undefined + suggestion
                     return;
                 };
-                // Rebinding a variable invalidates its narrowing — the new
+                // Rebinding a place invalidates its narrowing — the new
                 // value may be null again. (The value above was typed while
-                // still narrowed, so `cur = cur.next` checks out.)
-                if matches!(target, Expr::Ident(..)) {
-                    self.unnarrow(root);
+                // still narrowed, so `cur = cur.next` checks out. Prefixes
+                // stay narrowed, so a guarded `cur.left.v = 1` still types.)
+                if self.has_facts() {
+                    if let Some(path) = target.place_path() {
+                        self.unnarrow(&path);
+                    }
                 }
                 // Typing the target may emit its own errors (unknown field);
                 // stop here when it does — mutability/mismatch checks on an
                 // ill-formed target would only add noise.
                 let before = self.diagnostics.len();
                 let target_ty = self.type_of_expr(target);
-                if self.diagnostics.len() != before {
+                let clean = self.diagnostics.len() == before;
+                // Mutability: a `var` root, or a chain crossing a refstruct
+                // boundary (past a reference we mutate the shared object,
+                // not the binding). Decided while narrowing facts are still
+                // intact, so crosses_ref's re-typing sees exactly what the
+                // typing pass above saw and emits nothing new.
+                let allowed = !clean || mutable || self.crosses_ref(target);
+                // A write through a field may reach aliased state — field
+                // facts don't survive it. Dropped only now, after every
+                // check that re-reads the place.
+                if matches!(target, Expr::Field { .. }) {
+                    self.unnarrow_field_paths();
+                }
+                if !clean {
                     return;
                 }
-                // Mutation needs a `var` root unless the chain crosses a
-                // refstruct boundary — past a reference we mutate the shared
-                // object, not the binding.
-                if !mutable && !self.crosses_ref(target) {
+                if !allowed {
                     self.error(format!("cannot assign to const '{root}'"), *span);
                     return;
                 }
@@ -574,7 +654,7 @@ impl<'a> Checker<'a> {
                 // `x != null && …` — the null check guards the right side.
                 let rt = if *op == BinOp::And {
                     let (if_true, _) = null_checks(lhs);
-                    self.nonnull.push(if_true);
+                    self.nonnull.push(NarrowFrame::new(if_true));
                     let rt = self.type_of_expr(rhs);
                     self.nonnull.pop();
                     rt
@@ -583,7 +663,13 @@ impl<'a> Checker<'a> {
                 };
                 self.check_binary(*op, lt, rt, *span)
             }
-            Expr::Call { callee, args, span } => self.check_call(callee, args, *span),
+            Expr::Call { callee, args, span } => {
+                let ty = self.check_call(callee, args, *span);
+                // The callee can mutate any shared refstruct it can reach,
+                // so field-path narrowing doesn't survive a call.
+                self.unnarrow_field_paths();
+                ty
+            }
             Expr::Field {
                 base,
                 name,
@@ -649,11 +735,10 @@ impl<'a> Checker<'a> {
         // independent of the `&mut self` calls below — no clone needed.
         let sigs = self.sigs;
         let Some(target) = self.fn_alias.get(&name) else {
-            let mut diag = Diagnostic::error(format!("undefined function '{name}'"), span);
-            if let Some(suggestion) = closest(&name, self.fn_alias.keys().map(String::as_str)) {
-                diag = diag.with_help(format!("did you mean '{suggestion}'?"));
-            }
-            self.diagnostics.push(diag);
+            self.diagnostics.push(
+                Diagnostic::error(format!("undefined function '{name}'"), span)
+                    .suggest(&name, self.fn_alias.keys().map(String::as_str)),
+            );
             // Still check the arguments — their own errors shouldn't vanish
             // just because the callee is unknown.
             for arg in args {
@@ -731,10 +816,9 @@ impl<'a> Checker<'a> {
             );
             return Type::Unit;
         };
-        let (sm, struct_name) = (*sm, struct_name.clone());
         let field_ty = self
             .structs
-            .get(&(sm, struct_name.clone()))
+            .get(&(*sm, struct_name.clone()))
             .and_then(|st| st.fields.iter().find(|(fname, _)| fname == field))
             .map(|(_, ty)| ty.clone());
         match field_ty {
@@ -743,6 +827,16 @@ impl<'a> Checker<'a> {
                 Type::Optional(_) => ty,
                 other => Type::Optional(Box::new(other)),
             },
+            // A narrowed field path reads as its inner type, same as
+            // narrowed variables in `lookup`.
+            Some(Type::Optional(inner))
+                if self.has_facts()
+                    && base
+                        .place_path()
+                        .is_some_and(|p| self.is_nonnull(&format!("{p}.{field}"))) =>
+            {
+                *inner
+            }
             Some(ty) => ty,
             None => {
                 self.error(
@@ -757,11 +851,10 @@ impl<'a> Checker<'a> {
     fn check_struct_lit(&mut self, name: &str, fields: &[(String, Expr)], span: Span) -> Type {
         let structs = self.structs;
         let Some(key) = self.ty_alias.get(name) else {
-            let mut diag = Diagnostic::error(format!("unknown struct '{name}'"), span);
-            if let Some(suggestion) = closest(name, self.ty_alias.keys().map(String::as_str)) {
-                diag = diag.with_help(format!("did you mean '{suggestion}'?"));
-            }
-            self.diagnostics.push(diag);
+            self.diagnostics.push(
+                Diagnostic::error(format!("unknown struct '{name}'"), span)
+                    .suggest(name, self.ty_alias.keys().map(String::as_str)),
+            );
             for (_, value) in fields {
                 self.type_of_expr(value);
             }
@@ -844,11 +937,9 @@ impl<'a> Checker<'a> {
             return info.ty.clone();
         }
         let visible = self.scopes.iter().flat_map(|s| s.keys().map(String::as_str));
-        let mut diag = Diagnostic::error(format!("undefined variable '{name}'"), span);
-        if let Some(suggestion) = closest(name, visible) {
-            diag = diag.with_help(format!("did you mean '{suggestion}'?"));
-        }
-        self.diagnostics.push(diag);
+        self.diagnostics.push(
+            Diagnostic::error(format!("undefined variable '{name}'"), span).suggest(name, visible),
+        );
         Type::Unit
     }
 }
@@ -859,17 +950,25 @@ fn eq_comparable(lt: &Type, rt: &Type) -> bool {
     *lt != Type::Unit && *rt != Type::Unit && (fits(lt, rt) || fits(rt, lt))
 }
 
-/// The names a condition proves non-null: `(if_true, if_false)`.
-/// `x != null` proves `x` in the true branch, `x == null` in the false
-/// branch; `&&` accumulates its sides' true-facts. Nothing deeper (v1).
+/// The place paths a condition proves non-null: `(if_true, if_false)`.
+/// `x != null` (or `x.f != null`) proves the path in the true branch,
+/// `== null` in the false branch; `&&` accumulates its sides' true-facts.
 fn null_checks(cond: &Expr) -> (HashSet<String>, HashSet<String>) {
     let (mut if_true, mut if_false) = (HashSet::new(), HashSet::new());
     if let Expr::Binary { op, lhs, rhs, .. } = cond {
         match op {
-            BinOp::Ne => if_true.extend(ident_vs_null(lhs, rhs)),
-            BinOp::Eq => if_false.extend(ident_vs_null(lhs, rhs)),
+            BinOp::Ne => if_true.extend(place_vs_null(lhs, rhs)),
+            BinOp::Eq => if_false.extend(place_vs_null(lhs, rhs)),
             BinOp::And => {
-                if_true.extend(null_checks(lhs).0);
+                let (mut lhs_true, _) = null_checks(lhs);
+                // The right side runs after the left's checks — a call in
+                // it can null a checked field through an alias, so field
+                // facts don't cross it. (Bare-variable facts survive; a
+                // callee can't rebind the caller's locals.)
+                if contains_call(rhs) {
+                    lhs_true.retain(|p| !p.contains('.'));
+                }
+                if_true.extend(lhs_true);
                 if_true.extend(null_checks(rhs).0);
             }
             _ => {}
@@ -878,11 +977,75 @@ fn null_checks(cond: &Expr) -> (HashSet<String>, HashSet<String>) {
     (if_true, if_false)
 }
 
-fn ident_vs_null(a: &Expr, b: &Expr) -> Option<String> {
-    match (a, b) {
-        (Expr::Ident(n, _), Expr::Null(_)) | (Expr::Null(_), Expr::Ident(n, _)) => {
-            Some(n.clone())
+/// Does this expression contain a call? Calls can mutate any shared
+/// refstruct they can reach, which kills field-path narrowing facts.
+fn contains_call(e: &Expr) -> bool {
+    match e {
+        Expr::Call { .. } => true,
+        Expr::Unary { rhs, .. } => contains_call(rhs),
+        Expr::Binary { lhs, rhs, .. } => contains_call(lhs) || contains_call(rhs),
+        Expr::Field { base, .. } => contains_call(base),
+        Expr::StructLit { fields, .. } => fields.iter().any(|(_, v)| contains_call(v)),
+        Expr::Int(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::Str(..)
+        | Expr::Ident(..)
+        | Expr::Null(_) => false,
+    }
+}
+
+/// What a loop body can do to enclosing narrowing facts on a later
+/// iteration: the places it assigns, and whether it can invalidate field
+/// facts at all (a call or a write through a field, both alias-reaching).
+fn body_effects(stmts: &[Stmt], assigned: &mut HashSet<String>, kills_fields: &mut bool) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Assign { target, value, .. } => {
+                if let Some(path) = target.place_path() {
+                    assigned.insert(path);
+                }
+                if matches!(target, Expr::Field { .. }) || contains_call(value) {
+                    *kills_fields = true;
+                }
+            }
+            Stmt::Let { value, .. } | Stmt::Expr(value) => {
+                if contains_call(value) {
+                    *kills_fields = true;
+                }
+            }
+            Stmt::Return { value, .. } => {
+                if value.as_ref().is_some_and(contains_call) {
+                    *kills_fields = true;
+                }
+            }
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+                ..
+            } => {
+                if contains_call(cond) {
+                    *kills_fields = true;
+                }
+                body_effects(then_body, assigned, kills_fields);
+                if let Some(else_body) = else_body {
+                    body_effects(else_body, assigned, kills_fields);
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                if contains_call(cond) {
+                    *kills_fields = true;
+                }
+                body_effects(body, assigned, kills_fields);
+            }
         }
+    }
+}
+
+fn place_vs_null(a: &Expr, b: &Expr) -> Option<String> {
+    match (a, b) {
+        (Expr::Null(_), e) | (e, Expr::Null(_)) => e.place_path(),
         _ => None,
     }
 }
@@ -1702,6 +1865,178 @@ mod tests {
     fn narrowed_value_type_optionals_support_arithmetic() {
         let d = diags(
             "fun f(x: int?): int { if x != null { return x + 1; } else { return 0; } }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    // --- Field-path narrowing ---
+
+    #[test]
+    fn field_null_checks_narrow_in_loops() {
+        let d = diags(
+            "refstruct Tree { v: int, left: Tree? }\n\
+             fun min(t: Tree): int {\n\
+                 var cur = t;\n\
+                 while cur.left != null { cur = cur.left; }\n\
+                 return cur.v;\n\
+             }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn field_null_checks_narrow_reads_through_the_chain() {
+        let d = diags(
+            "refstruct Node { v: int, next: Node? }\n\
+             fun f(n: Node): int {\n\
+                 if n.next != null { return n.next.v; } else { return 0; }\n\
+             }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn assigning_to_a_narrowed_field_unnarrows_it() {
+        let d = diags(
+            "refstruct Node { v: int, next: Node? }\n\
+             fun f(n: Node): int {\n\
+                 if n.next != null { n.next = null; return n.next.v; }\n\
+                 return 0;\n\
+             }",
+        );
+        assert!(d.iter().any(|e| e.message.contains("may be null")), "{d:?}");
+    }
+
+    #[test]
+    fn calls_unnarrow_field_paths() {
+        // The callee can reach the same object through the shared ref.
+        let d = diags(
+            "refstruct Node { v: int, next: Node? }\n\
+             fun touch(n: Node) { n.next = null; }\n\
+             fun f(n: Node): int {\n\
+                 if n.next != null { touch(n); return n.next.v; }\n\
+                 return 0;\n\
+             }",
+        );
+        assert!(d.iter().any(|e| e.message.contains("may be null")), "{d:?}");
+    }
+
+    #[test]
+    fn writes_through_other_paths_unnarrow_field_facts() {
+        // b may alias a (refstructs), so a.next can't stay narrowed.
+        let d = diags(
+            "refstruct Node { v: int, next: Node? }\n\
+             fun f(a: Node, b: Node): int {\n\
+                 if a.next != null { b.next = null; return a.next.v; }\n\
+                 return 0;\n\
+             }",
+        );
+        assert!(d.iter().any(|e| e.message.contains("may be null")), "{d:?}");
+    }
+
+    #[test]
+    fn rebinding_the_root_unnarrows_its_field_facts() {
+        let d = diags(
+            "refstruct Node { v: int, next: Node? }\n\
+             fun f(a: Node, b: Node): int {\n\
+                 var cur = a;\n\
+                 if cur.next != null { cur = b; return cur.next.v; }\n\
+                 return 0;\n\
+             }",
+        );
+        assert!(d.iter().any(|e| e.message.contains("may be null")), "{d:?}");
+    }
+
+    #[test]
+    fn facts_do_not_survive_calls_later_in_the_condition() {
+        // kill() runs after the null check and can null the field through
+        // the shared ref — the body must not trust the fact.
+        let d = diags(
+            "refstruct Node { v: int, next: Node? }\n\
+             fun kill(n: Node): bool { n.next = null; return true; }\n\
+             fun f(a: Node): int {\n\
+                 if a.next != null && kill(a) { return a.next.v; }\n\
+                 return 0;\n\
+             }",
+        );
+        assert!(d.iter().any(|e| e.message.contains("may be null")), "{d:?}");
+    }
+
+    #[test]
+    fn outer_facts_invalidated_inside_loop_bodies_do_not_leak() {
+        // Sound on iteration 1, null on iteration 2 — the outer fact must
+        // be dropped on loop entry because the body assigns its place.
+        let d = diags(
+            "refstruct P { x: int }\n\
+             fun f(q: P?): int {\n\
+                 var p = q;\n\
+                 var i = 0;\n\
+                 var sum = 0;\n\
+                 if p != null {\n\
+                     while i < 2 { sum = sum + p.x; p = null; i = i + 1; }\n\
+                 }\n\
+                 return sum;\n\
+             }",
+        );
+        assert!(d.iter().any(|e| e.message.contains("may be null")), "{d:?}");
+    }
+
+    #[test]
+    fn outer_field_facts_killed_by_calls_in_loop_bodies_do_not_leak() {
+        let d = diags(
+            "refstruct Node { v: int, next: Node? }\n\
+             fun kill(n: Node) { n.next = null; }\n\
+             fun f(a: Node): int {\n\
+                 var i = 0;\n\
+                 var sum = 0;\n\
+                 if a.next != null {\n\
+                     while i < 2 { sum = sum + a.next.v; kill(a); i = i + 1; }\n\
+                 }\n\
+                 return sum;\n\
+             }",
+        );
+        assert!(d.iter().any(|e| e.message.contains("may be null")), "{d:?}");
+    }
+
+    #[test]
+    fn guarded_deep_chain_assignment_is_allowed() {
+        let d = diags(
+            "refstruct Node { v: int, next: Node? }\n\
+             fun f(n: Node) {\n\
+                 if n.next != null && n.next.next != null { n.next.next.v = 1; }\n\
+             }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn guarded_optional_ref_field_write_through_const_is_allowed() {
+        // ADR 0006: the write goes through the shared R object, so const
+        // `b` is fine — the guard narrows b.r across the ref boundary.
+        let d = diags(
+            "refstruct R { v: int }\n\
+             struct Box { r: R? }\n\
+             fun f() {\n\
+                 const b = Box { r: R { v: 1 } };\n\
+                 if b.r != null { b.r.v = 2; }\n\
+             }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn shadowing_in_an_inner_block_restores_narrowing_after_it() {
+        // The inner `const p` hides the fact only while its scope lives;
+        // the outer p at p.x is still the proven-non-null binding.
+        let d = diags(
+            "refstruct P { x: int }\n\
+             fun f(p: P?, b: bool): int {\n\
+                 if p != null {\n\
+                     if b { const p = 1; }\n\
+                     return p.x;\n\
+                 }\n\
+                 return 0;\n\
+             }",
         );
         assert!(d.is_empty(), "unexpected: {d:?}");
     }

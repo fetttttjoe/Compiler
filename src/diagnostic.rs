@@ -39,6 +39,18 @@ impl Diagnostic {
         self
     }
 
+    /// Attaches a "did you mean 'x'?" help when a close candidate exists.
+    pub fn suggest<'a>(
+        self,
+        name: &str,
+        candidates: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        match closest(name, candidates) {
+            Some(suggestion) => self.with_help(format!("did you mean '{suggestion}'?")),
+            None => self,
+        }
+    }
+
     /// Plain-text convenience over `render_styled` — the form the test
     /// suites assert against; production renders via `render_styled`.
     #[cfg(test)]

@@ -196,6 +196,22 @@ impl UnOp {
 }
 
 impl Expr {
+    /// The textual path of a plain place expression (`cur.left` →
+    /// "cur.left"). `?.` links and non-places yield `None` — a place that
+    /// might not exist can't be assigned to or narrowed.
+    pub fn place_path(&self) -> Option<String> {
+        match self {
+            Expr::Ident(n, _) => Some(n.clone()),
+            Expr::Field {
+                base,
+                name,
+                optional: false,
+                ..
+            } => Some(format!("{}.{name}", base.place_path()?)),
+            _ => None,
+        }
+    }
+
     pub fn span(&self) -> Span {
         match self {
             Expr::Int(_, s)
