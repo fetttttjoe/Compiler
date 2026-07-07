@@ -23,6 +23,7 @@ pub struct Parser<'a> {
 const MAX_NESTING: u32 = 128;
 
 impl<'a> Parser<'a> {
+    /// Creates a parser over a token stream (which must end in `Eof`).
     pub fn new(tokens: &'a [Token]) -> Parser<'a> {
         Parser {
             tokens,
@@ -85,17 +86,24 @@ impl<'a> Parser<'a> {
     }
 
     fn expect(&mut self, kind: TokenKind) -> Span {
+        self.expect_or_flag(kind).0
+    }
+
+    /// Like `expect`, but also reports whether the token was actually there —
+    /// statement parsers use the flag to tell their caller they terminated
+    /// cleanly (so recovery is driven by outcome, not token-state guessing).
+    fn expect_or_flag(&mut self, kind: TokenKind) -> (Span, bool) {
         if self.check(&kind) {
             let span = self.peek().span;
             self.bump();
-            span
+            (span, true)
         } else {
             let tok = self.peek().clone();
             self.error(
                 format!("expected {}, found {}", describe(&kind), describe(&tok.kind)),
                 tok.span,
             );
-            tok.span
+            (tok.span, false)
         }
     }
 
@@ -170,7 +178,8 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let (body, end) = self.parse_block();
+        // An unclosed body is recovered by the caller's item-level synchronize.
+        let (body, end, _) = self.parse_block();
         Function {
             name,
             params,
@@ -394,25 +403,22 @@ impl<'a> Parser<'a> {
     /// Parses `{ stmt* }`, synchronizing after a malformed statement so one
     /// error doesn't cascade across the rest of the block. Returns the
     /// statements and the span of the closing brace.
-    fn parse_block(&mut self) -> (Vec<Stmt>, Span) {
+    /// Parses `{ stmt* }`. Returns the statements, the closing brace's span,
+    /// and whether the block terminated cleanly (closing brace present).
+    fn parse_block(&mut self) -> (Vec<Stmt>, Span, bool) {
         self.expect(TokenKind::LeftBrace);
         let mut stmts = Vec::new();
         while !self.check(&TokenKind::RightBrace) && !self.at_eof() {
-            stmts.push(self.parse_stmt());
-            // A statement that ended cleanly consumed through its `;` (or a
-            // nested block's `}`). Anything else means parse_stmt stopped
+            let (stmt, clean) = self.parse_stmt();
+            stmts.push(stmt);
+            // A statement that didn't terminate cleanly left the parser
             // mid-statement — skip to a boundary before continuing.
-            let clean = self.pos > 0
-                && matches!(
-                    self.tokens[self.pos - 1].kind,
-                    TokenKind::Semicolon | TokenKind::RightBrace
-                );
             if !clean {
                 self.synchronize_stmt();
             }
         }
-        let end = self.expect(TokenKind::RightBrace);
-        (stmts, end)
+        let (end, closed) = self.expect_or_flag(TokenKind::RightBrace);
+        (stmts, end, closed)
     }
 
     /// Statement-level recovery: skip past the next `;`, or stop before a
@@ -436,21 +442,21 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_if(&mut self) -> Stmt {
+    fn parse_if(&mut self) -> (Stmt, bool) {
         // `else if` chains recurse here directly, so they claim depth too.
         if !self.enter_nested() {
-            return Stmt::Expr(Expr::Int(0, self.peek().span)); // recovery placeholder
+            return (Stmt::Expr(Expr::Int(0, self.peek().span)), false); // recovery placeholder
         }
-        let stmt = self.parse_if_inner();
+        let result = self.parse_if_inner();
         self.depth -= 1;
-        stmt
+        result
     }
 
-    fn parse_if_inner(&mut self) -> Stmt {
+    fn parse_if_inner(&mut self) -> (Stmt, bool) {
         let start = self.peek().span;
         self.bump(); // 'if'
         let cond = self.parse_condition();
-        let (then_body, then_end) = self.parse_block();
+        let (then_body, then_end, mut clean) = self.parse_block();
         let mut span = start.to(then_end);
         let mut else_body = None;
         if self.eat(&TokenKind::Else) {
@@ -458,47 +464,57 @@ impl<'a> Parser<'a> {
                 // `else if …` nests as an else body with a single If. (The
                 // depth guard can substitute a placeholder, which has no span
                 // to extend — keep the chain's span as-is then.)
-                let nested = self.parse_if();
+                let (nested, nested_clean) = self.parse_if();
+                clean = nested_clean;
                 if let Stmt::If { span: nested_span, .. } = &nested {
                     span = start.to(*nested_span);
                 }
                 else_body = Some(vec![nested]);
             } else {
-                let (body, else_end) = self.parse_block();
+                let (body, else_end, else_clean) = self.parse_block();
+                clean = else_clean;
                 span = start.to(else_end);
                 else_body = Some(body);
             }
         }
-        Stmt::If {
-            cond,
-            then_body,
-            else_body,
-            span,
-        }
+        (
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+                span,
+            },
+            clean,
+        )
     }
 
-    pub fn parse_stmt(&mut self) -> Stmt {
+    /// Parses one statement. The flag reports whether it terminated cleanly
+    /// (its `;` or closing `}` was present) — callers synchronize when not.
+    pub fn parse_stmt(&mut self) -> (Stmt, bool) {
         if !self.enter_nested() {
-            return Stmt::Expr(Expr::Int(0, self.peek().span)); // recovery placeholder
+            return (Stmt::Expr(Expr::Int(0, self.peek().span)), false); // recovery placeholder
         }
-        let stmt = self.parse_stmt_inner();
+        let result = self.parse_stmt_inner();
         self.depth -= 1;
-        stmt
+        result
     }
 
-    fn parse_stmt_inner(&mut self) -> Stmt {
+    fn parse_stmt_inner(&mut self) -> (Stmt, bool) {
         let tok = self.peek().clone();
         match tok.kind {
             TokenKind::If => self.parse_if(),
             TokenKind::While => {
                 self.bump();
                 let cond = self.parse_condition();
-                let (body, end) = self.parse_block();
-                Stmt::While {
-                    cond,
-                    body,
-                    span: tok.span.to(end),
-                }
+                let (body, end, clean) = self.parse_block();
+                (
+                    Stmt::While {
+                        cond,
+                        body,
+                        span: tok.span.to(end),
+                    },
+                    clean,
+                )
             }
             TokenKind::Var | TokenKind::Const => {
                 let mutable = matches!(tok.kind, TokenKind::Var);
@@ -506,13 +522,16 @@ impl<'a> Parser<'a> {
                 let name = self.expect_identifier();
                 self.expect(TokenKind::Equals);
                 let value = self.parse_expr(0);
-                let end = self.expect(TokenKind::Semicolon);
-                Stmt::Let {
-                    mutable,
-                    name,
-                    value,
-                    span: tok.span.to(end),
-                }
+                let (end, clean) = self.expect_or_flag(TokenKind::Semicolon);
+                (
+                    Stmt::Let {
+                        mutable,
+                        name,
+                        value,
+                        span: tok.span.to(end),
+                    },
+                    clean,
+                )
             }
             TokenKind::Return => {
                 self.bump();
@@ -521,11 +540,14 @@ impl<'a> Parser<'a> {
                 } else {
                     Some(self.parse_expr(0))
                 };
-                let end = self.expect(TokenKind::Semicolon);
-                Stmt::Return {
-                    value,
-                    span: tok.span.to(end),
-                }
+                let (end, clean) = self.expect_or_flag(TokenKind::Semicolon);
+                (
+                    Stmt::Return {
+                        value,
+                        span: tok.span.to(end),
+                    },
+                    clean,
+                )
             }
             _ => {
                 let expr = self.parse_expr(0);
@@ -536,16 +558,19 @@ impl<'a> Parser<'a> {
                         let start = *ident_span;
                         self.bump(); // '='
                         let value = self.parse_expr(0);
-                        let end = self.expect(TokenKind::Semicolon);
-                        return Stmt::Assign {
-                            name,
-                            value,
-                            span: start.to(end),
-                        };
+                        let (end, clean) = self.expect_or_flag(TokenKind::Semicolon);
+                        return (
+                            Stmt::Assign {
+                                name,
+                                value,
+                                span: start.to(end),
+                            },
+                            clean,
+                        );
                     }
                 }
-                self.expect(TokenKind::Semicolon);
-                Stmt::Expr(expr)
+                let (_, clean) = self.expect_or_flag(TokenKind::Semicolon);
+                (Stmt::Expr(expr), clean)
             }
         }
     }
@@ -740,7 +765,7 @@ mod tests {
         let (tokens, diags) = lex(src);
         assert!(diags.is_empty(), "lex errors: {diags:?}");
         let mut p = Parser::new(&tokens);
-        let s = p.parse_stmt();
+        let (s, _clean) = p.parse_stmt();
         assert!(p.diagnostics.is_empty(), "parse errors: {:?}", p.diagnostics);
         s
     }
@@ -926,6 +951,30 @@ mod tests {
         let s = stmt("if eq(P { x: 1 }) { return 1; }");
         let Stmt::If { cond, .. } = s else { panic!("expected If") };
         assert_eq!(cond.sexpr(), "(call eq (struct P x=1))");
+    }
+
+    #[test]
+    fn missing_semicolon_after_struct_literal_does_not_cascade() {
+        // Regression: the statement ends in the struct literal's `}`, which
+        // used to spoof the "ended cleanly" check and skip recovery.
+        let (tokens, _) = lex("fun f(): int { const p = P { x: 1 } ) return 1; }");
+        let (ast, pd) = parse(&tokens);
+        assert_eq!(pd.len(), 1, "one missing-semicolon error only: {pd:?}");
+        let Item::Function(f) = &ast[0] else { panic!("expected function") };
+        assert!(matches!(f.body.last(), Some(Stmt::Return { .. })));
+    }
+
+    #[test]
+    fn error_placeholder_consuming_a_semicolon_does_not_cascade() {
+        // Regression: `var x = ;` — parse_atom's recovery consumed the `;`,
+        // which used to spoof the clean-end check; the junk after it then
+        // parsed as phantom statements.
+        let (tokens, _) = lex("fun f(): int { var x = ; y z w return 1; }");
+        let (ast, pd) = parse(&tokens);
+        assert_eq!(pd.len(), 2, "missing expression + missing semicolon: {pd:?}");
+        let Item::Function(f) = &ast[0] else { panic!("expected function") };
+        assert_eq!(f.body.len(), 2, "no phantom statements: {:?}", f.body);
+        assert!(matches!(f.body.last(), Some(Stmt::Return { .. })));
     }
 
     #[test]
