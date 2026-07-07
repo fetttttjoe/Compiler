@@ -1,5 +1,5 @@
 use crate::ast::{
-    Ast, BinOp, Expr, Field, Function, Item, Param, Stmt, Struct, TypeAnn, UnOp,
+    Ast, BinOp, Expr, Field, Function, ImportDecl, Item, Param, Stmt, Struct, TypeAnn, UnOp,
 };
 use crate::diagnostic::Diagnostic;
 use crate::span::Span;
@@ -158,7 +158,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_function(&mut self) -> Function {
+    fn parse_function(&mut self, exported: bool) -> Function {
         let start = self.expect(TokenKind::Fun);
         let name = self.expect_identifier();
         self.expect(TokenKind::LeftParen);
@@ -181,6 +181,7 @@ impl<'a> Parser<'a> {
         // An unclosed body is recovered by the caller's item-level synchronize.
         let (body, end, _) = self.parse_block();
         Function {
+            exported,
             name,
             params,
             return_type,
@@ -189,7 +190,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_struct(&mut self) -> Struct {
+    fn parse_struct(&mut self, exported: bool) -> Struct {
         let start = self.expect(TokenKind::Struct);
         let name = self.expect_identifier();
         self.expect(TokenKind::LeftBrace);
@@ -205,6 +206,7 @@ impl<'a> Parser<'a> {
         }
         let end = self.expect(TokenKind::RightBrace);
         Struct {
+            exported,
             name,
             fields,
             span: start.to(end),
@@ -222,7 +224,11 @@ impl<'a> Parser<'a> {
                     self.bump();
                     return;
                 }
-                TokenKind::RightBrace | TokenKind::Fun | TokenKind::Struct => return,
+                TokenKind::RightBrace
+                | TokenKind::Fun
+                | TokenKind::Struct
+                | TokenKind::Import
+                | TokenKind::Export => return,
                 _ => {
                     self.bump();
                 }
@@ -386,6 +392,41 @@ impl<'a> Parser<'a> {
         Expr::StructLit {
             name,
             fields,
+            span: start.to(end),
+        }
+    }
+
+    /// Parses `import { a, b } from "./path";`.
+    fn parse_import(&mut self) -> ImportDecl {
+        let start = self.expect(TokenKind::Import);
+        self.expect(TokenKind::LeftBrace);
+        let mut names = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.at_eof() {
+            let span = self.peek().span;
+            let name = self.expect_identifier();
+            names.push((name, span));
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RightBrace);
+        self.expect(TokenKind::From);
+        let tok = self.peek().clone();
+        let (path, path_span) = if let TokenKind::StringLiteral(p) = tok.kind {
+            self.bump();
+            (p, tok.span)
+        } else {
+            self.error(
+                format!("expected a module path string, found {}", describe(&tok.kind)),
+                tok.span,
+            );
+            (String::new(), tok.span)
+        };
+        let end = self.expect(TokenKind::Semicolon);
+        ImportDecl {
+            names,
+            path,
+            path_span,
             span: start.to(end),
         }
     }
@@ -691,8 +732,31 @@ pub fn parse(tokens: &[Token]) -> (Ast, Vec<Diagnostic>) {
     let mut items = Vec::new();
     while !parser.at_eof() {
         match parser.peek().kind {
-            TokenKind::Fun => items.push(Item::Function(parser.parse_function())),
-            TokenKind::Struct => items.push(Item::Struct(parser.parse_struct())),
+            TokenKind::Fun => items.push(Item::Function(parser.parse_function(false))),
+            TokenKind::Struct => items.push(Item::Struct(parser.parse_struct(false))),
+            TokenKind::Import => items.push(Item::Import(parser.parse_import())),
+            TokenKind::Export => {
+                parser.bump();
+                match parser.peek().kind {
+                    TokenKind::Fun => {
+                        items.push(Item::Function(parser.parse_function(true)))
+                    }
+                    TokenKind::Struct => {
+                        items.push(Item::Struct(parser.parse_struct(true)))
+                    }
+                    _ => {
+                        let tok = parser.peek().clone();
+                        parser.error(
+                            format!(
+                                "expected 'fun' or 'struct' after 'export', found {}",
+                                describe(&tok.kind)
+                            ),
+                            tok.span,
+                        );
+                        parser.synchronize();
+                    }
+                }
+            }
             _ => {
                 let tok = parser.peek().clone();
                 parser.error(
@@ -855,6 +919,51 @@ mod tests {
             }
             other => panic!("expected struct, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_an_import_declaration() {
+        let (tokens, ld) = lex("import { fib, add } from \"./math\";");
+        assert!(ld.is_empty(), "{ld:?}");
+        let (ast, pd) = parse(&tokens);
+        assert!(pd.is_empty(), "parse errors: {pd:?}");
+        let Item::Import(imp) = &ast[0] else { panic!("expected import") };
+        let names: Vec<&str> = imp.names.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["fib", "add"]);
+        assert_eq!(imp.path, "./math");
+    }
+
+    #[test]
+    fn export_marks_functions_and_structs() {
+        let (tokens, _) = lex(
+            "export fun f(): int { return 1; } export struct P { x: int } fun g() { }",
+        );
+        let (ast, pd) = parse(&tokens);
+        assert!(pd.is_empty(), "parse errors: {pd:?}");
+        let Item::Function(f) = &ast[0] else { panic!() };
+        assert!(f.exported);
+        let Item::Struct(s) = &ast[1] else { panic!() };
+        assert!(s.exported);
+        let Item::Function(g) = &ast[2] else { panic!() };
+        assert!(!g.exported);
+    }
+
+    #[test]
+    fn export_before_junk_is_reported_and_recovered() {
+        let (tokens, _) = lex("export 42 fun ok(): int { return 1; }");
+        let (ast, pd) = parse(&tokens);
+        assert_eq!(pd.len(), 1, "{pd:?}");
+        assert!(pd[0].message.contains("after 'export'"), "{pd:?}");
+        assert_eq!(ast.len(), 1);
+    }
+
+    #[test]
+    fn import_with_missing_path_recovers() {
+        let (tokens, _) = lex("import { f } from ; fun ok(): int { return 1; }");
+        let (ast, pd) = parse(&tokens);
+        assert_eq!(pd.len(), 1, "{pd:?}");
+        assert!(pd[0].message.contains("module path"), "{pd:?}");
+        assert_eq!(ast.len(), 2); // the (broken) import + the function
     }
 
     #[test]

@@ -6,10 +6,22 @@ pub type Ast = Vec<Item>;
 pub enum Item {
     Function(Function),
     Struct(Struct),
+    Import(ImportDecl),
+}
+
+/// `import { a, b } from "./path";` — each name keeps its own span so
+/// resolution errors can point at the exact identifier.
+#[derive(Debug, PartialEq)]
+pub struct ImportDecl {
+    pub names: Vec<(String, Span)>,
+    pub path: String,
+    pub path_span: Span,
+    pub span: Span,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Function {
+    pub exported: bool,
     pub name: String,
     pub params: Vec<Param>,
     pub return_type: Option<TypeAnn>,
@@ -25,6 +37,7 @@ pub struct Param {
 
 #[derive(Debug, PartialEq)]
 pub struct Struct {
+    pub exported: bool,
     pub name: String,
     pub fields: Vec<Field>,
     pub span: Span,

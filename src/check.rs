@@ -72,6 +72,8 @@ fn collect_signatures(ast: &Ast, diags: &mut Vec<Diagnostic>) -> SymbolTable {
     let mut table = SymbolTable::default();
     for item in ast {
         match item {
+            // Imports resolve per-module in the module-aware pass (next task).
+            Item::Import(_) => {}
             Item::Struct(s) => {
                 let fields = s
                     .fields
