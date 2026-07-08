@@ -1,0 +1,19 @@
+fun is_prime(n: int): bool {
+    if n < 2 { return false; }
+    var d: int = 2;
+    while d * d <= n {
+        if n % d == 0 { return false; }
+        d = d + 1;
+    }
+    return true;
+}
+
+fun main(): int {
+    var count: int = 0;
+    var n: int = 2;
+    while n < 80000 {
+        if is_prime(n) { count = count + 1; }
+        n = n + 1;
+    }
+    return count % 251;
+}

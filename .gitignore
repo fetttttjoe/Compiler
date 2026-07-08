@@ -9,3 +9,6 @@
 
 # Claude session tooling stays local.
 /.claude/
+
+# Benchmark artifacts are rebuilt by benches/run.sh.
+/benches/out/
