@@ -77,20 +77,32 @@ fn label_of(module: usize, name: &str) -> String {
     }
 }
 
-/// Slots needed for a body: one per `let` site, blocks included.
-fn count_lets(body: &[Stmt]) -> usize {
-    body.iter()
-        .map(|stmt| match stmt {
-            Stmt::Let { .. } => 1,
+/// Peak number of simultaneously live `let` slots for a body. Blocks
+/// release their slots on exit (`block` restores `next_slot`), so sibling
+/// scopes share: the frame needs the deepest path, not the sum. `for`
+/// bindings (element + optional index) are counted with their body so the
+/// frame is already right when that slice lands.
+fn peak_slots(body: &[Stmt]) -> usize {
+    let mut live = 0;
+    let mut peak = 0;
+    for stmt in body {
+        let inner = match stmt {
+            Stmt::Let { .. } => {
+                live += 1;
+                0
+            }
             Stmt::If {
                 then_body,
                 else_body,
                 ..
-            } => count_lets(then_body) + else_body.as_deref().map_or(0, count_lets),
-            Stmt::While { body, .. } | Stmt::For { body, .. } => count_lets(body),
+            } => peak_slots(then_body).max(else_body.as_deref().map_or(0, peak_slots)),
+            Stmt::While { body, .. } => peak_slots(body),
+            Stmt::For { index, body, .. } => 1 + usize::from(index.is_some()) + peak_slots(body),
             _ => 0,
-        })
-        .sum()
+        };
+        peak = peak.max(live + inner);
+    }
+    peak.max(live)
 }
 
 struct Emitter<'a> {
@@ -143,7 +155,7 @@ impl Emitter<'_> {
         // frame is 16-byte aligned so %rsp parity at any point is just
         // the outstanding push count.
         self.asm.push_str("\tpushq %rbp\n\tmovq %rsp, %rbp\n");
-        let frame = ((f.params.len() + count_lets(&f.body)) * 8 + 15) & !15;
+        let frame = ((f.params.len() + peak_slots(&f.body)) * 8 + 15) & !15;
         if frame > 0 {
             let _ = writeln!(self.asm, "\tsubq ${frame}, %rsp");
         }
@@ -187,7 +199,12 @@ impl Emitter<'_> {
 
     fn block(&mut self, body: &[Stmt]) -> Result<(), Diagnostic> {
         self.scopes.push(HashMap::new());
+        let saved_slot = self.next_slot;
         let result = body.iter().try_for_each(|stmt| self.stmt(stmt));
+        // The block's names died with its scope, so its slots are free
+        // for sibling blocks — this is what lets `peak_slots` size the
+        // frame by deepest path instead of total let count.
+        self.next_slot = saved_slot;
         self.scopes.pop();
         result
     }
@@ -320,36 +337,52 @@ impl Emitter<'_> {
                 self.expr(rhs)?;
                 let _ = writeln!(self.asm, "{end}:");
             }
-            Expr::Binary { op, lhs, rhs, span } => {
+            Expr::Binary {
+                op: BinOp::Coalesce,
+                span,
+                ..
+            } => return Err(unsupported("operator '??'", *span)),
+            Expr::Binary { op, lhs, rhs, .. } => {
                 // lhs in %rax, rhs in %rcx. Wrapping add/sub/mul match the
                 // interpreter's wrapping ops; idiv truncates toward zero
                 // and signs the remainder like the dividend, matching the
                 // oracle on every input it runs cleanly (it diagnoses the
-                // idiv traps: /0 and i64::MIN / -1). Comparisons: cmpq
-                // computes rax - rcx, so the set condition reads lhs ? rhs.
-                let apply = match op {
-                    BinOp::Add => "\taddq %rcx, %rax\n",
-                    BinOp::Sub => "\tsubq %rcx, %rax\n",
-                    BinOp::Mul => "\timulq %rcx, %rax\n",
-                    BinOp::Div => "\tcqto\n\tidivq %rcx\n",
-                    BinOp::Rem => "\tcqto\n\tidivq %rcx\n\tmovq %rdx, %rax\n",
-                    BinOp::Eq => CMP_SETE,
-                    BinOp::Ne => CMP_SETNE,
-                    BinOp::Lt => CMP_SETL,
-                    BinOp::Le => CMP_SETLE,
-                    BinOp::Gt => CMP_SETG,
-                    BinOp::Ge => CMP_SETGE,
-                    BinOp::And | BinOp::Or => unreachable!("handled above"),
-                    BinOp::Coalesce => {
-                        return Err(unsupported("operator '??'", *span));
-                    }
-                };
+                // idiv traps: /0 and i64::MIN / -1).
                 self.expr(lhs)?;
                 self.push("%rax");
                 self.expr(rhs)?;
                 self.asm.push_str("\tmovq %rax, %rcx\n");
                 self.pop("%rax");
-                self.asm.push_str(apply);
+                match op {
+                    BinOp::Add => self.asm.push_str("\taddq %rcx, %rax\n"),
+                    BinOp::Sub => self.asm.push_str("\tsubq %rcx, %rax\n"),
+                    BinOp::Mul => self.asm.push_str("\timulq %rcx, %rax\n"),
+                    BinOp::Div => self.asm.push_str("\tcqto\n\tidivq %rcx\n"),
+                    BinOp::Rem => self
+                        .asm
+                        .push_str("\tcqto\n\tidivq %rcx\n\tmovq %rdx, %rax\n"),
+                    // cmpq computes rax - rcx, so the condition code reads
+                    // lhs ? rhs; one shared template keeps the six
+                    // comparisons typo-proof.
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                        let cc = match op {
+                            BinOp::Eq => "e",
+                            BinOp::Ne => "ne",
+                            BinOp::Lt => "l",
+                            BinOp::Le => "le",
+                            BinOp::Gt => "g",
+                            BinOp::Ge => "ge",
+                            _ => unreachable!(),
+                        };
+                        let _ = writeln!(
+                            self.asm,
+                            "\tcmpq %rcx, %rax\n\tset{cc} %al\n\tmovzbq %al, %rax"
+                        );
+                    }
+                    BinOp::And | BinOp::Or | BinOp::Coalesce => {
+                        unreachable!("handled above")
+                    }
+                }
             }
             Expr::Call { callee, args, span } => {
                 let Expr::Ident(name, _) = callee.as_ref() else {
@@ -390,13 +423,6 @@ impl Emitter<'_> {
         Ok(())
     }
 }
-
-const CMP_SETE: &str = "\tcmpq %rcx, %rax\n\tsete %al\n\tmovzbq %al, %rax\n";
-const CMP_SETNE: &str = "\tcmpq %rcx, %rax\n\tsetne %al\n\tmovzbq %al, %rax\n";
-const CMP_SETL: &str = "\tcmpq %rcx, %rax\n\tsetl %al\n\tmovzbq %al, %rax\n";
-const CMP_SETLE: &str = "\tcmpq %rcx, %rax\n\tsetle %al\n\tmovzbq %al, %rax\n";
-const CMP_SETG: &str = "\tcmpq %rcx, %rax\n\tsetg %al\n\tmovzbq %al, %rax\n";
-const CMP_SETGE: &str = "\tcmpq %rcx, %rax\n\tsetge %al\n\tmovzbq %al, %rax\n";
 
 fn unsupported(what: &str, span: Span) -> Diagnostic {
     Diagnostic::error(format!("not yet compilable: {what}"), span)

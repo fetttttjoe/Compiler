@@ -171,6 +171,34 @@ fn builds_the_multi_module_fib_example() {
     assert_eq!(run.status.code(), Some(55));
 }
 
+/// A parameterized main would read argc/argv as its "arguments" once
+/// compiled (the interpreter has no arguments to pass either) — both
+/// engines must refuse it identically, up front.
+#[test]
+fn main_with_parameters_is_rejected_by_both_engines() {
+    let dir = tempdir();
+    std::fs::write(
+        dir.join("mainargs.ys"),
+        "fun main(a: int): int { return a; }",
+    )
+    .unwrap();
+    let src = dir.join("mainargs.ys");
+    let bin = dir.join("mainargs");
+    let modes: [&[&str]; 2] = [
+        &[src.to_str().unwrap()],
+        &["build", src.to_str().unwrap(), "-o", bin.to_str().unwrap()],
+    ];
+    for args in modes {
+        let out = compiler(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("takes no parameters"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 #[test]
 fn more_than_six_parameters_is_not_yet_compilable() {
     let dir = tempdir();

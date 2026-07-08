@@ -81,6 +81,12 @@ fn run() {
         print_error(&format!("entry file '{entry}' does not define 'main'"));
         std::process::exit(1);
     };
+    // Guarded here so both engines agree: the interpreter calls main with
+    // no arguments, and compiled main would read argc/argv as its params.
+    if !main_fn.params.is_empty() {
+        print_error("'main' takes no parameters");
+        std::process::exit(1);
+    }
 
     if let Mode::Build { out } = mode {
         let out = out.unwrap_or_else(|| default_out(entry));
