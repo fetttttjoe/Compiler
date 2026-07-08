@@ -20,9 +20,16 @@ fn diff(name: &str, program: &str) {
         "oracle failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The oracle's stdout is the program's print output plus a final
+    // "=> value" result line; the compiled binary must reproduce the
+    // print output exactly and the value as its exit code.
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let value: i64 = stdout
-        .trim()
+    let trimmed = stdout.trim_end_matches('\n');
+    let (prints, result) = match trimmed.rsplit_once('\n') {
+        Some((prints, result)) => (format!("{prints}\n"), result),
+        None => (String::new(), trimmed),
+    };
+    let value: i64 = result
         .strip_prefix("=> Int(")
         .and_then(|s| s.strip_suffix(')'))
         .unwrap_or_else(|| panic!("oracle printed a non-int: {stdout}"))
@@ -43,6 +50,11 @@ fn diff(name: &str, program: &str) {
         run.status.code(),
         Some((value & 0xff) as i32),
         "'{name}' diverged from oracle value {value}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        prints,
+        "'{name}' print output diverged from the oracle"
     );
 }
 
@@ -626,6 +638,77 @@ fn struct_with_refstruct_field_compares_by_identity() {
             if a == b { r = r + 1; }
             if a == c { r = r + 10; }
             return r;
+        }",
+    );
+}
+
+#[test]
+fn print_scalars_and_strings() {
+    diff(
+        "print",
+        "fun main(): int {
+            print(42);
+            print(-7);
+            print(true);
+            print(1 > 2);
+            print(\"hello, world\");
+            print(\"\");
+            var i: int = 0;
+            while i < 3 { print(i * 10); i = i + 1; }
+            return 5;
+        }",
+    );
+}
+
+#[test]
+fn strings_copy_pass_and_return() {
+    diff(
+        "strings",
+        "fun pick(flag: bool, a: string, b: string): string {
+            if flag { return a; }
+            return b;
+        }
+        fun main(): int {
+            const greet: string = \"héllo\";
+            var s: string = greet;
+            print(pick(true, s, \"other\"));
+            print(pick(false, s, \"other\"));
+            return 3;
+        }",
+    );
+}
+
+#[test]
+fn string_equality_is_content_equality() {
+    diff(
+        "streq",
+        "fun exclaim(): string { return \"yo!\"; }
+        fun main(): int {
+            const a: string = \"yo!\";
+            var r: int = 0;
+            if a == exclaim() { r = r + 1; }
+            if a == \"yo\" { r = r + 10; }
+            if a != \"no\" { r = r + 100; }
+            if \"\" == \"\" { r = r + 1000; }
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn strings_inside_structs() {
+    diff(
+        "strfield",
+        "refstruct Named { name: string, id: int }
+        struct Tag { label: string }
+        fun main(): int {
+            const n: Named = Named { name: \"widget\", id: 7 };
+            print(n.name);
+            var t: Tag = Tag { label: \"a\" };
+            t.label = \"b\";
+            print(t.label);
+            if t.label == \"b\" { return n.id; }
+            return 0;
         }",
     );
 }

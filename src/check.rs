@@ -35,6 +35,9 @@ pub struct Resolutions {
     /// Per module: every visible type name → its defining (module, name),
     /// so codegen can resolve `Named` annotations to `structs` entries.
     pub types: Vec<Alias>,
+    /// The argument type of each `print` call (keyed by call span), so
+    /// codegen picks the right formatting without re-deriving types.
+    pub print_types: HashMap<Span, Type>,
 }
 
 /// A resolved field access (see `Resolutions::field_slots`).
@@ -178,6 +181,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
     let paths: Vec<&str> = graph.modules.iter().map(|m| m.path.as_str()).collect();
     let mut field_slots = HashMap::new();
     let mut struct_lits = HashMap::new();
+    let mut print_types = HashMap::new();
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             if let Item::Function(f) = item {
@@ -194,6 +198,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                     ret: Type::Unit,
                     field_slots: &mut field_slots,
                     struct_lits: &mut struct_lits,
+                    print_types: &mut print_types,
                 };
                 checker.check_function(f);
             }
@@ -219,6 +224,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
             field_slots,
             struct_lits,
             types: ty_aliases,
+            print_types,
         },
         diags,
     )
@@ -301,6 +307,7 @@ struct Checker<'a> {
     /// `Resolutions::field_slots` / `struct_lits`).
     field_slots: &'a mut HashMap<Span, FieldSlot>,
     struct_lits: &'a mut HashMap<Span, (usize, String)>,
+    print_types: &'a mut HashMap<Span, Type>,
 }
 
 impl<'a> Checker<'a> {
@@ -865,7 +872,8 @@ impl<'a> Checker<'a> {
                     );
                 }
                 for arg in args {
-                    self.type_of_expr(arg); // any type prints
+                    let ty = self.type_of_expr(arg); // any type prints
+                    self.print_types.insert(span, ty);
                 }
                 return Type::Unit;
             }

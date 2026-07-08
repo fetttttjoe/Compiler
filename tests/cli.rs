@@ -290,6 +290,27 @@ fn arrays_of_value_structs_are_not_yet_compilable() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("not yet compilable"));
 }
 
+/// Printing aggregates needs the debug renderer the runtime doesn't
+/// have yet; scalars and strings print, the rest diagnoses.
+#[test]
+fn printing_structs_is_not_yet_compilable() {
+    let dir = tempdir();
+    std::fs::write(
+        dir.join("printstruct.ys"),
+        "refstruct P { x: int }
+        fun main(): int { print(P { x: 1 }); return 0; }",
+    )
+    .unwrap();
+    let out = compiler(&[
+        "build",
+        dir.join("printstruct.ys").to_str().unwrap(),
+        "-o",
+        dir.join("printstruct").to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not yet compilable"));
+}
+
 #[test]
 fn more_than_six_parameters_is_not_yet_compilable() {
     let dir = tempdir();
