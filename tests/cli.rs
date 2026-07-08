@@ -246,20 +246,45 @@ fn value_optionals_are_not_yet_compilable() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("not yet compilable"));
 }
 
+/// A recursive value struct has infinite size; the checker allows the
+/// declaration (its values are unconstructible), so codegen must
+/// diagnose instead of recursing forever.
 #[test]
-fn value_struct_literals_are_not_yet_compilable() {
+fn recursive_value_struct_is_a_clean_diagnostic() {
     let dir = tempdir();
     std::fs::write(
-        dir.join("valstruct.ys"),
-        "struct P { x: int }
-        fun main(): int { const p: P = P { x: 1 }; return p.x; }",
+        dir.join("recur.ys"),
+        "struct S { s: S }
+        fun f(p: S): int { return 0; }
+        fun main(): int { return 1; }",
     )
     .unwrap();
     let out = compiler(&[
         "build",
-        dir.join("valstruct.ys").to_str().unwrap(),
+        dir.join("recur.ys").to_str().unwrap(),
         "-o",
-        dir.join("valstruct").to_str().unwrap(),
+        dir.join("recur").to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not yet compilable"));
+}
+
+/// Arrays of multi-word values need stride machinery ys_push and the
+/// indexers don't have yet.
+#[test]
+fn arrays_of_value_structs_are_not_yet_compilable() {
+    let dir = tempdir();
+    std::fs::write(
+        dir.join("valarr.ys"),
+        "struct P { x: int, y: int }
+        fun main(): int { const ps: P[] = [P { x: 1, y: 2 }]; return ps[0].x; }",
+    )
+    .unwrap();
+    let out = compiler(&[
+        "build",
+        dir.join("valarr.ys").to_str().unwrap(),
+        "-o",
+        dir.join("valarr").to_str().unwrap(),
     ]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("not yet compilable"));

@@ -531,6 +531,106 @@ fn nested_field_chains() {
 }
 
 #[test]
+fn value_structs_copy_on_assignment() {
+    diff(
+        "valstruct",
+        "struct Point { x: int, y: int }
+        fun main(): int {
+            const a: Point = Point { x: 3, y: 4 };
+            var b: Point = a;
+            b.x = 30;
+            return a.x * 1000 + b.x + a.y;
+        }",
+    );
+}
+
+#[test]
+fn value_structs_through_calls_and_returns() {
+    diff(
+        "valcalls",
+        "struct Point { x: int, y: int }
+        fun make(x: int, y: int): Point {
+            return Point { x: x, y: y };
+        }
+        fun taxi(p: Point): int { return p.x + p.y; }
+        fun main(): int {
+            const p: Point = make(20, 22);
+            return taxi(p) + taxi(make(1, 2)) * 100;
+        }",
+    );
+}
+
+#[test]
+fn nested_value_structs_inline() {
+    diff(
+        "valnest",
+        "struct Inner { v: int, w: int }
+        struct Outer { pre: int, inner: Inner, post: int }
+        fun main(): int {
+            var o: Outer = Outer { pre: 1, inner: Inner { v: 2, w: 3 }, post: 4 };
+            var i: Inner = o.inner;
+            i.v = 20;
+            o.inner.w = 30;
+            return o.pre + o.inner.v * 10 + o.inner.w + i.v * 100 + o.post;
+        }",
+    );
+}
+
+#[test]
+fn value_struct_equality_is_structural() {
+    diff(
+        "valeq",
+        "struct Pair { a: int, b: bool }
+        fun main(): int {
+            const x: Pair = Pair { a: 5, b: true };
+            const y: Pair = Pair { a: 5, b: true };
+            const z: Pair = Pair { a: 5, b: false };
+            var r: int = 0;
+            if x == y { r = r + 1; }
+            if x == z { r = r + 10; }
+            if x != z { r = r + 100; }
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn value_struct_inside_a_refstruct() {
+    diff(
+        "valinref",
+        "struct Pos { x: int, y: int }
+        refstruct Entity { pos: Pos, hp: int }
+        fun main(): int {
+            const e: Entity = Entity { pos: Pos { x: 1, y: 2 }, hp: 100 };
+            var copy: Pos = e.pos;
+            copy.x = 50;
+            e.pos.y = 20;
+            e.pos = Pos { x: e.pos.x + 6, y: e.pos.y + 1 };
+            return e.pos.x + e.pos.y * 10 + copy.x * 100 + e.hp;
+        }",
+    );
+}
+
+#[test]
+fn struct_with_refstruct_field_compares_by_identity() {
+    diff(
+        "mixedeq",
+        "refstruct Shared { n: int }
+        struct Tag { label: int, shared: Shared }
+        fun main(): int {
+            const s: Shared = Shared { n: 1 };
+            const a: Tag = Tag { label: 7, shared: s };
+            const b: Tag = Tag { label: 7, shared: s };
+            const c: Tag = Tag { label: 7, shared: Shared { n: 1 } };
+            var r: int = 0;
+            if a == b { r = r + 1; }
+            if a == c { r = r + 10; }
+            return r;
+        }",
+    );
+}
+
+#[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as
     // tall as the chain is long; 6000 terms used to overflow the checker's

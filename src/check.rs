@@ -11,7 +11,7 @@ use crate::types::{
 };
 
 /// A per-module view: visible name → the (module, name) that defines it.
-type Alias = HashMap<String, (usize, String)>;
+pub type Alias = HashMap<String, (usize, String)>;
 
 /// Name-resolution results — the checker's durable output. For every module,
 /// each callable name maps to its defining (module, name), locals and imports
@@ -26,12 +26,22 @@ pub struct Resolutions {
     /// exports ADR 0009 reserved for codegen (field layout and by_ref).
     pub structs: HashMap<(usize, String), StructType>,
     /// Field-access resolution for codegen: each `Field` expr's span maps
-    /// to its field's declaration index and type. Spans are file-global
-    /// offsets, so they key uniquely across the whole program.
-    pub field_slots: HashMap<Span, (usize, Type)>,
+    /// to its base struct, field index, and field type. Spans are
+    /// file-global offsets, so they key uniquely across the whole program.
+    pub field_slots: HashMap<Span, FieldSlot>,
     /// Struct-literal resolution for codegen: literal span → the defining
     /// (module, name) its visible name resolved to.
     pub struct_lits: HashMap<Span, (usize, String)>,
+    /// Per module: every visible type name → its defining (module, name),
+    /// so codegen can resolve `Named` annotations to `structs` entries.
+    pub types: Vec<Alias>,
+}
+
+/// A resolved field access (see `Resolutions::field_slots`).
+pub struct FieldSlot {
+    pub base: (usize, String),
+    pub index: usize,
+    pub ty: Type,
 }
 
 /// One module's declared names with their export flags.
@@ -208,6 +218,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
             structs,
             field_slots,
             struct_lits,
+            types: ty_aliases,
         },
         diags,
     )
@@ -288,7 +299,7 @@ struct Checker<'a> {
     ret: Type,
     /// Codegen resolution tables filled in as expressions type (see
     /// `Resolutions::field_slots` / `struct_lits`).
-    field_slots: &'a mut HashMap<Span, (usize, Type)>,
+    field_slots: &'a mut HashMap<Span, FieldSlot>,
     struct_lits: &'a mut HashMap<Span, (usize, String)>,
 }
 
@@ -1043,8 +1054,16 @@ impl<'a> Checker<'a> {
                     .map(|i| (i, st.fields[i].1.clone()))
             })
             .map(|(i, ty)| {
-                // Codegen's layout table: declaration index = word offset.
-                self.field_slots.insert(span, (i, ty.clone()));
+                // Codegen's layout table (field offsets are computed from
+                // the base def, since fields may be multi-word).
+                self.field_slots.insert(
+                    span,
+                    FieldSlot {
+                        base: (*sm, struct_name.clone()),
+                        index: i,
+                        ty: ty.clone(),
+                    },
+                );
                 ty
             });
         match field_ty {

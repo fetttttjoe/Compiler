@@ -1,24 +1,27 @@
 //! x86-64 backend (ADR 0009): compiles the program to AT&T assembly for
 //! the system `cc` to assemble and link. Covers int/bool arithmetic,
-//! comparisons, short-circuit logic, locals, `if`/`while`, and direct
-//! calls (≤6 register args, System V). Everything else is a clean
-//! "not yet compilable" diagnostic; breadth arrives slice by slice,
-//! each diffed against the interpreter (see tests/diff.rs).
+//! comparisons, short-circuit logic, locals, `if`/`while`/`for`, direct
+//! calls, arrays, refstructs with reference optionals, and value structs.
+//! Everything else is a clean "not yet compilable" diagnostic; breadth
+//! arrives slice by slice, each diffed against the interpreter
+//! (see tests/diff.rs).
 //!
 //! Scheme: recursive emission into %rax, machine stack for the pending
-//! left operand. ponytail: no IR and no register allocation until a real
-//! optimization needs them, per ADR 0009.
+//! left operand. Every value is one word — scalars and handles by value,
+//! value structs by *pointer* to frame/heap storage (copied at `let`,
+//! assignment, and return; passing a pointer uncopied is sound because
+//! the checker forbids writes through const value params). ponytail: no
+//! IR and no register allocation until a real optimization needs them,
+//! per ADR 0009.
 //!
 //! Compiled behavior on the idiv traps — division by zero and
 //! i64::MIN / -1 — is deferred (the binary takes a SIGFPE): the
 //! interpreter diagnoses both, and the differential harness only diffs
 //! programs the interpreter runs cleanly.
 //!
-//! Standing obligations for later slices (so they aren't rediscovered
-//! as bugs): the first emitted `call` must keep %rsp 16-byte aligned at
-//! the call site (System V ABI — SSE spills fault without it), and the
-//! first data symbol (string literal, global) must use RIP-relative
-//! addressing, because the system cc links PIE by default.
+//! Standing obligation for later slices: the first data symbol (string
+//! literal, global) must use RIP-relative addressing — the system cc
+//! links PIE by default.
 
 use crate::ast::{BinOp, Expr, Function, Item, Stmt, TypeAnn, UnOp};
 use crate::check::Resolutions;
@@ -52,11 +55,32 @@ pub fn compile(
         asm: String::from("\t.section .note.GNU-stack,\"\",@progbits\n\t.text\n"),
         scopes: Vec::new(),
         next_slot: 0,
+        min_slot: 0,
         labels: 0,
         depth: 0,
         module: 0,
+        ret_words: 1,
+        sret_slot: None,
         res,
+        returns: &HashMap::new(),
     };
+
+    // Return-size table: which callees hand their value back through a
+    // hidden destination pointer (multi-word value structs).
+    let mut returns = HashMap::new();
+    for (mi, module) in graph.modules.iter().enumerate() {
+        for item in &module.ast {
+            if let Item::Function(f) = item {
+                let words = match &f.return_type {
+                    None => 1,
+                    Some(t) => e.ann_words(t, mi).unwrap_or(1),
+                };
+                returns.insert((mi, f.name.clone()), words);
+            }
+        }
+    }
+    e.returns = &returns;
+
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             if let Item::Function(f) = item {
@@ -117,42 +141,33 @@ fn label_of(module: usize, name: &str) -> String {
     }
 }
 
-/// Peak number of simultaneously live `let` slots for a body. Blocks
-/// release their slots on exit (`block` restores `next_slot`), so sibling
-/// scopes share: the frame needs the deepest path, not the sum. `for`
-/// bindings (element + optional index) are counted with their body so the
-/// frame is already right when that slice lands.
-fn peak_slots(body: &[Stmt]) -> usize {
-    let mut live = 0;
-    let mut peak = 0;
-    for stmt in body {
-        let inner = match stmt {
-            Stmt::Let { .. } => {
-                live += 1;
-                0
-            }
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => peak_slots(then_body).max(else_body.as_deref().map_or(0, peak_slots)),
-            Stmt::While { body, .. } => peak_slots(body),
-            // Element + counter (doubles as the index binding) + the
-            // evaluated-once array handle.
-            Stmt::For { body, .. } => 3 + peak_slots(body),
-            _ => 0,
-        };
-        peak = peak.max(live + inner);
+/// A reference-shaped checker type: a handle where 0 means `null`, so a
+/// `T?` of it is a nullable pointer for free (ADR 0009).
+fn ref_shaped(t: &Type, res: &Resolutions) -> bool {
+    match t {
+        Type::Array(_) => true,
+        Type::Struct(m, n) => res.structs[&(*m, n.clone())].by_ref,
+        _ => false,
     }
-    peak.max(live)
+}
+
+/// One binding's storage: frame offset, value size, and whether the slot
+/// holds a pointer to the value (struct params) instead of the value.
+#[derive(Clone, Copy)]
+struct Local {
+    off: i64,
+    words: usize,
+    indirect: bool,
 }
 
 struct Emitter<'a> {
     asm: String,
     /// Innermost-last scope stack; each block pushes and pops one frame.
-    scopes: Vec<HashMap<String, i64>>,
-    /// Slots handed out so far — every `let` site takes a fresh one.
+    scopes: Vec<HashMap<String, Local>>,
+    /// Bump-allocated frame offsets; `min_slot` is the high-water mark
+    /// that sizes the frame (emitted after the body, spliced before it).
     next_slot: i64,
+    min_slot: i64,
     /// Global label counter — jump labels must be unique per file.
     labels: usize,
     /// Outstanding operand pushes. %rsp sits 16-aligned at statement
@@ -161,71 +176,144 @@ struct Emitter<'a> {
     /// The module whose function is being emitted — call names resolve
     /// through its alias map.
     module: usize,
+    /// Current function's return size; >1 means sret (hidden dest ptr).
+    ret_words: usize,
+    /// Frame slot holding the incoming sret destination pointer.
+    sret_slot: Option<i64>,
     res: &'a Resolutions,
+    /// Return sizes of every user function, for sret call sites.
+    returns: &'a HashMap<(usize, String), usize>,
 }
 
 impl Emitter<'_> {
-    /// Emits one function: prologue, register-spilled params, body,
-    /// fall-through epilogue (reachable only for unit functions — the
-    /// checker proves value-returning bodies always return).
-    /// The `TypeAnn` mirror of `word_type`, for annotations (params,
-    /// returns, `let`) resolved through this module's visible names.
-    fn word_ann(&self, ty: &TypeAnn, module: usize) -> bool {
-        match ty {
-            TypeAnn::Int | TypeAnn::Bool => true,
-            TypeAnn::Named(n) => self.res.ref_structs[module].contains(n),
-            // Element annotations recurse: `int?[]` is as uncompilable
-            // as a bare `int?` slot.
-            TypeAnn::Array(inner) => self.word_ann(inner, module),
-            TypeAnn::Optional(inner) => match inner.as_ref() {
-                TypeAnn::Named(n) => self.res.ref_structs[module].contains(n),
-                TypeAnn::Array(_) => true,
-                _ => false,
-            },
-            _ => false,
+    /// Words a checker type occupies inline. `None` = not compilable yet
+    /// (floats, strings, value optionals) or infinite (recursive value
+    /// struct — the depth guard catches it; values that deep can't exist).
+    fn type_words(&self, t: &Type, fuel: usize) -> Option<usize> {
+        match t {
+            Type::Int | Type::Bool => Some(1),
+            Type::Optional(inner) => ref_shaped(inner, self.res).then_some(1),
+            Type::Array(_) => Some(1),
+            Type::Struct(m, n) => {
+                let def = &self.res.structs[&(*m, n.clone())];
+                if def.by_ref {
+                    return Some(1);
+                }
+                let next = fuel.checked_sub(1)?;
+                def.fields
+                    .iter()
+                    .try_fold(0, |sum, (_, ft)| Some(sum + self.type_words(ft, next)?))
+            }
+            _ => None,
         }
     }
 
-    fn function(&mut self, f: &Function, module: usize) -> Result<(), Diagnostic> {
-        for p in &f.params {
-            if !self.word_ann(&p.ty, module) {
-                return Err(unsupported("parameters of this type", f.span));
+    /// `type_words` for annotations, resolved through `module`'s names.
+    fn ann_words(&self, ty: &TypeAnn, module: usize) -> Option<usize> {
+        match ty {
+            TypeAnn::Int | TypeAnn::Bool => Some(1),
+            // Element annotations must be single words: `int?[]` is as
+            // uncompilable as a bare `int?`, `Point[]` needs strides.
+            TypeAnn::Array(inner) => (self.ann_words(inner, module)? == 1).then_some(1),
+            TypeAnn::Optional(inner) => match inner.as_ref() {
+                TypeAnn::Named(n) => self.res.ref_structs[module].contains(n).then_some(1),
+                TypeAnn::Array(_) => Some(1),
+                _ => None,
+            },
+            TypeAnn::Named(n) => {
+                let key = self.res.types[module].get(n)?;
+                self.type_words(&Type::Struct(key.0, key.1.clone()), 64)
             }
+            _ => None,
         }
-        if !f
-            .return_type
-            .as_ref()
-            .is_none_or(|t| self.word_ann(t, module))
-        {
-            return Err(unsupported("this return type", f.span));
+    }
+
+    /// Byte offset of field `index` in `def` — the sum of the sizes
+    /// before it (C-style declaration-order layout, ADR 0009).
+    fn offset_of(&self, base: &(usize, String), index: usize) -> Option<i64> {
+        let def = &self.res.structs[base];
+        def.fields[..index].iter().try_fold(0, |sum, (_, ft)| {
+            Some(sum + 8 * self.type_words(ft, 64)? as i64)
+        })
+    }
+
+    /// The size of an expression's value, from the resolution tables the
+    /// checker exported — everything not struct-shaped is one word.
+    fn expr_words(&self, e: &Expr) -> usize {
+        match e {
+            Expr::Ident(name, _) => self.lookup(name).map_or(1, |l| l.words),
+            Expr::Field { span, .. } => self
+                .res
+                .field_slots
+                .get(span)
+                .and_then(|slot| self.type_words(&slot.ty, 64))
+                .unwrap_or(1),
+            Expr::StructLit { span, .. } => self
+                .res
+                .struct_lits
+                .get(span)
+                .filter(|key| !self.res.structs[*key].by_ref)
+                .and_then(|key| self.type_words(&Type::Struct(key.0, key.1.clone()), 64))
+                .unwrap_or(1),
+            Expr::Call { callee, .. } => match callee.as_ref() {
+                Expr::Ident(name, _) => self.res.functions[self.module]
+                    .get(name)
+                    .and_then(|key| self.returns.get(key))
+                    .copied()
+                    .unwrap_or(1),
+                _ => 1,
+            },
+            _ => 1,
         }
-        if f.params.len() > ARG_REGS.len() {
+    }
+
+    /// Emits one function: body first into a side buffer (so the frame
+    /// size is simply the slot high-water mark), then label + prologue +
+    /// body. The fall-through epilogue is reachable only for unit
+    /// functions — the checker proves value-returning bodies return.
+    fn function(&mut self, f: &Function, module: usize) -> Result<(), Diagnostic> {
+        self.module = module;
+        self.next_slot = 0;
+        self.min_slot = 0;
+        self.depth = 0;
+        self.ret_words = match &f.return_type {
+            None => 1,
+            Some(t) => self
+                .ann_words(t, module)
+                .ok_or_else(|| unsupported("this return type", f.span))?,
+        };
+        let sret = self.ret_words > 1;
+        if f.params.len() + sret as usize > ARG_REGS.len() {
             return Err(unsupported("more than 6 parameters", f.span));
         }
 
-        self.module = module;
-        self.next_slot = 0;
-        self.depth = 0;
-        let label = label_of(module, &f.name);
-        if label == "main" {
-            self.asm.push_str("\t.globl main\n");
-        }
-        let _ = writeln!(self.asm, "{label}:");
+        let outer = std::mem::take(&mut self.asm);
 
-        // Slots are rbp-relative because operand pushes move %rsp; the
-        // frame is 16-byte aligned so %rsp parity at any point is just
-        // the outstanding push count.
-        self.asm.push_str("\tpushq %rbp\n\tmovq %rsp, %rbp\n");
-        let frame = ((f.params.len() + peak_slots(&f.body)) * 8 + 15) & !15;
-        if frame > 0 {
-            let _ = writeln!(self.asm, "\tsubq ${frame}, %rsp");
+        // The hidden sret pointer arrives first and hides in the frame.
+        self.sret_slot = None;
+        if sret {
+            let slot = self.alloc(1);
+            let _ = writeln!(self.asm, "\tmovq %rdi, {slot}(%rbp)");
+            self.sret_slot = Some(slot);
         }
-
+        // Params: scalars and handles arrive by value, value structs as
+        // pointers to the caller's storage (read-only by checker rule).
         let mut params = HashMap::new();
         for (i, p) in f.params.iter().enumerate() {
-            self.next_slot -= 8;
-            let _ = writeln!(self.asm, "\tmovq {}, {}(%rbp)", ARG_REGS[i], self.next_slot);
-            params.insert(p.name.clone(), self.next_slot);
+            let words = self
+                .ann_words(&p.ty, module)
+                .ok_or_else(|| unsupported("parameters of this type", f.span))?;
+            let slot = self.alloc(1);
+            let reg = ARG_REGS[i + sret as usize];
+            let _ = writeln!(self.asm, "\tmovq {reg}, {slot}(%rbp)");
+            params.insert(
+                p.name.clone(),
+                Local {
+                    off: slot,
+                    words,
+                    indirect: words > 1,
+                },
+            );
         }
         self.scopes = vec![params];
 
@@ -233,7 +321,29 @@ impl Emitter<'_> {
             self.stmt(stmt)?;
         }
         self.asm.push_str("\tleave\n\tret\n");
+        let body = std::mem::replace(&mut self.asm, outer);
+
+        let label = label_of(module, &f.name);
+        if label == "main" {
+            self.asm.push_str("\t.globl main\n");
+        }
+        // Slots are rbp-relative because operand pushes move %rsp; the
+        // frame is 16-byte aligned so %rsp parity at any point is just
+        // the outstanding push count.
+        let _ = writeln!(self.asm, "{label}:\n\tpushq %rbp\n\tmovq %rsp, %rbp");
+        let frame = ((-self.min_slot) + 15) & !15;
+        if frame > 0 {
+            let _ = writeln!(self.asm, "\tsubq ${frame}, %rsp");
+        }
+        self.asm.push_str(&body);
         Ok(())
+    }
+
+    /// Claims `words` fresh frame words; freed by restoring `next_slot`.
+    fn alloc(&mut self, words: usize) -> i64 {
+        self.next_slot -= 8 * words as i64;
+        self.min_slot = self.min_slot.min(self.next_slot);
+        self.next_slot
     }
 
     fn fresh_label(&mut self) -> String {
@@ -265,6 +375,12 @@ impl Emitter<'_> {
         }
     }
 
+    /// Copies `words` 8-byte words from %rsi to %rdi (clobbers %rcx and
+    /// advances %rsi/%rdi). Only emitted where no operand relies on them.
+    fn copy(&mut self, words: usize) {
+        let _ = writeln!(self.asm, "\tmovq ${words}, %rcx\n\trep movsq");
+    }
+
     /// ADR 0008's runtime bounds check: index in %rcx against the length
     /// of the array whose handle is in `hdl`. Unsigned compare catches
     /// negatives; out of bounds aborts — the deferred-trap policy (like
@@ -276,7 +392,7 @@ impl Emitter<'_> {
         let _ = writeln!(self.asm, "{ok}:");
     }
 
-    fn lookup(&self, name: &str) -> Option<i64> {
+    fn lookup(&self, name: &str) -> Option<Local> {
         self.scopes
             .iter()
             .rev()
@@ -288,39 +404,65 @@ impl Emitter<'_> {
         let saved_slot = self.next_slot;
         let result = body.iter().try_for_each(|stmt| self.stmt(stmt));
         // The block's names died with its scope, so its slots are free
-        // for sibling blocks — this is what lets `peak_slots` size the
-        // frame by deepest path instead of total let count.
+        // for sibling blocks.
         self.next_slot = saved_slot;
         self.scopes.pop();
         result
     }
 
     fn stmt(&mut self, stmt: &Stmt) -> Result<(), Diagnostic> {
+        // Expression temporaries (value-struct literals, sret call slots)
+        // live to the end of their statement; `let` keeps its binding.
+        let saved_slot = self.next_slot;
         match stmt {
             Stmt::Let {
                 name, value, ty, ..
             } => {
                 if let Some(ann) = ty {
-                    if !self.word_ann(ann, self.module) {
+                    if self.ann_words(ann, self.module).is_none() {
                         return Err(unsupported("bindings of this type", stmt.span()));
                     }
                 }
+                let words = self.expr_words(value);
+                let off = self.alloc(words);
                 self.expr(value)?;
-                self.next_slot -= 8;
-                let off = self.next_slot;
+                if words == 1 {
+                    let _ = writeln!(self.asm, "\tmovq %rax, {off}(%rbp)");
+                } else {
+                    let _ = writeln!(self.asm, "\tleaq {off}(%rbp), %rdi\n\tmovq %rax, %rsi");
+                    self.copy(words);
+                }
                 self.scopes
                     .last_mut()
                     .expect("a scope is always open")
-                    .insert(name.clone(), off);
-                let _ = writeln!(self.asm, "\tmovq %rax, {off}(%rbp)");
+                    .insert(
+                        name.clone(),
+                        Local {
+                            off,
+                            words,
+                            indirect: false,
+                        },
+                    );
+                // Free the value's temporaries, keep the binding.
+                self.next_slot = off;
+                return Ok(());
             }
             Stmt::Assign { target, value, .. } => match target {
                 Expr::Ident(name, span) => {
-                    let Some(off) = self.lookup(name) else {
+                    let Some(local) = self.lookup(name) else {
                         return Err(unsupported("this assignment target", *span));
                     };
                     self.expr(value)?;
-                    let _ = writeln!(self.asm, "\tmovq %rax, {off}(%rbp)");
+                    if local.words == 1 {
+                        let _ = writeln!(self.asm, "\tmovq %rax, {}(%rbp)", local.off);
+                    } else {
+                        let _ = writeln!(
+                            self.asm,
+                            "\tleaq {}(%rbp), %rdi\n\tmovq %rax, %rsi",
+                            local.off
+                        );
+                        self.copy(local.words);
+                    }
                 }
                 Expr::Index { base, index, .. } => {
                     self.expr(base)?;
@@ -338,21 +480,38 @@ impl Emitter<'_> {
                 // a field target is always a plain, checker-proven-safe
                 // dereference: no null check needed.
                 Expr::Field { base, span, .. } => {
-                    let Some((slot, _)) = self.res.field_slots.get(span) else {
+                    let Some(slot) = self.res.field_slots.get(span) else {
                         return Err(unsupported("this field target", *span));
                     };
-                    let off = 8 * slot;
+                    let words = self
+                        .type_words(&slot.ty, 64)
+                        .ok_or_else(|| unsupported("fields of this type", *span))?;
+                    let off = self
+                        .offset_of(&slot.base, slot.index)
+                        .ok_or_else(|| unsupported("this struct layout", *span))?;
                     self.expr(base)?;
                     self.push("%rax");
                     self.expr(value)?;
-                    self.pop("%rcx");
-                    let _ = writeln!(self.asm, "\tmovq %rax, {off}(%rcx)");
+                    self.pop("%rdi");
+                    if words == 1 {
+                        let _ = writeln!(self.asm, "\tmovq %rax, {off}(%rdi)");
+                    } else {
+                        let _ = writeln!(self.asm, "\tleaq {off}(%rdi), %rdi\n\tmovq %rax, %rsi");
+                        self.copy(words);
+                    }
                 }
                 other => return Err(unsupported("this assignment target", other.span())),
             },
             Stmt::Return { value, .. } => {
                 if let Some(expr) = value {
                     self.expr(expr)?;
+                    if let Some(sret) = self.sret_slot {
+                        // Copy the value into the caller's destination
+                        // and hand the destination back.
+                        let _ = writeln!(self.asm, "\tmovq {sret}(%rbp), %rdi\n\tmovq %rax, %rsi");
+                        self.copy(self.ret_words);
+                        let _ = writeln!(self.asm, "\tmovq {sret}(%rbp), %rax");
+                    }
                 }
                 // `leave` restores %rsp from %rbp, so pending operand
                 // pushes on this path unwind with the frame.
@@ -403,11 +562,11 @@ impl Emitter<'_> {
                 // re-read every step, element copied out before the body
                 // runs — exactly the oracle's contract (interpreter.rs).
                 // Three hidden slots: handle, counter (doubling as the
-                // index binding), element. Released after the loop.
-                let saved_slot = self.next_slot;
+                // index binding), element.
                 self.expr(iterable)?;
-                let (hdl, i, x) = (self.next_slot - 8, self.next_slot - 16, self.next_slot - 24);
-                self.next_slot -= 24;
+                let hdl = self.alloc(1);
+                let i = self.alloc(1);
+                let x = self.alloc(1);
                 let _ = writeln!(self.asm, "\tmovq %rax, {hdl}(%rbp)\n\tmovq $0, {i}(%rbp)");
                 let top = self.fresh_label();
                 let end = self.fresh_label();
@@ -418,9 +577,24 @@ impl Emitter<'_> {
                      \tmovq 16(%rax), %rax\n\tmovq (%rax,%rcx,8), %rax\n\
                      \tmovq %rax, {x}(%rbp)"
                 );
-                let mut bindings = HashMap::from([(name.clone(), x)]);
+                let mut bindings = HashMap::new();
+                bindings.insert(
+                    name.clone(),
+                    Local {
+                        off: x,
+                        words: 1,
+                        indirect: false,
+                    },
+                );
                 if let Some(index) = index {
-                    bindings.insert(index.clone(), i);
+                    bindings.insert(
+                        index.clone(),
+                        Local {
+                            off: i,
+                            words: 1,
+                            indirect: false,
+                        },
+                    );
                 }
                 self.scopes.push(bindings);
                 let inner_slot = self.next_slot;
@@ -429,19 +603,21 @@ impl Emitter<'_> {
                 self.scopes.pop();
                 result?;
                 let _ = writeln!(self.asm, "\tincq {i}(%rbp)\n\tjmp {top}\n{end}:");
-                self.next_slot = saved_slot;
             }
             Stmt::Expr(expr) => self.expr(expr)?, // value discarded
         }
+        self.next_slot = saved_slot;
         Ok(())
     }
 
-    /// Emits code leaving the expression's value in %rax (bools are 0/1).
-    /// Binary ops park the left operand on the machine stack while the
-    /// right side evaluates, then pop it into %rcx — pushes and pops
-    /// always balance across every emitted path. Recursion depth is safe:
-    /// the parser bounds AST height at construction (MAX_FN_OPS) and the
-    /// pipeline runs on a worker stack sized for that bound (main.rs).
+    /// Emits code leaving the expression's value in %rax — scalars and
+    /// handles by value (bools are 0/1), value structs as a pointer to
+    /// their storage. Binary ops park the left operand on the machine
+    /// stack while the right side evaluates, then pop it into %rcx —
+    /// pushes and pops always balance across every emitted path.
+    /// Recursion depth is safe: the parser bounds AST height at
+    /// construction (MAX_FN_OPS) and the pipeline runs on a worker stack
+    /// sized for that bound (main.rs).
     fn expr(&mut self, expr: &Expr) -> Result<(), Diagnostic> {
         match expr {
             // movabsq takes a full 64-bit immediate; movq would cap at i32.
@@ -458,8 +634,12 @@ impl Emitter<'_> {
                 self.asm.push_str("\txorl %eax, %eax\n");
             }
             Expr::Ident(name, span) => match self.lookup(name) {
-                Some(off) => {
-                    let _ = writeln!(self.asm, "\tmovq {off}(%rbp), %rax");
+                Some(local) if local.words == 1 || local.indirect => {
+                    let _ = writeln!(self.asm, "\tmovq {}(%rbp), %rax", local.off);
+                }
+                // A by-value struct local: its value IS the frame slots.
+                Some(local) => {
+                    let _ = writeln!(self.asm, "\tleaq {}(%rbp), %rax", local.off);
                 }
                 // The checker resolved it, but not to a local we can
                 // compile yet (e.g. a function name used as a value).
@@ -515,6 +695,25 @@ impl Emitter<'_> {
                 let _ = writeln!(self.asm, "{end}:");
             }
             Expr::Binary { op, lhs, rhs, .. } => {
+                // Value-struct equality is structural: the layout is
+                // padding-free 8-byte words, so memcmp decides it. The
+                // checker guarantees both sides share one type.
+                let words = self.expr_words(lhs);
+                if words > 1 && matches!(op, BinOp::Eq | BinOp::Ne) {
+                    self.expr(lhs)?;
+                    self.push("%rax");
+                    self.expr(rhs)?;
+                    self.asm.push_str("\tmovq %rax, %rsi\n");
+                    self.pop("%rdi");
+                    let _ = writeln!(self.asm, "\tmovq ${}, %rdx", 8 * words);
+                    self.call("memcmp@PLT");
+                    let cc = if matches!(op, BinOp::Eq) { "e" } else { "ne" };
+                    let _ = writeln!(
+                        self.asm,
+                        "\ttestl %eax, %eax\n\tset{cc} %al\n\tmovzbq %al, %rax"
+                    );
+                    return Ok(());
+                }
                 // lhs in %rax, rhs in %rcx. Wrapping add/sub/mul match the
                 // interpreter's wrapping ops; idiv truncates toward zero
                 // and signs the remainder like the dividend, matching the
@@ -560,14 +759,19 @@ impl Emitter<'_> {
                 let Expr::Ident(name, _) = callee.as_ref() else {
                     return Err(unsupported("this callee", *span));
                 };
-                let Some((tm, tname)) = self.res.functions[self.module].get(name) else {
+                let Some(key) = self.res.functions[self.module].get(name) else {
                     // Resolution order says: no user definition, so this
                     // is a builtin.
                     return self.builtin(name, args, *span);
                 };
-                if args.len() > ARG_REGS.len() {
+                let ret_words = self.returns.get(key).copied().unwrap_or(1);
+                let sret = ret_words > 1;
+                if args.len() + sret as usize > ARG_REGS.len() {
                     return Err(unsupported("calls with more than 6 arguments", *span));
                 }
+                // A struct-returning callee writes into a fresh temp here
+                // in the caller's frame (freed at statement end).
+                let dest = sret.then(|| self.alloc(ret_words));
                 // Evaluate args left to right onto the stack (a later
                 // arg's subexpressions would clobber earlier registers),
                 // then pop into the ABI registers in reverse.
@@ -575,22 +779,28 @@ impl Emitter<'_> {
                     self.expr(arg)?;
                     self.push("%rax");
                 }
-                for reg in ARG_REGS[..args.len()].iter().rev() {
+                let shifted = &ARG_REGS[sret as usize..sret as usize + args.len()];
+                for reg in shifted.iter().rev() {
                     self.pop(reg);
                 }
-                self.call(&label_of(*tm, tname));
+                if let Some(dest) = dest {
+                    let _ = writeln!(self.asm, "\tleaq {dest}(%rbp), %rdi");
+                }
+                self.call(&label_of(key.0, &key.1));
             }
-            Expr::ArrayLit { elements, span } => {
+            Expr::ArrayLit { elements, .. } => {
                 // A null element could make the literal an `int?[]` —
                 // a value-optional array the word model can't represent.
                 // ponytail: over-strict for `Node?[]` literals too; build
                 // those with push until the checker exports element types.
                 if let Some(null) = elements.iter().find(|e| matches!(e, Expr::Null(_))) {
-                    let _ = span;
                     return Err(unsupported(
                         "array literals with null elements",
                         null.span(),
                     ));
+                }
+                if let Some(wide) = elements.iter().find(|e| self.expr_words(e) > 1) {
+                    return Err(unsupported("arrays of multi-word values", wide.span()));
                 }
                 // Header {len, cap, data*} plus buffer, per ADR 0014.
                 // Allocation happens before element evaluation — the
@@ -635,14 +845,19 @@ impl Emitter<'_> {
                 span,
                 ..
             } => {
-                let Some((slot, field_ty)) = self.res.field_slots.get(span) else {
+                let Some(slot) = self.res.field_slots.get(span) else {
                     return Err(unsupported("this field access", *span));
                 };
-                let off = 8 * slot;
+                let words = self
+                    .type_words(&slot.ty, 64)
+                    .ok_or_else(|| unsupported("fields of this type", *span))?;
+                let off = self
+                    .offset_of(&slot.base, slot.index)
+                    .ok_or_else(|| unsupported("this struct layout", *span))?;
                 // `p?.x` with a value-typed x yields `int?` — a value
                 // optional the word model can't represent. Handle-typed
                 // fields are fine, already-optional ones stay flat.
-                let nullable_word = match field_ty {
+                let nullable_word = match &slot.ty {
                     Type::Optional(inner) => ref_shaped(inner, self.res),
                     other => ref_shaped(other, self.res),
                 };
@@ -655,10 +870,14 @@ impl Emitter<'_> {
                     let end = self.fresh_label();
                     let _ = writeln!(self.asm, "\ttestq %rax, %rax\n\tje {end}");
                     let _ = writeln!(self.asm, "\tmovq {off}(%rax), %rax\n{end}:");
-                } else {
+                } else if words == 1 {
                     // No null check: the checker's narrowing is sound, so
                     // a plain `.` base is proven non-null (ADR 0007).
                     let _ = writeln!(self.asm, "\tmovq {off}(%rax), %rax");
+                } else {
+                    // A struct-typed field's value is its storage inside
+                    // the base — an interior pointer; consumers copy.
+                    let _ = writeln!(self.asm, "\tleaq {off}(%rax), %rax");
                 }
             }
             Expr::StructLit { fields, span, .. } => {
@@ -666,31 +885,70 @@ impl Emitter<'_> {
                     return Err(unsupported("this struct literal", *span));
                 };
                 let def = &self.res.structs[key];
-                if !def.by_ref {
-                    return Err(unsupported("value struct literals", *span));
-                }
-                if !def.fields.iter().all(|(_, t)| word_type(t, self.res)) {
-                    return Err(unsupported("structs with fields of this type", *span));
-                }
-                // One heap object, fields at declaration-order word
-                // offsets (ADR 0009's C-style layout). The checker proved
-                // the literal complete, so every slot is written.
-                let size = (def.fields.len() * 8).max(8);
-                let _ = writeln!(self.asm, "\tmovq ${size}, %rdi");
-                self.call("malloc@PLT");
-                self.push("%rax");
-                for (fname, value) in fields {
-                    let slot = def
-                        .fields
+                let field_words: Vec<usize> = def
+                    .fields
+                    .iter()
+                    .map(|(_, t)| self.type_words(t, 64))
+                    .collect::<Option<_>>()
+                    .ok_or_else(|| unsupported("structs with fields of this type", *span))?;
+                let offsets: Vec<i64> = field_words
+                    .iter()
+                    .scan(0i64, |acc, w| {
+                        let off = *acc;
+                        *acc += 8 * *w as i64;
+                        Some(off)
+                    })
+                    .collect();
+                let total: usize = field_words.iter().sum();
+                let slot_of = |fname: &str| {
+                    def.fields
                         .iter()
                         .position(|(dn, _)| dn == fname)
-                        .expect("checker verified the field exists");
-                    self.expr(value)?;
-                    self.pop("%rcx");
-                    let _ = writeln!(self.asm, "\tmovq %rax, {}(%rcx)", 8 * slot);
-                    self.push("%rcx");
+                        .expect("checker verified the field exists")
+                };
+                if def.by_ref {
+                    // One heap object; the checker proved the literal
+                    // complete, so every slot is written.
+                    let _ = writeln!(self.asm, "\tmovq ${}, %rdi", (8 * total).max(8));
+                    self.call("malloc@PLT");
+                    self.push("%rax");
+                    for (fname, value) in fields {
+                        let i = slot_of(fname);
+                        self.expr(value)?;
+                        self.pop("%rdx");
+                        if field_words[i] == 1 {
+                            let _ = writeln!(self.asm, "\tmovq %rax, {}(%rdx)", offsets[i]);
+                        } else {
+                            let _ = writeln!(
+                                self.asm,
+                                "\tleaq {}(%rdx), %rdi\n\tmovq %rax, %rsi",
+                                offsets[i]
+                            );
+                            self.copy(field_words[i]);
+                        }
+                        self.push("%rdx");
+                    }
+                    self.pop("%rax");
+                } else {
+                    // A value literal builds in a frame temp; its static
+                    // address means no handle juggling at all.
+                    let base = self.alloc(total.max(1));
+                    for (fname, value) in fields {
+                        let i = slot_of(fname);
+                        self.expr(value)?;
+                        if field_words[i] == 1 {
+                            let _ = writeln!(self.asm, "\tmovq %rax, {}(%rbp)", base + offsets[i]);
+                        } else {
+                            let _ = writeln!(
+                                self.asm,
+                                "\tleaq {}(%rbp), %rdi\n\tmovq %rax, %rsi",
+                                base + offsets[i]
+                            );
+                            self.copy(field_words[i]);
+                        }
+                    }
+                    let _ = writeln!(self.asm, "\tleaq {base}(%rbp), %rax");
                 }
-                self.pop("%rax");
             }
             other => return Err(unsupported("this expression", other.span())),
         }
@@ -707,6 +965,9 @@ impl Emitter<'_> {
                 self.asm.push_str("\tmovq 0(%rax), %rax\n");
             }
             ("push", [array, value]) => {
+                if self.expr_words(value) > 1 {
+                    return Err(unsupported("arrays of multi-word values", value.span()));
+                }
                 self.expr(array)?;
                 self.push("%rax");
                 self.expr(value)?;
@@ -717,27 +978,6 @@ impl Emitter<'_> {
             _ => return Err(unsupported(&format!("builtin '{name}'"), span)),
         }
         Ok(())
-    }
-}
-
-/// A reference-shaped checker type: a handle where 0 means `null`, so a
-/// `T?` of it is a nullable pointer for free (ADR 0009).
-fn ref_shaped(t: &Type, res: &Resolutions) -> bool {
-    match t {
-        Type::Array(_) => true,
-        Type::Struct(m, n) => res.structs[&(*m, n.clone())].by_ref,
-        _ => false,
-    }
-}
-
-/// A checker type the backend can hold in one word: scalars, handles,
-/// and nullable handles. Value structs (multi-word) and value optionals
-/// (0 and null would share a bit pattern) wait for their own slices.
-fn word_type(t: &Type, res: &Resolutions) -> bool {
-    match t {
-        Type::Int | Type::Bool => true,
-        Type::Optional(inner) => ref_shaped(inner, res),
-        other => ref_shaped(other, res),
     }
 }
 
