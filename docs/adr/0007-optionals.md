@@ -70,6 +70,5 @@ require `??` or restructuring; `int?`'s future tag cost is invisible until
 the codegen hint lands.
 
 **Revisited from ADR 0006:** reference cycles are now constructible
-(`a.next = a`), so the interpreter's `Rc` can leak. Accepted for the
-oracle — leak-freedom is not among its guarantees; the real memory policy
-(and any cycle answer) belongs to the codegen ADR.
+(`a.next = a`). ~~The interpreter's `Rc` can leak~~ — resolved by ADR
+0011's arena heap, where cycles are harmless by construction.

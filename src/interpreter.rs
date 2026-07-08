@@ -1,6 +1,4 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use crate::ast::{BinOp, Expr, Function, Item, Stmt, UnOp};
 use crate::check::Resolutions;
@@ -9,10 +7,45 @@ use crate::modules::ModuleGraph;
 use crate::span::Span;
 use crate::syntax;
 
-/// The shared buffer behind a `Value::Array` handle.
-pub type SharedArray = Rc<RefCell<Vec<Value>>>;
+// ---- Interpreter policy ----------------------------------------------
+// One unit of evaluation depth (a call, statement, or expression level)
+// costs at most ~16KB of native stack in debug builds (measured); the
+// owned stack is sized so the depth budget always binds first:
+// 65_536 units x 16KB = 1GB = INTERP_STACK_BYTES. The heap cap turns
+// runaway allocation into a diagnostic instead of an OOM kill.
+const MAX_EVAL_DEPTH: usize = 65_536;
+const MAX_HEAP_CELLS: usize = 1 << 20;
+const INTERP_STACK_BYTES: usize = 1 << 30;
 
-#[derive(Debug, Clone)]
+/// The interpreter's arena: every refstruct object and array buffer lives
+/// here, addressed by handle into its own typed table — a `Value::Ref` can
+/// only name a struct object and a `Value::Array` only a buffer, so no
+/// mismatch arm exists anywhere. Nothing is freed mid-run; the arena drops
+/// wholesale when execution ends (ADR 0009's collector-free story), which
+/// also makes reference cycles harmless.
+#[derive(Debug, Default)]
+pub struct Heap {
+    structs: Vec<StructObj>,
+    arrays: Vec<Vec<Value>>,
+}
+
+/// A refstruct object; fields sorted by name like inline structs.
+#[derive(Debug)]
+struct StructObj {
+    name: String,
+    fields: Vec<(String, Value)>,
+}
+
+impl Heap {
+    fn cell_count(&self) -> usize {
+        self.structs.len() + self.arrays.len()
+    }
+}
+
+/// Handles are plain indices, so the derived `PartialEq` gives refstructs
+/// and arrays identity equality for free, and `Value` stays `Send` — which
+/// lets the interpreter own its execution stack (see `interpret`).
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Int(i64),
     Float(f64),
@@ -26,47 +59,26 @@ pub enum Value {
         name: String,
         fields: Vec<(String, Value)>,
     },
-    /// A `refstruct` instance: one shared object (always a `Value::Struct`
-    /// inside), aliased by every copy of the handle.
-    Ref(Rc<RefCell<Value>>),
-    /// An array: one shared, growable buffer, aliased like a refstruct.
-    Array(SharedArray),
+    /// A `refstruct` instance: a handle to one shared heap object, aliased
+    /// by every copy of the handle.
+    Ref(usize),
+    /// An array: a handle to one shared, growable heap buffer.
+    Array(usize),
     /// The `null` literal — the empty state of a `T?` slot.
     Null,
     Unit,
 }
 
-/// Like the derive, except `Ref` compares by identity (same object), not by
-/// contents — so struct equality recursing into a ref field is identity too.
-impl PartialEq for Value {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a == b,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Str(a), Value::Str(b)) => a == b,
-            (
-                Value::Struct { name: an, fields: af },
-                Value::Struct { name: bn, fields: bf },
-            ) => an == bn && af == bf,
-            (Value::Ref(a), Value::Ref(b)) => Rc::ptr_eq(a, b),
-            (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
-            (Value::Null, Value::Null) => true,
-            (Value::Unit, Value::Unit) => true,
-            _ => false,
-        }
-    }
-}
-
 impl Value {
     /// Human-facing rendering for `print`: scalars and strings raw, structs
     /// and arrays in source-like shape, refs printed through the handle.
-    /// Depth-capped like `render` (cycles print `...`).
-    pub fn display(&self) -> String {
-        self.display_depth(8)
+    /// Depth-capped like `render` — a handle hop costs a level, so cycles
+    /// stay as bounded as they were under the Rc oracle.
+    pub fn display(&self, heap: &Heap) -> String {
+        self.display_depth(heap, 8)
     }
 
-    fn display_depth(&self, depth: usize) -> String {
+    fn display_depth(&self, heap: &Heap, depth: usize) -> String {
         if depth == 0 {
             return "...".to_string();
         }
@@ -77,59 +89,54 @@ impl Value {
             Value::Str(s) => s.clone(),
             Value::Null => "null".to_string(),
             Value::Unit => "unit".to_string(),
-            Value::Ref(cell) => cell.borrow().display_depth(depth - 1),
-            Value::Array(items) => {
-                let items: Vec<String> = items
-                    .borrow()
-                    .iter()
-                    .map(|v| v.display_depth(depth - 1))
-                    .collect();
-                format!("[{}]", items.join(", "))
+            // The hop consumes a level, the object's children another.
+            Value::Ref(id) if depth == 1 => {
+                let _ = id;
+                "...".to_string()
+            }
+            Value::Ref(id) => {
+                let obj = &heap.structs[*id];
+                render_struct(&obj.name, &obj.fields, |v| v.display_depth(heap, depth - 2))
+            }
+            Value::Array(id) => {
+                render_items(&heap.arrays[*id], |v| v.display_depth(heap, depth - 1))
             }
             Value::Struct { name, fields } => {
-                let fields: Vec<String> = fields
-                    .iter()
-                    .map(|(f, v)| format!("{f}: {}", v.display_depth(depth - 1)))
-                    .collect();
-                format!("{name} {{ {} }}", fields.join(", "))
+                render_struct(name, fields, |v| v.display_depth(heap, depth - 1))
             }
         }
     }
 
     /// Debug-style rendering with a depth cap — cyclic refstruct values
-    /// (constructible since optionals landed) would recurse forever under
-    /// derived `Debug`.
+    /// would recurse forever otherwise.
     // ponytail: depth cap, not cycle detection — 8 levels is plenty for a
-    // result dump; switch to pointer-tracking if real output needs it.
-    pub fn render(&self) -> String {
-        self.render_depth(8)
+    // result dump; switch to handle-tracking if real output needs it.
+    pub fn render(&self, heap: &Heap) -> String {
+        self.render_depth(heap, 8)
     }
 
-    fn render_depth(&self, depth: usize) -> String {
+    fn render_depth(&self, heap: &Heap, depth: usize) -> String {
         if depth == 0 {
             return "...".to_string();
         }
         match self {
-            Value::Ref(cell) => format!("Ref({})", cell.borrow().render_depth(depth - 1)),
-            Value::Array(items) => {
-                let items: Vec<String> = items
-                    .borrow()
-                    .iter()
-                    .map(|v| v.render_depth(depth - 1))
-                    .collect();
-                format!("[{}]", items.join(", "))
+            Value::Ref(_) if depth == 1 => "...".to_string(),
+            Value::Ref(id) => {
+                let obj = &heap.structs[*id];
+                format!(
+                    "Ref({})",
+                    render_struct(&obj.name, &obj.fields, |v| v.render_depth(heap, depth - 2))
+                )
+            }
+            Value::Array(id) => {
+                render_items(&heap.arrays[*id], |v| v.render_depth(heap, depth - 1))
             }
             Value::Struct { name, fields } => {
-                let fields: Vec<String> = fields
-                    .iter()
-                    .map(|(f, v)| format!("{f}: {}", v.render_depth(depth - 1)))
-                    .collect();
-                format!("{name} {{ {} }}", fields.join(", "))
+                render_struct(name, fields, |v| v.render_depth(heap, depth - 1))
             }
             other => format!("{other:?}"),
         }
     }
-
     fn type_name(&self) -> &'static str {
         match self {
             Value::Int(_) => "int",
@@ -145,9 +152,48 @@ impl Value {
     }
 }
 
+fn render_struct(name: &str, fields: &[(String, Value)], mut one: impl FnMut(&Value) -> String) -> String {
+    let fields: Vec<String> = fields.iter().map(|(f, v)| format!("{f}: {}", one(v))).collect();
+    format!("{name} {{ {} }}", fields.join(", "))
+}
+
+fn render_items(items: &[Value], one: impl FnMut(&Value) -> String) -> String {
+    let items: Vec<String> = items.iter().map(one).collect();
+    format!("[{}]", items.join(", "))
+}
+
 /// Runs `main()` from the entry module (graph index 0), resolving every call
-/// through its module's alias map. Returns `Unit` when there is no `main`.
-pub fn interpret(graph: &ModuleGraph, resolutions: &Resolutions) -> Result<Value, Diagnostic> {
+/// through its module's alias map. Returns `Unit` (and the heap, for
+/// rendering the result) when there is no `main`. Execution happens on the
+/// interpreter's own thread — `Value` is `Send` because handles are plain
+/// arena indices.
+pub fn interpret(
+    graph: &ModuleGraph,
+    resolutions: &Resolutions,
+) -> Result<(Value, Heap), Diagnostic> {
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("interpreter".to_string())
+            .stack_size(INTERP_STACK_BYTES)
+            .spawn_scoped(scope, || run_program(graph, resolutions));
+        match worker {
+            Ok(handle) => handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            // Constrained hosts (strict overcommit, tight rlimits) can
+            // refuse the stack reservation — that's an error, not a panic.
+            Err(e) => Err(Diagnostic::error(
+                format!("cannot start the interpreter: {e}"),
+                Span::new(0, 0),
+            )),
+        }
+    })
+}
+
+fn run_program(
+    graph: &ModuleGraph,
+    resolutions: &Resolutions,
+) -> Result<(Value, Heap), Diagnostic> {
     let mut functions: HashMap<(usize, &str), &Function> = HashMap::new();
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
@@ -161,11 +207,14 @@ pub fn interpret(graph: &ModuleGraph, resolutions: &Resolutions) -> Result<Value
         resolutions,
         module: 0,
         scopes: Vec::new(),
+        depth: 0,
+        heap: Heap::default(),
     };
-    match interp.functions.get(&(0, "main")).copied() {
-        Some(main) => interp.call(main, 0, Vec::new(), Span::new(0, 0)),
-        None => Ok(Value::Unit),
-    }
+    let value = match interp.functions.get(&(0, "main")).copied() {
+        Some(main) => interp.call(main, 0, Vec::new(), Span::new(0, 0))?,
+        None => Value::Unit,
+    };
+    Ok((value, interp.heap))
 }
 
 enum Flow {
@@ -180,6 +229,9 @@ struct Interp<'a> {
     /// function — saved/restored around every call.
     module: usize,
     scopes: Vec<HashMap<String, Value>>,
+    /// Current language-call depth — bounded as language policy in `call`.
+    depth: usize,
+    heap: Heap,
 }
 
 impl<'a> Interp<'a> {
@@ -188,8 +240,18 @@ impl<'a> Interp<'a> {
         func: &'a Function,
         module: usize,
         args: Vec<Value>,
-        _span: Span,
+        span: Span,
     ) -> Result<Value, Diagnostic> {
+        // Calls, statements, and expressions all charge the one depth
+        // budget (see the policy block up top) — the diagnostic here just
+        // gets to name the function.
+        if self.depth >= MAX_EVAL_DEPTH {
+            return Err(Diagnostic::error(
+                format!("evaluation depth limit exceeded in '{}'", func.name),
+                span,
+            ));
+        }
+        self.depth += 1;
         let mut scope = HashMap::new();
         for (param, value) in func.params.iter().zip(args) {
             scope.insert(param.name.clone(), value);
@@ -200,6 +262,7 @@ impl<'a> Interp<'a> {
         let result = self.exec_block(&func.body);
         self.scopes.pop();
         self.module = prev_module;
+        self.depth -= 1;
         Ok(match result? {
             Flow::Return(v) => v,
             Flow::Normal => Value::Unit,
@@ -216,6 +279,13 @@ impl<'a> Interp<'a> {
     }
 
     fn exec_stmt(&mut self, stmt: &'a Stmt) -> Result<Flow, Diagnostic> {
+        self.charge(stmt.span())?;
+        let flow = self.exec_stmt_inner(stmt);
+        self.depth -= 1;
+        flow
+    }
+
+    fn exec_stmt_inner(&mut self, stmt: &'a Stmt) -> Result<Flow, Diagnostic> {
         match stmt {
             Stmt::Let { name, value, .. } => {
                 let v = self.eval(value)?;
@@ -258,8 +328,8 @@ impl<'a> Interp<'a> {
                 body,
                 span,
             } => {
-                let items = match self.eval(iterable)? {
-                    Value::Array(items) => items,
+                let id = match self.eval(iterable)? {
+                    Value::Array(id) => id,
                     other => {
                         return Err(Diagnostic::error(
                             format!(
@@ -271,11 +341,11 @@ impl<'a> Interp<'a> {
                     }
                 };
                 // Live iteration: the body may push or mutate, so length
-                // and elements are re-read each step (element cloned out
-                // before the body runs, releasing the borrow).
+                // and elements are re-read from the heap each step (element
+                // cloned out before the body runs).
                 let mut i = 0;
                 loop {
-                    let item = items.borrow().get(i).cloned();
+                    let item = self.heap.arrays[id].get(i).cloned();
                     let Some(item) = item else { break };
                     let mut scope = HashMap::from([(name.clone(), item)]);
                     if let Some(index) = index {
@@ -349,6 +419,26 @@ impl<'a> Interp<'a> {
     }
 
     fn eval(&mut self, expr: &'a Expr) -> Result<Value, Diagnostic> {
+        self.charge(expr.span())?;
+        let value = self.eval_inner(expr);
+        self.depth -= 1;
+        value
+    }
+
+    /// Statements and expressions recurse on the native stack, so every
+    /// level draws one unit from the shared depth budget.
+    fn charge(&mut self, span: Span) -> Result<(), Diagnostic> {
+        if self.depth >= MAX_EVAL_DEPTH {
+            return Err(Diagnostic::error(
+                "evaluation depth limit exceeded (recursion or nesting too deep)".to_string(),
+                span,
+            ));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn eval_inner(&mut self, expr: &'a Expr) -> Result<Value, Diagnostic> {
         match expr {
             Expr::Int(n, _) => Ok(Value::Int(*n)),
             Expr::Float(f, _) => Ok(Value::Float(*f)),
@@ -391,13 +481,25 @@ impl<'a> Interp<'a> {
                     // are defensive; the checker validated arities and types.
                     if name == syntax::BUILTIN_PRINT && args.len() == 1 {
                         let v = self.eval(&args[0])?;
-                        println!("{}", v.display());
+                        use std::io::Write;
+                        if let Err(e) = writeln!(std::io::stdout(), "{}", v.display(&self.heap)) {
+                            // A closed pipe means the consumer is done —
+                            // stop quietly (GNU convention). Anything else
+                            // (full disk, bad fd) is a real error.
+                            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                                std::process::exit(0);
+                            }
+                            return Err(Diagnostic::error(
+                                format!("cannot write output: {e}"),
+                                *span,
+                            ));
+                        }
                         return Ok(Value::Unit);
                     }
                     if name == syntax::BUILTIN_LEN && args.len() == 1 {
                         return match self.eval(&args[0])? {
-                            Value::Array(items) => {
-                                Ok(Value::Int(items.borrow().len() as i64))
+                            Value::Array(id) => {
+                                Ok(Value::Int(self.heap.arrays[id].len() as i64))
                             }
                             other => Err(Diagnostic::error(
                                 format!("'len' expects an array, found {}", other.type_name()),
@@ -409,8 +511,8 @@ impl<'a> Interp<'a> {
                         let array = self.eval(&args[0])?;
                         let value = self.eval(&args[1])?;
                         return match array {
-                            Value::Array(items) => {
-                                items.borrow_mut().push(value);
+                            Value::Array(id) => {
+                                self.heap.arrays[id].push(value);
                                 Ok(Value::Unit)
                             }
                             other => Err(Diagnostic::error(
@@ -445,7 +547,7 @@ impl<'a> Interp<'a> {
             }
             // The checker has already verified literals are complete and
             // fields exist, so the error arms here are defensive only.
-            Expr::StructLit { name, fields, .. } => {
+            Expr::StructLit { name, fields, span } => {
                 // Evaluate in written order (side effects), store sorted.
                 let mut vals = Vec::with_capacity(fields.len());
                 for (fname, fexpr) in fields {
@@ -456,10 +558,17 @@ impl<'a> Interp<'a> {
                     name: name.clone(),
                     fields: vals,
                 };
-                // A refstruct literal allocates one shared object; everyone
-                // who copies the handle aliases it.
+                // A refstruct literal allocates one shared heap object;
+                // everyone who copies the handle aliases it.
                 if self.resolutions.ref_structs[self.module].contains(name.as_str()) {
-                    Ok(Value::Ref(Rc::new(RefCell::new(value))))
+                    let Value::Struct { name, fields } = value else {
+                        unreachable!("struct literals evaluate to structs")
+                    };
+                    self.check_heap(*span)?;
+                    Ok(Value::Ref({
+                        self.heap.structs.push(StructObj { name, fields });
+                        self.heap.structs.len() - 1
+                    }))
                 } else {
                     Ok(value)
                 }
@@ -473,19 +582,22 @@ impl<'a> Interp<'a> {
                 // `?.` short-circuits on null; plain `.` never sees one
                 // (the checker rejects it).
                 Value::Null if *optional => Ok(Value::Null),
-                v => get_field(&v, name, *span),
+                v => self.get_field(&v, name, *span),
             },
-            Expr::ArrayLit { elements, .. } => {
+            Expr::ArrayLit { elements, span } => {
                 let mut items = Vec::with_capacity(elements.len());
                 for element in elements {
                     items.push(self.eval(element)?);
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(items))))
+                self.check_heap(*span)?;
+                self.heap.arrays.push(items);
+                Ok(Value::Array(self.heap.arrays.len() - 1))
             }
             Expr::Index { base, index, span } => {
-                let (items, i) = index_array(self.eval(base)?, self.eval(index)?, *span)?;
-                let v = items.borrow()[i].clone();
-                Ok(v)
+                let array = self.eval(base)?;
+                let index = self.eval(index)?;
+                let (id, i) = self.index_array(array, index, *span)?;
+                Ok(self.heap.arrays[id][i].clone())
             }
         }
     }
@@ -508,24 +620,94 @@ impl<'a> Interp<'a> {
             Expr::Field {
                 base, name, span, ..
             } => match self.eval(base)? {
-                // A refstruct hop mutates the shared object directly — the
-                // aliasing semantics, and the end of the write-back chain.
-                Value::Ref(cell) => set_field(&mut cell.borrow_mut(), name, v, *span),
-                // A value hop: set the field in the copy, write the copy
-                // back into its own place. (set_field rejects non-structs.)
-                mut owned => {
-                    set_field(&mut owned, name, v, *span)?;
-                    self.assign_place(base, owned)
+                // A refstruct hop mutates the shared heap object directly —
+                // the aliasing semantics, and the end of the write-back
+                // chain (the handle itself is unchanged).
+                Value::Ref(id) => {
+                    set_in_fields(&mut self.heap.structs[id].fields, name, v, *span)
                 }
+                // A value hop: set the field in the copy, write the copy
+                // back into its own place.
+                Value::Struct {
+                    name: struct_name,
+                    mut fields,
+                } => {
+                    set_in_fields(&mut fields, name, v, *span)?;
+                    self.assign_place(
+                        base,
+                        Value::Struct {
+                            name: struct_name,
+                            fields,
+                        },
+                    )
+                }
+                other => Err(Diagnostic::error(
+                    format!("type {} has no fields", other.type_name()),
+                    *span,
+                )),
             },
             Expr::Index { base, index, span } => {
-                let (items, i) = index_array(self.eval(base)?, self.eval(index)?, *span)?;
-                items.borrow_mut()[i] = v;
+                let array = self.eval(base)?;
+                let index = self.eval(index)?;
+                let (id, i) = self.index_array(array, index, *span)?;
+                self.heap.arrays[id][i] = v;
                 Ok(())
             }
             _ => Err(Diagnostic::error(
                 "invalid assignment target",
                 target.span(),
+            )),
+        }
+    }
+
+    /// The arena never frees, so runaway allocation must become a
+    /// sanctioned diagnostic (like the depth limit) instead of an OOM kill.
+    fn check_heap(&self, span: Span) -> Result<(), Diagnostic> {
+        if self.heap.cell_count() >= MAX_HEAP_CELLS {
+            return Err(Diagnostic::error(
+                format!("heap limit ({MAX_HEAP_CELLS} objects) exceeded"),
+                span,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reads a field out of a struct value, following refstruct handles —
+    /// the read half of `Expr::Field`. Clones the field out (the oracle
+    /// trades copies for simplicity).
+    fn get_field(&self, container: &Value, field: &str, span: Span) -> Result<Value, Diagnostic> {
+        match container {
+            Value::Struct { fields, .. } => get_in_fields(fields, field, span),
+            Value::Ref(id) => get_in_fields(&self.heap.structs[*id].fields, field, span),
+            other => Err(Diagnostic::error(
+                format!("type {} has no fields", other.type_name()),
+                span,
+            )),
+        }
+    }
+
+    /// Bounds-checked (cell, index) extraction shared by element reads and
+    /// writes. The value shapes are checker-guaranteed; the bounds aren't.
+    fn index_array(
+        &self,
+        array: Value,
+        index: Value,
+        span: Span,
+    ) -> Result<(usize, usize), Diagnostic> {
+        match (array, index) {
+            (Value::Array(id), Value::Int(i)) => {
+                let len = self.heap.arrays[id].len();
+                match usize::try_from(i).ok().filter(|&i| i < len) {
+                    Some(i) => Ok((id, i)),
+                    None => Err(Diagnostic::error(
+                        format!("index {i} out of bounds (length {len})"),
+                        span,
+                    )),
+                }
+            }
+            (a, b) => Err(Diagnostic::error(
+                format!("cannot index {} with {}", a.type_name(), b.type_name()),
+                span,
             )),
         }
     }
@@ -544,66 +726,28 @@ impl<'a> Interp<'a> {
     }
 }
 
-/// Bounds-checked array/index extraction shared by element reads and
-/// writes. The value/type shapes are checker-guaranteed; the bounds aren't.
-fn index_array(
-    array: Value,
-    index: Value,
+/// Field lookup/update on a sorted fields vec — shared by inline structs
+/// and heap objects. Error arms are defensive; the checker validated fields.
+fn get_in_fields(fields: &[(String, Value)], field: &str, span: Span) -> Result<Value, Diagnostic> {
+    fields
+        .iter()
+        .find(|(fname, _)| fname == field)
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| Diagnostic::error(format!("no field '{field}'"), span))
+}
+
+fn set_in_fields(
+    fields: &mut [(String, Value)],
+    field: &str,
+    v: Value,
     span: Span,
-) -> Result<(SharedArray, usize), Diagnostic> {
-    match (array, index) {
-        (Value::Array(items), Value::Int(i)) => {
-            let len = items.borrow().len();
-            match usize::try_from(i).ok().filter(|&i| i < len) {
-                Some(i) => Ok((items, i)),
-                None => Err(Diagnostic::error(
-                    format!("index {i} out of bounds (length {len})"),
-                    span,
-                )),
-            }
+) -> Result<(), Diagnostic> {
+    match fields.iter_mut().find(|(fname, _)| fname == field) {
+        Some((_, slot)) => {
+            *slot = v;
+            Ok(())
         }
-        (a, b) => Err(Diagnostic::error(
-            format!("cannot index {} with {}", a.type_name(), b.type_name()),
-            span,
-        )),
-    }
-}
-
-/// Reads a field out of a struct value, following refstruct handles — the
-/// read half of `Expr::Field`. Clones the field out (the oracle trades
-/// copies for simplicity).
-fn get_field(container: &Value, field: &str, span: Span) -> Result<Value, Diagnostic> {
-    match container {
-        Value::Struct { fields, .. } => fields
-            .iter()
-            .find(|(fname, _)| fname == field)
-            .map(|(_, v)| v.clone())
-            .ok_or_else(|| Diagnostic::error(format!("no field '{field}'"), span)),
-        Value::Ref(cell) => get_field(&cell.borrow(), field, span),
-        other => Err(Diagnostic::error(
-            format!("type {} has no fields", other.type_name()),
-            span,
-        )),
-    }
-}
-
-/// Sets a field inside a (borrowed) struct value — the write half of a
-/// field-chain hop in `assign_place`.
-fn set_field(container: &mut Value, field: &str, v: Value, span: Span) -> Result<(), Diagnostic> {
-    match container {
-        Value::Struct { fields, .. } => {
-            match fields.iter_mut().find(|(fname, _)| fname == field) {
-                Some((_, slot)) => {
-                    *slot = v;
-                    Ok(())
-                }
-                None => Err(Diagnostic::error(format!("no field '{field}'"), span)),
-            }
-        }
-        other => Err(Diagnostic::error(
-            format!("type {} has no fields", other.type_name()),
-            span,
-        )),
+        None => Err(Diagnostic::error(format!("no field '{field}'"), span)),
     }
 }
 
@@ -724,6 +868,11 @@ mod tests {
     use crate::{check::check, lexer::lex, parser::parse};
 
     fn run(src: &str) -> Result<Value, Diagnostic> {
+        run_full(src).map(|(value, _)| value)
+    }
+
+    /// Like `run`, but keeps the heap for rendering assertions.
+    fn run_full(src: &str) -> Result<(Value, Heap), Diagnostic> {
         let (tokens, ld) = lex(src);
         assert!(ld.is_empty(), "lex: {ld:?}");
         let (ast, pd) = parse(&tokens);
@@ -757,7 +906,7 @@ mod tests {
         assert!(fd.is_empty(), "front-end: {fd:?}");
         let (res, cd) = check(&graph);
         assert!(cd.is_empty(), "check: {cd:?}");
-        interpret(&graph, &res)
+        interpret(&graph, &res).map(|(value, _)| value)
     }
 
     #[test]
@@ -1302,35 +1451,36 @@ fun main(): Node {
     a.next = a;
     return a;
 }";
-        let rendered = run(program).unwrap().render();
+        let (value, heap) = run_full(program).unwrap();
+        let rendered = value.render(&heap);
         assert!(rendered.contains("Node") && rendered.contains("..."), "{rendered}");
         assert!(rendered.len() < 500, "unbounded: {} bytes", rendered.len());
     }
 
     #[test]
     fn scalar_rendering_matches_debug() {
-        assert_eq!(Value::Int(55).render(), "Int(55)");
-        assert_eq!(Value::Bool(true).render(), "Bool(true)");
+        let heap = Heap::default();
+        assert_eq!(Value::Int(55).render(&heap), "Int(55)");
+        assert_eq!(Value::Bool(true).render(&heap), "Bool(true)");
     }
 
     #[test]
     fn display_shows_user_values_not_enum_internals() {
-        let array = Value::Array(Rc::new(RefCell::new(vec![
-            Value::Int(1),
-            Value::Str("x".into()),
-            Value::Null,
-        ])));
-        assert_eq!(array.display(), "[1, x, null]");
+        let mut heap = Heap::default();
+        heap.arrays.push(vec![Value::Int(1), Value::Str("x".into()), Value::Null]);
+        let array = Value::Array(0);
+        assert_eq!(array.display(&heap), "[1, x, null]");
         let s = Value::Struct {
             name: "P".into(),
             fields: vec![("x".into(), Value::Int(1))],
         };
-        assert_eq!(s.display(), "P { x: 1 }");
-        let r = Value::Ref(Rc::new(RefCell::new(Value::Struct {
+        assert_eq!(s.display(&heap), "P { x: 1 }");
+        heap.structs.push(StructObj {
             name: "N".into(),
             fields: vec![("v".into(), Value::Bool(true))],
-        })));
-        assert_eq!(r.display(), "N { v: true }");
+        });
+        let r = Value::Ref(0);
+        assert_eq!(r.display(&heap), "N { v: true }");
     }
 
     /// The kitchen-sink program: a binary search tree combining refstruct
@@ -1404,6 +1554,76 @@ fun main(): bool {
     return same(a) == a;
 }";
         assert_eq!(run(program), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn deep_expressions_with_recursion_are_a_diagnostic_not_a_crash() {
+        // Expression nesting recurses natively too — it must draw from the
+        // same depth budget as calls instead of overflowing the stack.
+        let program = "\
+fun down(n: int): int {
+    if n == 0 { return 0; }
+    return 0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + down(n - 1))))))))));
+}
+fun main(): int { return down(100000); }";
+        let result = run(program);
+        assert!(
+            result.as_ref().is_err_and(|e| e.message.contains("depth limit")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn runaway_allocation_is_a_diagnostic_not_an_oom() {
+        // Loop temporaries land in the arena; a cap turns runaway
+        // allocation into a sanctioned diagnostic instead of an OOM kill.
+        let program = "\
+fun main() {
+    var i: int = 0;
+    while i < 400000 {
+        const xs: int[][] = [[1], [2], [3], [4]];
+        i = i + 1;
+    }
+}";
+        let result = run(program);
+        assert!(
+            result.as_ref().is_err_and(|e| e.message.contains("heap limit")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn ref_hops_consume_render_depth() {
+        // A two-ref-field cycle must stay bounded like the Rc oracle did
+        // (hop + struct each cost a level), not fan out exponentially.
+        let program = "\
+refstruct T { a: T?, b: T? }
+fun main(): T {
+    const t: T = T { a: null, b: null };
+    t.a = t;
+    t.b = t;
+    return t;
+}";
+        let (value, heap) = run_full(program).unwrap();
+        let rendered = value.render(&heap);
+        assert!(rendered.len() < 600, "fan-out: {} bytes", rendered.len());
+    }
+
+    #[test]
+    fn runaway_recursion_is_a_diagnostic_not_a_crash() {
+        let result = run("fun f(): int { return f(); }\nfun main(): int { return f(); }");
+        assert!(
+            result.as_ref().is_err_and(|e| e.message.contains("depth limit")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn deep_but_bounded_recursion_still_runs() {
+        let program = "\
+fun down(n: int): int { if n == 0 { return 0; } return down(n - 1); }
+fun main(): int { return down(4000); }";
+        assert_eq!(run(program), Ok(Value::Int(0)));
     }
 
     #[test]

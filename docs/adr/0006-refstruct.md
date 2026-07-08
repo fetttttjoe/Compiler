@@ -38,9 +38,9 @@ TypeScript's silent everything-is-a-reference.
 6. **Plumbing.** `by_ref` on `ast::Struct`/`check::StructType`;
    `Resolutions.ref_structs` (per-module visible refstruct names) tells the
    interpreter — and later codegen — which literals allocate. The
-   interpreter models handles as `Rc<RefCell<_>>` with a manual `PartialEq`
-   (identity for refs); place assignment is read-modify-write (value hops
-   clone, ref hops mutate the shared cell).
+   interpreter models handles as arena indices (`Rc<RefCell<_>>` originally;
+   superseded by ADR 0011) with identity equality; place assignment is
+   read-modify-write (value hops clone, ref hops mutate the heap object).
 
 ## Consequences
 

@@ -15,12 +15,12 @@ mod types;
 use ast::Item;
 use diagnostic::Diagnostic;
 use source::SourceMap;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [entry] = args.as_slice() else {
-        eprintln!("usage: compiler <entry.ys>");
+        let _ = writeln!(std::io::stderr(), "usage: compiler <entry.ys>");
         std::process::exit(2);
     };
 
@@ -48,7 +48,17 @@ fn main() {
     }
 
     match interpreter::interpret(&graph, &resolutions) {
-        Ok(value) => println!("=> {}", value.render()),
+        Ok((value, heap)) => {
+            use std::io::Write;
+            if let Err(e) = writeln!(std::io::stdout(), "=> {}", value.render(&heap)) {
+                // A closed pipe is fine (the consumer left); losing the
+                // result any other way must not look like success.
+                if e.kind() != std::io::ErrorKind::BrokenPipe {
+                    print_error(&format!("cannot write output: {e}"));
+                    std::process::exit(1);
+                }
+            }
+        }
         Err(diag) => exit_on_errors(&[diag], &map),
     }
 }
@@ -71,7 +81,7 @@ fn print_error(message: &str) {
     } else {
         ("", "")
     };
-    eprintln!("{sev}error{reset}: {message}");
+    let _ = writeln!(std::io::stderr(), "{sev}error{reset}: {message}");
 }
 
 /// Renders every diagnostic to stderr and exits nonzero — no-op when empty.
@@ -81,7 +91,7 @@ fn exit_on_errors(diags: &[Diagnostic], map: &SourceMap) {
     }
     let color = use_color();
     for diag in diags {
-        eprintln!("{}", diag.render_styled(map, color));
+        let _ = writeln!(std::io::stderr(), "{}", diag.render_styled(map, color));
     }
     std::process::exit(1);
 }

@@ -216,6 +216,20 @@ impl UnOp {
     }
 }
 
+impl Stmt {
+    pub fn span(&self) -> Span {
+        match self {
+            Stmt::Let { span, .. }
+            | Stmt::Assign { span, .. }
+            | Stmt::Return { span, .. }
+            | Stmt::If { span, .. }
+            | Stmt::While { span, .. }
+            | Stmt::For { span, .. } => *span,
+            Stmt::Expr(e) => e.span(),
+        }
+    }
+}
+
 impl Expr {
     /// Can this expression be assigned to? Places are variables, plain
     /// field chains, and index expressions rooted at one. `?.` links are
