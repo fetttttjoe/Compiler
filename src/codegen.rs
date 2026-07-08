@@ -36,9 +36,10 @@ pub(crate) struct Strings {
 }
 
 impl Strings {
-    pub(crate) fn intern(&mut self, text: &str) -> usize {
+    /// Returns the descriptor's symbol — the label format lives only here.
+    pub(crate) fn intern(&mut self, text: &str) -> String {
         if let Some(&id) = self.ids.get(text) {
-            return id;
+            return format!(".Lsd{id}");
         }
         let id = self.ids.len();
         let _ = writeln!(self.bytes, ".Lsb{id}:");
@@ -52,7 +53,7 @@ impl Strings {
             text.len()
         );
         self.ids.insert(text.to_string(), id);
-        id
+        format!(".Lsd{id}")
     }
 }
 

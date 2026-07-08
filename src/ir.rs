@@ -11,7 +11,7 @@
 //! policy: the interpreter diagnoses them, and the differential harness
 //! only diffs programs the interpreter runs cleanly.
 
-use crate::ast::{BinOp, Expr, Function, Stmt, TypeAnn, UnOp};
+use crate::ast::{BinOp, Expr, Function, Stmt, UnOp};
 use crate::check::Resolutions;
 use crate::codegen::{label_of, Strings};
 use crate::diagnostic::Diagnostic;
@@ -29,6 +29,19 @@ const FUEL: usize = 64;
 
 fn unsupported(what: &str, span: Span) -> Diagnostic {
     Diagnostic::error(format!("not yet compilable: {what}"), span)
+}
+
+/// The setcc suffix for a signed integer comparison — one owner, used by
+/// both the register and the immediate emission paths.
+fn cc(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Eq => "e",
+        BinOp::Ne => "ne",
+        BinOp::Lt => "l",
+        BinOp::Le => "le",
+        BinOp::Gt => "g",
+        _ => "ge",
+    }
 }
 
 // ---- Value kinds ----------------------------------------------------------
@@ -264,7 +277,7 @@ pub fn function(
     res: &Resolutions,
     strings: &mut Strings,
 ) -> Result<String, Diagnostic> {
-    let sig = res.sigs[&(module, f.name.clone())].clone();
+    let sig = &res.sigs[&(module, f.name.clone())];
     let ret_kind = match &sig.ret {
         Type::Unit => Kind::Word,
         t => kind_of(t, res, FUEL).ok_or_else(|| unsupported("this return type", f.span))?,
@@ -383,10 +396,15 @@ impl Lowerer<'_> {
             Stmt::Let {
                 name, value, ty, ..
             } => {
-                if let Some(ann) = ty {
-                    if self.ann_ok(ann).is_none() {
-                        return Err(unsupported("bindings of this type", stmt.span()));
-                    }
+                if ty.is_some() {
+                    // The checker resolved the annotation; gate on that.
+                    let declared = self
+                        .res
+                        .let_types
+                        .get(&stmt.span())
+                        .ok_or_else(|| unsupported("bindings of this type", stmt.span()))?;
+                    kind_of(declared, self.res, FUEL)
+                        .ok_or_else(|| unsupported("bindings of this type", stmt.span()))?;
                 }
                 let kind = self.kind(value, stmt.span())?;
                 let v = self.expr(value)?;
@@ -570,27 +588,6 @@ impl Lowerer<'_> {
         Ok(())
     }
 
-    /// The `TypeAnn` gate for `let` annotations, resolved through this
-    /// module's names (mirrors `kind_of`; `None` = not compilable).
-    fn ann_ok(&self, ty: &TypeAnn) -> Option<Kind> {
-        match ty {
-            TypeAnn::Int | TypeAnn::Bool | TypeAnn::Float => Some(Kind::Word),
-            TypeAnn::Str => Some(Kind::Str),
-            TypeAnn::Array(inner) => (self.ann_ok(inner)? == Kind::Word).then_some(Kind::Word),
-            TypeAnn::Optional(inner) => match inner.as_ref() {
-                TypeAnn::Named(n) => self.res.ref_structs[self.module]
-                    .contains(n)
-                    .then_some(Kind::Word),
-                TypeAnn::Array(_) => self.ann_ok(inner),
-                _ => None,
-            },
-            TypeAnn::Named(n) => {
-                let key = self.res.types[self.module].get(n)?;
-                kind_of(&Type::Struct(key.0, key.1.clone()), self.res, FUEL)
-            }
-        }
-    }
-
     fn expr(&mut self, expr: &Expr) -> Result<V, Diagnostic> {
         match expr {
             Expr::Int(n, _) => Ok(self.const_word(*n)),
@@ -607,8 +604,8 @@ impl Lowerer<'_> {
             // A literal's descriptor and bytes are both static — strings
             // are immutable, so every use shares one rodata object.
             Expr::Str(text, _) => {
-                let id = self.strings.intern(text);
-                Ok(self.lea_sym(format!(".Lsd{id}")))
+                let sym = self.strings.intern(text);
+                Ok(self.lea_sym(sym))
             }
             Expr::Ident(name, span) => self
                 .lookup(name)
@@ -793,7 +790,8 @@ impl Lowerer<'_> {
                     return Err(unsupported("this struct literal", *span));
                 };
                 let key = (*dm, dn.clone());
-                let def = self.res.structs[&key].clone();
+                let res = self.res;
+                let def = &res.structs[&key];
                 let kinds: Vec<Kind> = def
                     .fields
                     .iter()
@@ -1019,7 +1017,9 @@ impl Lowerer<'_> {
         if !float {
             if let Expr::Int(n, _) = rhs {
                 let imm_ok = i32::try_from(*n).is_ok();
-                let pow2 = *n >= 2 && (*n & (*n - 1)) == 0;
+                // k > 31 would put the 2^k - 1 bias outside leaq's 32-bit
+                // displacement; those divisors take the magic path.
+                let pow2 = *n >= 2 && (*n & (*n - 1)) == 0 && n.trailing_zeros() <= 31;
                 match op {
                     BinOp::Div | BinOp::Rem if pow2 => {
                         let l = self.expr(lhs)?;
@@ -1115,7 +1115,8 @@ impl Lowerer<'_> {
         let Some(key) = self.res.functions[self.module].get(name).cloned() else {
             return self.builtin(name, args, span);
         };
-        let sig = self.res.sigs[&key].clone();
+        let res = self.res;
+        let sig = &res.sigs[&key];
         let ret_kind = match &sig.ret {
             Type::Unit => Kind::Word,
             t => kind_of(t, self.res, FUEL)
@@ -1329,15 +1330,20 @@ fn intervals(insts: &[Inst], vregs: usize) -> Vec<Interval> {
             label_pos.insert(*l, i);
         }
     }
-    let succs = |i: usize| -> Vec<usize> {
-        match &insts[i] {
+    // The instruction list is immutable during the fixpoint: resolve
+    // uses/defs and successors once, not once per pass.
+    let ud: Vec<(Vec<V>, Option<V>)> = insts.iter().map(uses_defs).collect();
+    let succ: Vec<Vec<usize>> = insts
+        .iter()
+        .enumerate()
+        .map(|(i, inst)| match inst {
             Inst::Jmp(l) => vec![label_pos[l]],
             Inst::BrZero(_, l) => vec![i + 1, label_pos[l]],
             Inst::Ret(_) => vec![],
             _ if i + 1 < insts.len() => vec![i + 1],
             _ => vec![],
-        }
-    };
+        })
+        .collect();
 
     let mut live_in: Vec<Vec<u64>> = vec![vec![0; words]; insts.len()];
     let mut out = vec![0u64; words];
@@ -1346,12 +1352,12 @@ fn intervals(insts: &[Inst], vregs: usize) -> Vec<Interval> {
         changed = false;
         for i in (0..insts.len()).rev() {
             out.iter_mut().for_each(|w| *w = 0);
-            for s in succs(i) {
-                for (o, w) in out.iter_mut().zip(&live_in[s]) {
+            for s in &succ[i] {
+                for (o, w) in out.iter_mut().zip(&live_in[*s]) {
                     *o |= w;
                 }
             }
-            let (uses, def) = uses_defs(&insts[i]);
+            let (uses, def) = &ud[i];
             if let Some(d) = def {
                 out[d / 64] &= !(1 << (d % 64));
             }
@@ -1377,9 +1383,8 @@ fn intervals(insts: &[Inst], vregs: usize) -> Vec<Interval> {
         ivs[v].start = ivs[v].start.min(i);
         ivs[v].end = ivs[v].end.max(i);
     };
-    for (i, inst) in insts.iter().enumerate() {
-        let (uses, def) = uses_defs(inst);
-        for v in uses.into_iter().chain(def) {
+    for (i, (uses, def)) in ud.iter().enumerate() {
+        for v in uses.iter().copied().chain(def.iter().copied()) {
             touch(v, i, &mut ivs);
         }
         for (w, word) in live_in[i].iter().enumerate() {
@@ -1676,18 +1681,11 @@ fn emit(name: &str, module: usize, nparams: usize, lo: Lowerer) -> String {
                     }
                 }
                 _ => {
-                    let cc = match op {
-                        BinOp::Eq => "e",
-                        BinOp::Ne => "ne",
-                        BinOp::Lt => "l",
-                        BinOp::Le => "le",
-                        BinOp::Gt => "g",
-                        _ => "ge",
-                    };
                     let _ = writeln!(
                         a,
-                        "\tcmpq ${imm}, {}\n\tset{cc} %al\n\tmovzbq %al, %rax\n\tmovq %rax, {}",
+                        "\tcmpq ${imm}, {}\n\tset{} %al\n\tmovzbq %al, %rax\n\tmovq %rax, {}",
                         at(*lhs),
+                        cc(*op),
                         at(*dst)
                     );
                 }
@@ -1778,18 +1776,11 @@ fn emit(name: &str, module: usize, nparams: usize, lo: Lowerer) -> String {
                         }
                     }
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                        let cc = match op {
-                            BinOp::Eq => "e",
-                            BinOp::Ne => "ne",
-                            BinOp::Lt => "l",
-                            BinOp::Le => "le",
-                            BinOp::Gt => "g",
-                            _ => "ge",
-                        };
                         let _ = writeln!(
                             a,
-                            "\tcmpq {}, %rax\n\tset{cc} %al\n\tmovzbq %al, %rax",
-                            at(*rhs)
+                            "\tcmpq {}, %rax\n\tset{} %al\n\tmovzbq %al, %rax",
+                            at(*rhs),
+                            cc(*op)
                         );
                     }
                     BinOp::And | BinOp::Or | BinOp::Coalesce => {

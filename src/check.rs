@@ -29,9 +29,6 @@ pub struct Resolutions {
     /// to its base struct, field index, and field type. Spans are
     /// file-global offsets, so they key uniquely across the whole program.
     pub field_slots: HashMap<Span, FieldSlot>,
-    /// Per module: every visible type name → its defining (module, name),
-    /// so codegen can resolve `Named` annotations to `structs` entries.
-    pub types: Vec<Alias>,
     /// Every function's resolved signature by (defining module, name).
     pub sigs: HashMap<(usize, String), FnSig>,
     /// The type of every checked expression, keyed by its span (spans are
@@ -39,6 +36,9 @@ pub struct Resolutions {
     /// applies — which is exactly what codegen wants. Codegen never
     /// re-derives a type.
     pub expr_types: HashMap<Span, Type>,
+    /// Each annotated `let`'s resolved declared type, keyed by the
+    /// statement span — so codegen never resolves an annotation itself.
+    pub let_types: HashMap<Span, Type>,
 }
 
 /// A resolved field access (see `Resolutions::field_slots`).
@@ -182,6 +182,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
     let paths: Vec<&str> = graph.modules.iter().map(|m| m.path.as_str()).collect();
     let mut field_slots = HashMap::new();
     let mut expr_types = HashMap::new();
+    let mut let_types = HashMap::new();
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             if let Item::Function(f) = item {
@@ -198,6 +199,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                     ret: Type::Unit,
                     field_slots: &mut field_slots,
                     expr_types: &mut expr_types,
+                    let_types: &mut let_types,
                 };
                 checker.check_function(f);
             }
@@ -236,9 +238,9 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
             ref_structs,
             structs,
             field_slots,
-            types: ty_aliases,
             sigs,
             expr_types,
+            let_types,
         },
         diags,
     )
@@ -321,6 +323,7 @@ struct Checker<'a> {
     /// `Resolutions::field_slots` / `struct_lits`).
     field_slots: &'a mut HashMap<Span, FieldSlot>,
     expr_types: &'a mut HashMap<Span, Type>,
+    let_types: &'a mut HashMap<Span, Type>,
 }
 
 impl<'a> Checker<'a> {
@@ -458,6 +461,9 @@ impl<'a> Checker<'a> {
                 let ty = match ty {
                     Some(ann) => {
                         let declared = resolve_type(ann, self.ty_alias, *span, self.diagnostics);
+                        // Codegen gates bindings on this resolved type —
+                        // never on the raw annotation.
+                        self.let_types.insert(*span, declared.clone());
                         if !self.check_literal_against(value, &declared) {
                             let init_ty = self.type_of_expr(value);
                             if !fits(&init_ty, &declared) {

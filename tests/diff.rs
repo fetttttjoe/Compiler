@@ -133,6 +133,23 @@ fn constant_division_across_divisors_and_extremes() {
 }
 
 #[test]
+fn huge_power_of_two_divisors_still_compile() {
+    // 2^k divisors with k > 31 can't ride the leaq-bias shift sequence
+    // (32-bit displacement limit); they must take the magic path.
+    diff(
+        "hugepow2",
+        "fun main(): int {
+            var x: int = 987654321987;
+            var r: int = (x / 4294967296) % 251;
+            r = r + (x % 4294967296) % 251;
+            r = r + ((0 - x) / 4611686018427387904) % 251;
+            r = r + ((0 - x) % 4294967296) % 251;
+            return r % 251;
+        }",
+    );
+}
+
+#[test]
 fn division_truncates_toward_zero() {
     diff("div", "fun main(): int { return -7 / 2; }");
 }

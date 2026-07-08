@@ -4,10 +4,11 @@ through both engines; stdout and exit codes must agree byte-for-byte.
 
 Usage: tools/fuzz.py [seed_start] [seed_end]   (default 0..200)
 
-Every generated program is int-returning, print-happy, and uses the
-compilable surface (ints, bools, floats via comparisons, arrays,
-refstructs, value structs, strings, optionals, calls). A divergence
-saves the program next to this script and exits nonzero.
+The generator currently covers ints, bools, int arrays with for-in and
+push, control flow, and int->int helper calls. Structs, strings, floats,
+and optionals are NOT generated yet — cover those manually (or extend
+the generator) when touching their lowering. A divergence saves the
+program next to this script and exits nonzero.
 """
 
 import random
@@ -91,11 +92,11 @@ class Gen:
     def program(self):
         r = self.r
         helpers = []
-        names = []
+        names = []  # (name, arity)
         for _ in range(r.randint(0, 2)):
             fname = self.name("f")
-            names.append(fname)
             params = [self.name("p") for _ in range(r.randint(1, 3))]
+            names.append((fname, len(params)))
             sig = ", ".join(f"{p}: int" for p in params)
             body = self.body(list(params))
             ret = self.int_expr(list(params))
@@ -103,8 +104,8 @@ class Gen:
         main_vars = []
         main_body = self.body(main_vars)
         calls = " ".join(
-            f"print({n}({', '.join(str(r.randint(-9, 9)) for _ in range(c))}));"
-            for n, c in [(n, helpers[i].count(": int") - 1) for i, n in enumerate(names)]
+            f"print({n}({', '.join(str(r.randint(-9, 9)) for _ in range(arity))}));"
+            for n, arity in names
         )
         arr = self.name("xs")
         arr_part = (
