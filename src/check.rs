@@ -3,113 +3,11 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{BinOp, Expr, Function, Item, Stmt, TypeAnn, UnOp};
 use crate::diagnostic::Diagnostic;
 use crate::modules::ModuleGraph;
+use crate::narrow::{body_effects, covers, null_checks, NarrowFrame};
 use crate::span::Span;
 use crate::syntax;
+use crate::types::{eq_comparable, fits, is_numeric, poisoned, unconstrained, FnSig, StructType, Type};
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Type {
-    Int,
-    Float,
-    Bool,
-    Str,
-    /// A struct type identified by (defining module, name) — same-named
-    /// structs in different modules are distinct types.
-    Struct(usize, String),
-    /// `T?` — T or null.
-    Optional(Box<Type>),
-    /// `T[]` — growable array, reference semantics (aliased, identity
-    /// equality), like refstruct.
-    Array(Box<Type>),
-    /// The type of the `null` literal; fits only into `T?` slots.
-    Null,
-    Unit,
-    /// Poisoned recovery: an expression that already produced a diagnostic.
-    /// Fits everything and compares with everything (structurally — a
-    /// `T?`/`T[]` wrapper keeps the property), so one mistake yields one
-    /// error instead of a cascade. Never printed in messages.
-    Error,
-    /// The element type of an empty array literal: nothing constrains it
-    /// yet. Unlike `Error`, no diagnostic exists — it fits only array
-    /// shapes, and a binding can't keep it (annotation required).
-    Unknown,
-}
-
-/// Structurally poisoned: a diagnostic was already emitted somewhere inside
-/// this type, so every further check stays silent.
-fn poisoned(t: &Type) -> bool {
-    match t {
-        Type::Error => true,
-        Type::Optional(inner) | Type::Array(inner) => poisoned(inner),
-        _ => false,
-    }
-}
-
-/// An element type that imposes no constraint yet — `[]`, or nested empties
-/// like `[[]]`.
-fn unconstrained(t: &Type) -> bool {
-    match t {
-        Type::Unknown => true,
-        Type::Array(inner) => unconstrained(inner),
-        _ => false,
-    }
-}
-
-impl Type {
-    pub fn name(&self) -> String {
-        match self {
-            Type::Int => "int".to_string(),
-            Type::Float => "float".to_string(),
-            Type::Bool => "bool".to_string(),
-            Type::Str => "string".to_string(),
-            Type::Struct(_, n) => n.clone(),
-            Type::Optional(inner) => format!("{}?", inner.name()),
-            Type::Array(inner) if unconstrained(inner) => "[]".to_string(),
-            Type::Array(inner) => format!("{}[]", inner.name()),
-            Type::Null => "null".to_string(),
-            Type::Unit => "unit".to_string(),
-            Type::Error => "<error>".to_string(),
-            Type::Unknown => "unknown".to_string(),
-        }
-    }
-}
-
-/// Can a value of type `value` be stored where `target` is expected?
-/// Exact match, or `T`/`null` into `T?`. Never an implicit conversion —
-/// optionality is spelled in the target's type.
-fn fits(value: &Type, target: &Type) -> bool {
-    if value == target || poisoned(value) || poisoned(target) {
-        return true;
-    }
-    match (value, target) {
-        // An unconstrained target (an empty literal's element slot)
-        // accepts anything; only transient literals ever have it — a
-        // binding can't keep `unknown` (annotation required at `let`).
-        (_, Type::Unknown) => true,
-        (_, Type::Optional(inner)) => {
-            matches!(value, Type::Null) || fits(value, inner)
-        }
-        // Arrays are invariant — int[] into int?[] would let an alias push
-        // null into the int[] — except unconstrained elements on either
-        // side: `[]` fits any array slot and accepts any element type.
-        (Type::Array(v), Type::Array(t)) => {
-            unconstrained(v) || unconstrained(t) || v == t
-        }
-        _ => false,
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct FnSig {
-    pub params: Vec<Type>,
-    pub ret: Type,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct StructType {
-    pub fields: Vec<(String, Type)>,
-    /// True for `refstruct` declarations (reference semantics).
-    pub by_ref: bool,
-}
 
 /// A per-module view: visible name → the (module, name) that defines it.
 type Alias = HashMap<String, (usize, String)>;
@@ -361,29 +259,6 @@ struct VarInfo {
     mutable: bool,
 }
 
-/// One narrowing region: facts proven non-null on entry, plus places whose
-/// facts are hidden for the region's duration because a new binding shadows
-/// the name — hiding ends automatically when the frame pops.
-struct NarrowFrame {
-    facts: HashSet<String>,
-    shadowed: HashSet<String>,
-}
-
-impl NarrowFrame {
-    fn new(facts: HashSet<String>) -> NarrowFrame {
-        NarrowFrame {
-            facts,
-            shadowed: HashSet::new(),
-        }
-    }
-}
-
-/// Is `path` the same place as `prefix`, or reached through it
-/// (`covers("cur", "cur.left")` is true; `covers("cur", "curx")` is not)?
-fn covers(prefix: &str, path: &str) -> bool {
-    path == prefix || (path.starts_with(prefix) && path[prefix.len()..].starts_with('.'))
-}
-
 struct Checker<'a> {
     module: usize,
     paths: &'a [&'a str],
@@ -484,6 +359,25 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Facts from outside a loop go stale on iteration 2 if the body can
+    /// invalidate them (only the loop's own condition is re-checked each
+    /// pass) — drop everything the body can touch before checking it. The
+    /// condition's own facts are pushed fresh afterwards and stay safe.
+    fn drop_loop_invalidated_facts(&mut self, body: &[Stmt]) {
+        if !self.has_facts() {
+            return;
+        }
+        let mut assigned = HashSet::new();
+        let mut kills_fields = false;
+        body_effects(body, &mut assigned, &mut kills_fields);
+        for path in &assigned {
+            self.unnarrow(path);
+        }
+        if kills_fields {
+            self.unnarrow_field_paths();
+        }
+    }
+
     /// Field-path facts don't survive calls or writes through fields — any
     /// of those can reach the checked object through an alias. Bare
     /// variable facts do survive: a callee can't rebind the caller's locals.
@@ -515,63 +409,55 @@ impl<'a> Checker<'a> {
                 value,
                 span,
             } => {
-                let init_ty = self.type_of_expr(value);
                 let ty = match ty {
                     Some(ann) => {
                         let declared =
                             resolve_type(ann, self.ty_alias, *span, self.diagnostics);
-                        if !fits(&init_ty, &declared) {
-                            self.error(
-                                format!(
-                                    "'{name}' is declared as {} but initialized with {}",
-                                    self.type_name(&declared),
-                                    self.type_name(&init_ty)
-                                ),
-                                *span,
-                            );
+                        if !self.check_literal_against(value, &declared) {
+                            let init_ty = self.type_of_expr(value);
+                            if !fits(&init_ty, &declared) {
+                                self.error(
+                                    format!(
+                                        "'{name}' is declared as {} but initialized with {}",
+                                        self.type_name(&declared),
+                                        self.type_name(&init_ty)
+                                    ),
+                                    *span,
+                                );
+                            }
                         }
                         declared
                     }
-                    None if unconstrained(&init_ty) => {
+                    // Every binding declares its type (ADR 0010); the
+                    // annotation error leads, then the initializer is still
+                    // typed for its own errors.
+                    None => {
                         self.diagnostics.push(
                             Diagnostic::error(
-                                format!("cannot infer an element type for '{name}' from '[]'"),
+                                format!("missing type annotation for '{name}'"),
                                 *span,
                             )
                             .with_help(format!(
-                                "add an annotation, e.g. 'var {name}: int[] = [];'"
+                                "every binding declares its type: 'var {name}: <type> = …;'"
                             )),
                         );
-                        Type::Error // recovery: already reported
+                        let init_ty = self.type_of_expr(value);
+                        if init_ty == Type::Null || unconstrained(&init_ty) {
+                            Type::Error // recovery: nothing usable to bind
+                        } else {
+                            init_ty // best-effort recovery
+                        }
                     }
-                    None if init_ty == Type::Null => {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                format!("cannot infer a type for '{name}' from 'null'"),
-                                *span,
-                            )
-                            .with_help(format!(
-                                "add an annotation, e.g. 'var {name}: T? = null;'"
-                            )),
-                        );
-                        Type::Error // recovery: already reported
-                    }
-                    None => init_ty,
                 };
-                self.scopes.last_mut().unwrap().insert(
-                    name.clone(),
-                    VarInfo {
-                        ty,
-                        mutable: *mutable,
-                    },
-                );
-                // A new binding hides any narrowing of the same name for
-                // the rest of this block; outer facts return when it ends.
-                if let Some(frame) = self.nonnull.last_mut() {
-                    frame.shadowed.insert(name.clone());
-                }
+                self.bind(name, ty, *mutable);
             }
             Stmt::Return { value, span } => {
+                let ret = self.ret.clone();
+                if let Some(e) = value {
+                    if self.check_literal_against(e, &ret) {
+                        return;
+                    }
+                }
                 let ty = match value {
                     Some(e) => self.type_of_expr(e),
                     None => Type::Unit,
@@ -603,29 +489,79 @@ impl<'a> Checker<'a> {
             Stmt::While { cond, body, .. } => {
                 self.check_condition("while", cond);
                 let (if_true, _) = null_checks(cond);
-                // Facts from OUTSIDE the loop go stale on iteration 2 if
-                // the body can invalidate them (only the loop's own
-                // condition is re-checked each pass). Drop what the body
-                // can touch before checking it; the condition's own facts
-                // are pushed fresh and stay safe.
-                if self.has_facts() {
-                    let mut assigned = HashSet::new();
-                    let mut kills_fields = false;
-                    body_effects(body, &mut assigned, &mut kills_fields);
-                    for path in &assigned {
-                        self.unnarrow(path);
-                    }
-                    if kills_fields {
-                        self.unnarrow_field_paths();
-                    }
-                }
+                self.drop_loop_invalidated_facts(body);
                 self.check_block_narrowed(body, if_true);
+            }
+            Stmt::For {
+                index,
+                name,
+                iterable,
+                body,
+                span,
+            } => {
+                if index.as_deref() == Some(name.as_str()) {
+                    self.error(
+                        format!("index and element need distinct names, both are '{name}'"),
+                        *span,
+                    );
+                }
+                let iter_ty = self.type_of_expr(iterable);
+                let elem = match iter_ty {
+                    // An unconstrained element (`for x in [[]]`) would bind
+                    // x at a type that fits everything — reject like an
+                    // un-annotated `[]` binding.
+                    Type::Array(elem) if unconstrained(&elem) => {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                format!("cannot infer a type for '{name}' from this iterable"),
+                                iterable.span(),
+                            )
+                            .with_help(
+                                "bind the array with an annotated type first".to_string(),
+                            ),
+                        );
+                        Type::Error
+                    }
+                    Type::Array(elem) => *elem,
+                    ref t if poisoned(t) => Type::Error,
+                    other => {
+                        self.error(
+                            format!(
+                                "can only iterate over arrays, found {}",
+                                self.type_name(&other)
+                            ),
+                            iterable.span(),
+                        );
+                        Type::Error
+                    }
+                };
+                self.drop_loop_invalidated_facts(body);
+                // Body scope with the loop bindings: const element (and
+                // optional const int index).
+                self.nonnull.push(NarrowFrame::new(HashSet::new()));
+                self.scopes.push(HashMap::new());
+                self.bind(name, elem, false);
+                if let Some(index) = index {
+                    self.bind(index, Type::Int, false);
+                }
+                for stmt in body {
+                    self.check_stmt(stmt);
+                }
+                self.scopes.pop();
+                self.nonnull.pop();
             }
             Stmt::Expr(e) => {
                 self.type_of_expr(e);
             }
             Stmt::Assign { target, value, span } => {
-                let value_ty = self.type_of_expr(value);
+                // Array-literal values are checked against the target's
+                // declared type once it's known (ADR 0010); everything else
+                // is typed now, while narrowing facts are still intact.
+                let value_ty = if matches!(value, Expr::ArrayLit { .. }) {
+                    None
+                } else {
+                    Some(self.type_of_expr(value))
+                };
                 // The parser only builds place targets, so a root always exists.
                 let Some((root, root_span)) = root_ident(target) else {
                     return;
@@ -668,6 +604,11 @@ impl<'a> Checker<'a> {
                     self.error(format!("cannot assign to const '{root}'"), *span);
                     return;
                 }
+                let value_ty = match value_ty {
+                    Some(ty) => ty,
+                    None if self.check_literal_against(value, &target_ty) => return,
+                    None => self.type_of_expr(value),
+                };
                 if !fits(&value_ty, &target_ty) {
                     let message = match target {
                         Expr::Field { name, .. } => format!(
@@ -978,6 +919,9 @@ impl<'a> Checker<'a> {
             );
         }
         for (arg, expected) in args.iter().zip(&sig.params) {
+            if self.check_literal_against(arg, expected) {
+                continue;
+            }
             let got = self.type_of_expr(arg);
             if !fits(&got, expected) {
                 self.error(
@@ -991,6 +935,45 @@ impl<'a> Checker<'a> {
             }
         }
         sig.ret.clone()
+    }
+
+    /// Bidirectional check for array literals at declared positions: the
+    /// declaration is the truth, never the literal's shape (ADR 0010).
+    /// Unwraps optional declarations, recurses into nested literals, and
+    /// returns true when it handled the pair — callers fall back to the
+    /// ordinary `fits` path otherwise.
+    fn check_literal_against(&mut self, value: &Expr, expected: &Type) -> bool {
+        let mut target = expected;
+        while let Type::Optional(inner) = target {
+            target = inner;
+        }
+        let (Type::Array(elem), Expr::ArrayLit { elements, .. }) = (target, value) else {
+            return false;
+        };
+        for element in elements {
+            if self.check_literal_against(element, elem) {
+                continue;
+            }
+            let got = self.type_of_expr(element);
+            if !fits(&got, elem) {
+                let mut diag = Diagnostic::error(
+                    format!(
+                        "array element: expected {}, found {}",
+                        self.type_name(elem),
+                        self.type_name(&got)
+                    ),
+                    element.span(),
+                );
+                if got == Type::Null {
+                    diag = diag.with_help(format!(
+                        "declare the element type optional: '{}?'",
+                        self.type_name(elem)
+                    ));
+                }
+                self.diagnostics.push(diag);
+            }
+        }
+        true
     }
 
     fn check_field(&mut self, base: &Expr, field: &str, optional: bool, span: Span) -> Type {
@@ -1090,6 +1073,11 @@ impl<'a> Checker<'a> {
                     value.span(),
                 );
             }
+            if let Some((_, expected)) = decl.fields.iter().find(|(dn, _)| dn == fname) {
+                if self.check_literal_against(value, &expected.clone()) {
+                    continue;
+                }
+            }
             let got = self.type_of_expr(value);
             match decl.fields.iter().find(|(dn, _)| dn == fname) {
                 Some((_, expected)) => {
@@ -1144,6 +1132,19 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Declares `name` in the innermost scope and hides any narrowing of
+    /// the same name while that scope's region lives — a new binding
+    /// shadows; outer facts return when the frame pops.
+    fn bind(&mut self, name: &str, ty: Type, mutable: bool) {
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .insert(name.to_string(), VarInfo { ty, mutable });
+        if let Some(frame) = self.nonnull.last_mut() {
+            frame.shadowed.insert(name.to_string());
+        }
+    }
+
     /// The innermost binding for `name`, searching scopes inside-out.
     fn find_var(&self, name: &str) -> Option<&VarInfo> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
@@ -1167,113 +1168,7 @@ impl<'a> Checker<'a> {
     }
 }
 
-/// Comparability for `==`/`!=`: two non-unit types compare when either fits
-/// the other — same type, `null` vs `T?`, or `T` vs `T?`.
-fn eq_comparable(lt: &Type, rt: &Type) -> bool {
-    *lt != Type::Unit && *rt != Type::Unit && (fits(lt, rt) || fits(rt, lt))
-}
 
-/// The place paths a condition proves non-null: `(if_true, if_false)`.
-/// `x != null` (or `x.f != null`) proves the path in the true branch,
-/// `== null` in the false branch; `&&` accumulates its sides' true-facts.
-fn null_checks(cond: &Expr) -> (HashSet<String>, HashSet<String>) {
-    let (mut if_true, mut if_false) = (HashSet::new(), HashSet::new());
-    if let Expr::Binary { op, lhs, rhs, .. } = cond {
-        match op {
-            BinOp::Ne => if_true.extend(place_vs_null(lhs, rhs)),
-            BinOp::Eq => if_false.extend(place_vs_null(lhs, rhs)),
-            BinOp::And => {
-                let (mut lhs_true, _) = null_checks(lhs);
-                // The right side runs after the left's checks — a call in
-                // it can null a checked field through an alias, so field
-                // facts don't cross it. (Bare-variable facts survive; a
-                // callee can't rebind the caller's locals.)
-                if contains_call(rhs) {
-                    lhs_true.retain(|p| !p.contains('.'));
-                }
-                if_true.extend(lhs_true);
-                if_true.extend(null_checks(rhs).0);
-            }
-            _ => {}
-        }
-    }
-    (if_true, if_false)
-}
-
-/// Does this expression contain a call? Calls can mutate any shared
-/// refstruct they can reach, which kills field-path narrowing facts.
-fn contains_call(e: &Expr) -> bool {
-    match e {
-        Expr::Call { .. } => true,
-        Expr::Unary { rhs, .. } => contains_call(rhs),
-        Expr::Binary { lhs, rhs, .. } => contains_call(lhs) || contains_call(rhs),
-        Expr::Field { base, .. } => contains_call(base),
-        Expr::StructLit { fields, .. } => fields.iter().any(|(_, v)| contains_call(v)),
-        Expr::ArrayLit { elements, .. } => elements.iter().any(contains_call),
-        Expr::Index { base, index, .. } => contains_call(base) || contains_call(index),
-        Expr::Int(..)
-        | Expr::Float(..)
-        | Expr::Bool(..)
-        | Expr::Str(..)
-        | Expr::Ident(..)
-        | Expr::Null(_) => false,
-    }
-}
-
-/// What a loop body can do to enclosing narrowing facts on a later
-/// iteration: the places it assigns, and whether it can invalidate field
-/// facts at all (a call or a write through a field, both alias-reaching).
-fn body_effects(stmts: &[Stmt], assigned: &mut HashSet<String>, kills_fields: &mut bool) {
-    for stmt in stmts {
-        match stmt {
-            Stmt::Assign { target, value, .. } => {
-                if let Some(path) = target.place_path() {
-                    assigned.insert(path);
-                }
-                if !matches!(target, Expr::Ident(..)) || contains_call(value) {
-                    *kills_fields = true;
-                }
-            }
-            Stmt::Let { value, .. } | Stmt::Expr(value) => {
-                if contains_call(value) {
-                    *kills_fields = true;
-                }
-            }
-            Stmt::Return { value, .. } => {
-                if value.as_ref().is_some_and(contains_call) {
-                    *kills_fields = true;
-                }
-            }
-            Stmt::If {
-                cond,
-                then_body,
-                else_body,
-                ..
-            } => {
-                if contains_call(cond) {
-                    *kills_fields = true;
-                }
-                body_effects(then_body, assigned, kills_fields);
-                if let Some(else_body) = else_body {
-                    body_effects(else_body, assigned, kills_fields);
-                }
-            }
-            Stmt::While { cond, body, .. } => {
-                if contains_call(cond) {
-                    *kills_fields = true;
-                }
-                body_effects(body, assigned, kills_fields);
-            }
-        }
-    }
-}
-
-fn place_vs_null(a: &Expr, b: &Expr) -> Option<String> {
-    match (a, b) {
-        (Expr::Null(_), e) | (e, Expr::Null(_)) => e.place_path(),
-        _ => None,
-    }
-}
 
 /// The variable at the root of a place expression (`o.i.v` → `o`).
 fn root_ident(e: &Expr) -> Option<(&str, Span)> {
@@ -1284,9 +1179,6 @@ fn root_ident(e: &Expr) -> Option<(&str, Span)> {
     }
 }
 
-fn is_numeric(t: &Type) -> bool {
-    matches!(t, Type::Int | Type::Float)
-}
 
 /// Definite-return analysis: does this statement list guarantee a `return` on
 /// every path? An `if` guarantees it only when both branches exist and both
@@ -1377,7 +1269,7 @@ mod tests {
 
     #[test]
     fn mixing_int_and_float_is_an_error() {
-        let d = diags("fun f(a: int): int { const x = a + 1.0; return a; }");
+        let d = diags("fun f(a: int): int { const x: float = a + 1.0; return a; }");
         assert!(
             d.iter().any(|e| e.message.contains("cannot apply '+'")),
             "{d:?}"
@@ -1426,10 +1318,10 @@ mod tests {
 
     #[test]
     fn unannotated_empty_array_requires_an_annotation() {
-        let d = diags("fun main() { var xs = []; push(xs, 1); push(xs, \"a\"); }");
+        let d = diags("fun main() { var xs = []; push(xs, 1); }");
         assert!(
-            d.iter().any(|e| e.message.contains("cannot infer")
-                && e.help.as_deref().is_some_and(|h| h.contains("[]"))),
+            d.iter().any(|e| e.message.contains("missing type annotation")
+                && e.help.is_some()),
             "{d:?}"
         );
     }
@@ -1443,7 +1335,7 @@ mod tests {
     #[test]
     fn empty_literals_nest_in_either_position() {
         let d = diags(
-            "fun main() { const a = [[1], []]; const b: int[][] = [[], [1]]; }",
+            "fun main() { const a: int[][] = [[1], []]; const b: int[][] = [[], [1]]; }",
         );
         assert!(d.is_empty(), "unexpected: {d:?}");
     }
@@ -1481,6 +1373,159 @@ mod tests {
         );
     }
 
+    // --- Literal-vs-declaration checking at every declared position ---
+
+    #[test]
+    fn literal_checking_recurses_into_nested_literals() {
+        let d = diags("fun f() { var g: int?[][] = [[1, 2], [3]]; }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+        let d = diags("fun f() { var g: int?[][] = [[null]]; }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn literal_checking_unwraps_optional_declarations() {
+        let d = diags("fun f() { var xs: int?[]? = [1, 2]; }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn literal_checking_applies_at_every_declared_position() {
+        let d = diags(
+            "struct Box { xs: int?[] }\n\
+             fun g(xs: int?[]): int?[] { return [1, 2]; }\n\
+             fun f() {\n\
+                 var xs: int?[] = [1, 2];\n\
+                 xs = [3, 4];\n\
+                 g([5, 6]);\n\
+                 const b: Box = Box { xs: [7, 8] };\n\
+             }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+    }
+
+    #[test]
+    fn null_elements_against_non_optional_declarations_get_a_hint() {
+        let d = diags("fun f() { var xs: int[] = [null, 1]; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("expected int, found null")
+                && e.help.as_deref().is_some_and(|h| h.contains("optional"))),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn missing_annotation_error_leads_for_uninferable_literals() {
+        let d = diags("fun f() { var xs = [null]; }");
+        assert!(
+            d[0].message.contains("missing type annotation"),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn iterating_an_unconstrained_literal_is_an_error() {
+        // `for x in [[]]` must not bind x at a type that fits everything.
+        let d = diags("fun f() { for x in [[]] { print(x); } }");
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot infer")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn iterable_position_still_infers_literal_types() {
+        // Inference survives where nothing is declared: loop iterables.
+        let d = diags("fun f() { for x in [1, null] { print(x ?? 0); } }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+        let d = diags("fun f() { for x in [[], [1]] { print(len(x)); } }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+        let d = diags("fun f() { for x in [1, \"a\"] { } }");
+        assert!(
+            d.iter().any(|e| e.message.contains("must share one type")),
+            "{d:?}"
+        );
+    }
+
+    // --- Mandatory annotations (ADR 0010) ---
+
+    #[test]
+    fn every_binding_requires_a_type_annotation() {
+        let d = diags("fun f() { var x = 5; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("missing type annotation for 'x'")
+                && e.help.is_some()),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn array_literals_are_checked_against_the_declaration() {
+        // The annotation is the source of truth: int elements are welcome
+        // in an int?[] — no inference from the literal's shape.
+        let d = diags("fun f() { var xs: int?[] = [1, 2]; }");
+        assert!(d.is_empty(), "unexpected: {d:?}");
+        let d = diags("fun f() { var xs: int?[] = [1, \"a\"]; }");
+        assert!(
+            d.iter().any(|e| e.message.contains("expected int?, found string")),
+            "{d:?}"
+        );
+    }
+
+    // --- For loops ---
+
+    #[test]
+    fn for_loops_type_the_element_and_bind_it_const() {
+        let d = diags(
+            "fun sum(xs: int[]): int { var total: int = 0; for x in xs { total = total + x; } return total; }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+        let d = diags("fun f(xs: int[]) { for x in xs { x = 1; } }");
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot assign to const 'x'")),
+            "{d:?}"
+        );
+        let d = diags("fun f(n: int) { for x in n { } }");
+        assert!(
+            d.iter().any(|e| e.message.contains("can only iterate over arrays")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn for_bodies_invalidate_enclosing_facts_like_while() {
+        let d = diags(
+            "refstruct P { x: int }\n\
+             fun f(q: P?, xs: int[]): int {\n\
+                 var p: P? = q;\n\
+                 var total: int = 0;\n\
+                 if p != null {\n\
+                     for x in xs { total = total + p.x; p = null; }\n\
+                 }\n\
+                 return total;\n\
+             }",
+        );
+        assert!(d.iter().any(|e| e.message.contains("may be null")), "{d:?}");
+    }
+
+    #[test]
+    fn for_index_bindings_are_int_and_const() {
+        let d = diags(
+            "fun f(xs: string[]) { for [i, s] in xs { print(s); print(i + 1); } }",
+        );
+        assert!(d.is_empty(), "unexpected: {d:?}");
+        let d = diags("fun f(xs: int[]) { for [i, x] in xs { i = 0; } }");
+        assert!(
+            d.iter().any(|e| e.message.contains("cannot assign to const 'i'")),
+            "{d:?}"
+        );
+        let d = diags("fun f(xs: int[]) { for [x, x] in xs { } }");
+        assert!(
+            d.iter().any(|e| e.message.contains("distinct names")),
+            "{d:?}"
+        );
+    }
+
     // --- Builtins ---
 
     #[test]
@@ -1506,7 +1551,7 @@ mod tests {
     #[test]
     fn array_literals_indexing_and_builtins_are_typed() {
         let d = diags(
-            "fun f(): int { const xs = [1, 2, 3]; return xs[0] + len(xs); }\n\
+            "fun f(): int { const xs: int[] = [1, 2, 3]; return xs[0] + len(xs); }\n\
              fun g() { var ys: int[] = []; push(ys, 4); }",
         );
         assert!(d.is_empty(), "unexpected: {d:?}");
@@ -1514,7 +1559,7 @@ mod tests {
 
     #[test]
     fn array_elements_must_share_one_type() {
-        let d = diags("fun f() { const xs = [1, \"a\"]; }");
+        let d = diags("fun f() { const xs: int[] = [1, \"a\"]; }");
         assert!(
             d.iter().any(|e| e.message.contains("expected int, found string")),
             "{d:?}"
@@ -1549,9 +1594,9 @@ mod tests {
     fn arrays_are_references_for_mutability() {
         // Writing an element goes through the array reference — fine on a
         // const binding. Rebinding the const is still an error.
-        let d = diags("fun f() { const xs = [1]; xs[0] = 2; }");
+        let d = diags("fun f() { const xs: int[] = [1]; xs[0] = 2; }");
         assert!(d.is_empty(), "unexpected: {d:?}");
-        let d = diags("fun f() { const xs = [1]; xs = [2]; }");
+        let d = diags("fun f() { const xs: int[] = [1]; xs = [2]; }");
         assert!(
             d.iter()
                 .any(|e| e.message.contains("cannot assign to const 'xs'")),
@@ -1678,7 +1723,7 @@ mod tests {
 
     #[test]
     fn block_bindings_do_not_escape_their_scope() {
-        let d = diags("fun f(a: bool): int { if a { const x = 1; } return x; }");
+        let d = diags("fun f(a: bool): int { if a { const x: int = 1; } return x; }");
         assert!(
             d.iter().any(|e| e.message.contains("undefined variable 'x'")),
             "{d:?}"
@@ -1719,7 +1764,7 @@ mod tests {
             (
                 "main.ys",
                 "import { make, Point } from \"./geo\";\n\
-                 fun main(): int { const p = make(); const q = Point { x: p.x }; return q.x; }",
+                 fun main(): int { const p: Point = make(); const q: Point = Point { x: p.x }; return q.x; }",
             ),
             (
                 "geo.ys",
@@ -1827,7 +1872,7 @@ mod tests {
 
     #[test]
     fn undefined_names_suggest_close_matches() {
-        let d = diags("fun f(): int { const account = 1; return acount; }");
+        let d = diags("fun f(): int { const account: int = 1; return acount; }");
         assert!(
             d.iter().any(|e| e.message.contains("undefined variable 'acount'")
                 && e.help.as_deref() == Some("did you mean 'account'?")),
@@ -1836,7 +1881,7 @@ mod tests {
 
         let d = diags(
             "fun fibonacci(n: int): int { return n; }\n\
-             fun main(): int { const answer = 1; return fibonaci(answr); }",
+             fun main(): int { const answer: int = 1; return fibonaci(answr); }",
         );
         assert!(
             d.iter().any(|e| e.message.contains("undefined function 'fibonaci'")
@@ -1850,7 +1895,7 @@ mod tests {
             "{d:?}"
         );
 
-        let d = diags("struct Point { x: int } fun f(): int { const p = Pont { x: 1 }; return 1; }");
+        let d = diags("struct Point { x: int } fun f(): int { const p: Pont = Pont { x: 1 }; return 1; }");
         assert!(
             d.iter().any(|e| e.message.contains("unknown struct 'Pont'")
                 && e.help.as_deref() == Some("did you mean 'Point'?")),
@@ -1907,7 +1952,7 @@ mod tests {
         let d = diags(
             "struct P { x: int, y: int }\n\
              fun add(a: int, b: int): int { return a + b; }\n\
-             fun main(): int { const p = P { x: 1, y: 2 }; return add(p.x, p.y); }",
+             fun main(): int { const p: P = P { x: 1, y: 2 }; return add(p.x, p.y); }",
         );
         assert!(d.is_empty(), "unexpected: {d:?}");
     }
@@ -1939,7 +1984,7 @@ mod tests {
 
     #[test]
     fn struct_literal_field_type_mismatch_is_an_error() {
-        let d = diags("struct P { x: int } fun f(): int { const p = P { x: 1.0 }; return 1; }");
+        let d = diags("struct P { x: int } fun f(): int { const p: P = P { x: 1.0 }; return 1; }");
         assert!(
             d.iter().any(|e| e.message.contains("field 'x' expects int")),
             "{d:?}"
@@ -1949,7 +1994,7 @@ mod tests {
     #[test]
     fn duplicate_struct_literal_field_is_an_error() {
         let d = diags(
-            "struct P { x: int } fun f(): int { const p = P { x: 1, x: 2 }; return 1; }",
+            "struct P { x: int } fun f(): int { const p: P = P { x: 1, x: 2 }; return 1; }",
         );
         assert!(
             d.iter().any(|e| e.message.contains("duplicate field 'x'")),
@@ -1959,7 +2004,7 @@ mod tests {
 
     #[test]
     fn assign_type_mismatch_is_an_error() {
-        let d = diags("fun f(): int { var x = 1; x = 1.0; return x; }");
+        let d = diags("fun f(): int { var x: int = 1; x = 1.0; return x; }");
         assert!(
             d.iter()
                 .any(|e| e.message.contains("cannot assign float to variable of type int")),
@@ -1970,7 +2015,7 @@ mod tests {
     #[test]
     fn missing_struct_literal_field_is_an_error() {
         let d = diags(
-            "struct P { x: int, y: int } fun f(): int { const p = P { x: 1 }; return 1; }",
+            "struct P { x: int, y: int } fun f(): int { const p: P = P { x: 1 }; return 1; }",
         );
         assert!(
             d.iter()
@@ -1981,13 +2026,13 @@ mod tests {
 
     #[test]
     fn field_assignment_is_well_typed() {
-        let d = diags("struct P { x: int } fun f() { var p = P { x: 1 }; p.x = 2; }");
+        let d = diags("struct P { x: int } fun f() { var p: P = P { x: 1 }; p.x = 2; }");
         assert!(d.is_empty(), "unexpected: {d:?}");
     }
 
     #[test]
     fn field_assignment_type_mismatch_is_an_error() {
-        let d = diags("struct P { x: int } fun f() { var p = P { x: 1 }; p.x = 1.0; }");
+        let d = diags("struct P { x: int } fun f() { var p: P = P { x: 1 }; p.x = 1.0; }");
         assert!(
             d.iter()
                 .any(|e| e.message.contains("field 'x' expects int, found float")),
@@ -1997,7 +2042,7 @@ mod tests {
 
     #[test]
     fn field_assignment_through_const_is_an_error() {
-        let d = diags("struct P { x: int } fun f() { const p = P { x: 1 }; p.x = 2; }");
+        let d = diags("struct P { x: int } fun f() { const p: P = P { x: 1 }; p.x = 2; }");
         assert!(
             d.iter()
                 .any(|e| e.message.contains("cannot assign to const 'p'")),
@@ -2007,7 +2052,7 @@ mod tests {
 
     #[test]
     fn assigning_to_unknown_field_is_an_error() {
-        let d = diags("struct P { x: int } fun f() { var p = P { x: 1 }; p.z = 2; }");
+        let d = diags("struct P { x: int } fun f() { var p: P = P { x: 1 }; p.z = 2; }");
         assert!(
             d.iter().any(|e| e.message.contains("no field 'z'")),
             "{d:?}"
@@ -2016,7 +2061,7 @@ mod tests {
 
     #[test]
     fn refstruct_field_mutation_through_const_is_allowed() {
-        let d = diags("refstruct P { x: int } fun f() { const p = P { x: 1 }; p.x = 2; }");
+        let d = diags("refstruct P { x: int } fun f() { const p: P = P { x: 1 }; p.x = 2; }");
         assert!(d.is_empty(), "unexpected: {d:?}");
     }
 
@@ -2029,7 +2074,7 @@ mod tests {
     #[test]
     fn rebinding_const_refstruct_is_rejected() {
         let d = diags(
-            "refstruct P { x: int } fun f() { const p = P { x: 1 }; p = P { x: 2 }; }",
+            "refstruct P { x: int } fun f() { const p: P = P { x: 1 }; p = P { x: 2 }; }",
         );
         assert!(
             d.iter()
@@ -2055,13 +2100,13 @@ mod tests {
         // `b`'s own copy — rejected.
         let src = "refstruct R { v: int }\n\
                    struct Box { r: R }\n\
-                   fun f() { const b = Box { r: R { v: 1 } }; b.r.v = 7; }";
+                   fun f() { const b: Box = Box { r: R { v: 1 } }; b.r.v = 7; }";
         let d = diags(src);
         assert!(d.is_empty(), "unexpected: {d:?}");
 
         let src = "refstruct R { v: int }\n\
                    struct Box { r: R }\n\
-                   fun f() { const b = Box { r: R { v: 1 } }; b.r = R { v: 2 }; }";
+                   fun f() { const b: Box = Box { r: R { v: 1 } }; b.r = R { v: 2 }; }";
         let d = diags(src);
         assert!(
             d.iter()
@@ -2093,7 +2138,7 @@ mod tests {
         let d = diags("fun f() { var x = null; }");
         assert!(
             d.iter()
-                .any(|e| e.message.contains("cannot infer") && e.help.is_some()),
+                .any(|e| e.message.contains("missing type annotation") && e.help.is_some()),
             "{d:?}"
         );
     }
@@ -2140,8 +2185,8 @@ mod tests {
         let d = diags(
             "refstruct Node { v: int, next: Node? }\n\
              fun sum(head: Node?): int {\n\
-                 var acc = 0;\n\
-                 var cur = head;\n\
+                 var acc: int = 0;\n\
+                 var cur: Node? = head;\n\
                  while cur != null { acc = acc + cur.v; cur = cur.next; }\n\
                  if head != null { acc = acc + head.v; }\n\
                  return acc;\n\
@@ -2191,7 +2236,7 @@ mod tests {
     fn struct_literal_fields_accept_null_for_optionals() {
         let d = diags(
             "refstruct Node { v: int, next: Node? }\n\
-             fun f() { const n = Node { v: 1, next: null }; }",
+             fun f() { const n: Node = Node { v: 1, next: null }; }",
         );
         assert!(d.is_empty(), "unexpected: {d:?}");
     }
@@ -2225,7 +2270,7 @@ mod tests {
         let d = diags(
             "refstruct P { x: int }\n\
              fun f(q: P?): int {\n\
-                 var p = q;\n\
+                 var p: P? = q;\n\
                  if p != null { p = null; return p.x; }\n\
                  return 0;\n\
              }",
@@ -2239,7 +2284,7 @@ mod tests {
             "refstruct P { x: int }\n\
              fun get(): P? { return null; }\n\
              fun f(p: P?): int {\n\
-                 if p != null { const p = get(); return p.x; }\n\
+                 if p != null { const p: P? = get(); return p.x; }\n\
                  return 0;\n\
              }",
         );
@@ -2251,8 +2296,8 @@ mod tests {
         let d = diags(
             "refstruct Node { v: int, next: Node? }\n\
              fun f(head: Node?): int {\n\
-                 var cur = head;\n\
-                 var n = 0;\n\
+                 var cur: Node? = head;\n\
+                 var n: int = 0;\n\
                  while cur != null && cur.v < 5 { n = n + 1; cur = cur.next; }\n\
                  return n;\n\
              }",
@@ -2275,7 +2320,7 @@ mod tests {
         let d = diags(
             "refstruct Tree { v: int, left: Tree? }\n\
              fun min(t: Tree): int {\n\
-                 var cur = t;\n\
+                 var cur: Tree = t;\n\
                  while cur.left != null { cur = cur.left; }\n\
                  return cur.v;\n\
              }",
@@ -2338,7 +2383,7 @@ mod tests {
         let d = diags(
             "refstruct Node { v: int, next: Node? }\n\
              fun f(a: Node, b: Node): int {\n\
-                 var cur = a;\n\
+                 var cur: Node = a;\n\
                  if cur.next != null { cur = b; return cur.next.v; }\n\
                  return 0;\n\
              }",
@@ -2368,9 +2413,9 @@ mod tests {
         let d = diags(
             "refstruct P { x: int }\n\
              fun f(q: P?): int {\n\
-                 var p = q;\n\
-                 var i = 0;\n\
-                 var sum = 0;\n\
+                 var p: P? = q;\n\
+                 var i: int = 0;\n\
+                 var sum: int = 0;\n\
                  if p != null {\n\
                      while i < 2 { sum = sum + p.x; p = null; i = i + 1; }\n\
                  }\n\
@@ -2386,8 +2431,8 @@ mod tests {
             "refstruct Node { v: int, next: Node? }\n\
              fun kill(n: Node) { n.next = null; }\n\
              fun f(a: Node): int {\n\
-                 var i = 0;\n\
-                 var sum = 0;\n\
+                 var i: int = 0;\n\
+                 var sum: int = 0;\n\
                  if a.next != null {\n\
                      while i < 2 { sum = sum + a.next.v; kill(a); i = i + 1; }\n\
                  }\n\
@@ -2416,7 +2461,7 @@ mod tests {
             "refstruct R { v: int }\n\
              struct Box { r: R? }\n\
              fun f() {\n\
-                 const b = Box { r: R { v: 1 } };\n\
+                 const b: Box = Box { r: R { v: 1 } };\n\
                  if b.r != null { b.r.v = 2; }\n\
              }",
         );
@@ -2431,7 +2476,7 @@ mod tests {
             "refstruct P { x: int }\n\
              fun f(p: P?, b: bool): int {\n\
                  if p != null {\n\
-                     if b { const p = 1; }\n\
+                     if b { const p: int = 1; }\n\
                      return p.x;\n\
                  }\n\
                  return 0;\n\
@@ -2478,7 +2523,7 @@ mod tests {
 
     #[test]
     fn assigning_to_const_is_an_error() {
-        let d = diags("fun f(): int { const x = 1; x = 2; return x; }");
+        let d = diags("fun f(): int { const x: int = 1; x = 2; return x; }");
         assert!(
             d.iter()
                 .any(|e| e.message.contains("cannot assign to const 'x'")),

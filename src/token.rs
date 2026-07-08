@@ -12,6 +12,8 @@ pub enum TokenKind {
     If,
     Else,
     While,
+    For,
+    In,
     Import,
     Export,
     From,

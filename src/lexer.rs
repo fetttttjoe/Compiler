@@ -314,6 +314,8 @@ impl Lexer<'_> {
             syntax::KW_IF => TokenKind::If,
             syntax::KW_ELSE => TokenKind::Else,
             syntax::KW_WHILE => TokenKind::While,
+            syntax::KW_FOR => TokenKind::For,
+            syntax::KW_IN => TokenKind::In,
             syntax::KW_IMPORT => TokenKind::Import,
             syntax::KW_EXPORT => TokenKind::Export,
             syntax::KW_FROM => TokenKind::From,

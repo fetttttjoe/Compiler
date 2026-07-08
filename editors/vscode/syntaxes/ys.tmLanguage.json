@@ -60,7 +60,7 @@
         },
         {
           "name": "keyword.control.ys",
-          "match": "\\b(else|export|from|if|import|return|while)\\b"
+          "match": "\\b(else|export|for|from|if|import|in|return|while)\\b"
         },
         {
           "name": "support.type.primitive.ys",

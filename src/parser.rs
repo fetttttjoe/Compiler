@@ -107,6 +107,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `expect` variants that signal failure instead of recovering in
+    /// place — for multi-token headers where each follow-on expect would
+    /// otherwise re-report the same bad token.
+    fn header_identifier(&mut self) -> Option<String> {
+        match &self.peek().kind {
+            TokenKind::Identifier(_) => Some(self.expect_identifier()),
+            _ => {
+                self.expect_identifier();
+                None
+            }
+        }
+    }
+
+    fn header_token(&mut self, kind: TokenKind) -> Option<Span> {
+        let (span, clean) = self.expect_or_flag(kind);
+        clean.then_some(span)
+    }
+
     fn expect_identifier(&mut self) -> String {
         let tok = self.peek().clone();
         if let TokenKind::Identifier(name) = tok.kind {
@@ -569,7 +587,8 @@ impl<'a> Parser<'a> {
                 | TokenKind::Const
                 | TokenKind::Return
                 | TokenKind::If
-                | TokenKind::While => return,
+                | TokenKind::While
+                | TokenKind::For => return,
                 _ => self.bump(),
             }
         }
@@ -643,6 +662,60 @@ impl<'a> Parser<'a> {
                 (
                     Stmt::While {
                         cond,
+                        body,
+                        span: tok.span.to(end),
+                    },
+                    clean,
+                )
+            }
+            TokenKind::For => {
+                self.bump();
+                // `for x in …` or `for [i, x] in …`. One malformed header
+                // token = one diagnostic: the first failed expect bails to
+                // statement recovery instead of dragging every following
+                // expect over the same token.
+                let header = (|| {
+                    let (index, name) = if self.eat(&TokenKind::LeftBracket) {
+                        let index = self.header_identifier()?;
+                        self.header_token(TokenKind::Comma)?;
+                        let name = self.header_identifier()?;
+                        self.header_token(TokenKind::RightBracket)?;
+                        (Some(index), name)
+                    } else {
+                        (None, self.header_identifier()?)
+                    };
+                    self.header_token(TokenKind::In)?;
+                    Some((index, name))
+                })();
+                let Some((index, name)) = header else {
+                    // Skip the rest of the header and swallow the loop body
+                    // so the brace structure stays balanced.
+                    while !self.at_eof()
+                        && !matches!(
+                            self.peek().kind,
+                            TokenKind::LeftBrace
+                                | TokenKind::Semicolon
+                                | TokenKind::RightBrace
+                        )
+                    {
+                        self.bump();
+                    }
+                    if self.check(&TokenKind::LeftBrace) {
+                        let _ = self.parse_block();
+                        return (Stmt::Expr(Expr::Int(0, tok.span)), true);
+                    }
+                    return (Stmt::Expr(Expr::Int(0, tok.span)), false);
+                };
+                // Struct literals are off in the iterable, same as
+                // conditions: `for x in xs { … }` must read `xs` then a
+                // block, not a struct literal `xs { … }`.
+                let iterable = self.parse_condition();
+                let (body, end, clean) = self.parse_block();
+                (
+                    Stmt::For {
+                        index,
+                        name,
+                        iterable,
                         body,
                         span: tok.span.to(end),
                     },
@@ -789,6 +862,8 @@ fn describe(kind: &TokenKind) -> &'static str {
         If => "'if'",
         Else => "'else'",
         While => "'while'",
+        For => "'for'",
+        In => "'in'",
         Import => "'import'",
         Export => "'export'",
         From => "'from'",
@@ -952,7 +1027,7 @@ mod tests {
 
     #[test]
     fn const_binding_is_immutable() {
-        match stmt("const x = a + 1;") {
+        match stmt("const x: int = a + 1;") {
             Stmt::Let { mutable, name, value, .. } => {
                 assert!(!mutable);
                 assert_eq!(name, "x");
@@ -964,7 +1039,7 @@ mod tests {
 
     #[test]
     fn var_binding_is_mutable() {
-        match stmt("var y = 2;") {
+        match stmt("var y: int = 2;") {
             Stmt::Let { mutable, .. } => assert!(mutable),
             other => panic!("expected Let, got {other:?}"),
         }
@@ -1071,6 +1146,37 @@ mod tests {
         assert_eq!(expr("a[i + 1]").sexpr(), "(idx a (+ i 1))");
         assert_eq!(expr("a[0][1]").sexpr(), "(idx (idx a 0) 1)");
         assert_eq!(expr("xs[0].f").sexpr(), "(. (idx xs 0) f)");
+    }
+
+    #[test]
+    fn for_loops_parse() {
+        match stmt("for x in xs { print(x); }") {
+            Stmt::For { name, iterable, body, .. } => {
+                assert_eq!(name, "x");
+                assert_eq!(iterable.sexpr(), "xs");
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("expected For, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn for_loops_can_bind_the_index() {
+        match stmt("for [i, s] in scores { print(s); }") {
+            Stmt::For { index, name, iterable, .. } => {
+                assert_eq!(index.as_deref(), Some("i"));
+                assert_eq!(name, "s");
+                assert_eq!(iterable.sexpr(), "scores");
+            }
+            other => panic!("expected For, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_for_headers_report_once() {
+        let (tokens, _) = lex("fun f(xs: int[]) { for [1, x] in xs { } }");
+        let (_, pd) = parse(&tokens);
+        assert_eq!(pd.len(), 1, "{pd:?}");
     }
 
     #[test]
@@ -1309,7 +1415,7 @@ mod tests {
         // Regression: the outer block used to see the nested block's (already
         // recovered) diagnostic and synchronize again, swallowing `x = 5;`.
         let (tokens, _) =
-            lex("fun f(): int { var x = 0; if true { const = 1; } x = 5; return x; }");
+            lex("fun f(): int { var x: int = 0; if true { const = 1; } x = 5; return x; }");
         let (ast, pd) = parse(&tokens);
         assert_eq!(pd.len(), 1, "{pd:?}");
         let Item::Function(f) = &ast[0] else { panic!("expected function") };
@@ -1328,7 +1434,7 @@ mod tests {
     fn missing_semicolon_after_struct_literal_does_not_cascade() {
         // Regression: the statement ends in the struct literal's `}`, which
         // used to spoof the "ended cleanly" check and skip recovery.
-        let (tokens, _) = lex("fun f(): int { const p = P { x: 1 } ) return 1; }");
+        let (tokens, _) = lex("fun f(): int { const p: P = P { x: 1 } ) return 1; }");
         let (ast, pd) = parse(&tokens);
         assert_eq!(pd.len(), 1, "one missing-semicolon error only: {pd:?}");
         let Item::Function(f) = &ast[0] else { panic!("expected function") };

@@ -33,6 +33,10 @@ diagnostics.
    "reference" (refstruct, arrays). Element writes (`a[i] = v`) go through
    the reference and are legal on `const` bindings; rebinding is not.
 4. **Element typing is first-element inference, with two refinements.**
+   *(Amended by ADR 0010: bindings now always declare their type, and a
+   literal at a binding is verified element-by-element against the
+   declaration — the inference below applies only in already-typed
+   positions such as arguments and returns.)*
    `[1, 2, 3]` is `int[]`; mixed elements error ("must share one type");
    a leading `null` can't name a type (error + hint). A later `null`
    widens the element to optional (`[1, null]` is `int?[]`), and a later

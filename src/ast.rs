@@ -100,6 +100,16 @@ pub enum Stmt {
         body: Vec<Stmt>,
         span: Span,
     },
+    /// `for x in xs { … }` — iterates an array; `x` is a const binding of
+    /// the element type, fresh each iteration. `for [i, x] in xs` also
+    /// binds the const int index.
+    For {
+        index: Option<String>,
+        name: String,
+        iterable: Expr,
+        body: Vec<Stmt>,
+        span: Span,
+    },
     Expr(Expr),
 }
 

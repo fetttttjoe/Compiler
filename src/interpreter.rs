@@ -251,6 +251,46 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Flow::Normal)
             }
+            Stmt::For {
+                index,
+                name,
+                iterable,
+                body,
+                span,
+            } => {
+                let items = match self.eval(iterable)? {
+                    Value::Array(items) => items,
+                    other => {
+                        return Err(Diagnostic::error(
+                            format!(
+                                "can only iterate over arrays, found {}",
+                                other.type_name()
+                            ),
+                            *span,
+                        ))
+                    }
+                };
+                // Live iteration: the body may push or mutate, so length
+                // and elements are re-read each step (element cloned out
+                // before the body runs, releasing the borrow).
+                let mut i = 0;
+                loop {
+                    let item = items.borrow().get(i).cloned();
+                    let Some(item) = item else { break };
+                    let mut scope = HashMap::from([(name.clone(), item)]);
+                    if let Some(index) = index {
+                        scope.insert(index.clone(), Value::Int(i as i64));
+                    }
+                    self.scopes.push(scope);
+                    let flow = self.exec_block(body);
+                    self.scopes.pop();
+                    if let Flow::Return(v) = flow? {
+                        return Ok(Flow::Return(v));
+                    }
+                    i += 1;
+                }
+                Ok(Flow::Normal)
+            }
             Stmt::Expr(e) => {
                 self.eval(e)?;
                 Ok(Flow::Normal)
@@ -766,7 +806,7 @@ mod tests {
     #[test]
     fn local_bindings_and_unary() {
         assert_eq!(
-            run("fun main(): int { const x = 10; return -x + 2; }"),
+            run("fun main(): int { const x: int = 10; return -x + 2; }"),
             Ok(Value::Int(-8))
         );
     }
@@ -785,6 +825,47 @@ mod tests {
     }
 
     #[test]
+    fn for_loops_iterate_and_return_early() {
+        let program = "\
+fun find(xs: int[], needle: int): bool {
+    for x in xs { if x == needle { return true; } }
+    return false;
+}
+fun main(): int {
+    var xs: int[] = [3, 7, 42];
+    var total: int = 0;
+    for x in xs { total = total + x; }
+    if find(xs, 7) && !find(xs, 9) { return total; }
+    return 0;
+}";
+        assert_eq!(run(program), Ok(Value::Int(52)));
+    }
+
+    #[test]
+    fn widened_iterables_run_with_optional_elements() {
+        let program = "\
+fun main(): int {
+    var acc: int = 0;
+    for x in [10, null, 32] { acc = acc + (x ?? 0); }
+    return acc;
+}";
+        assert_eq!(run(program), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn for_loops_track_the_index_on_request() {
+        let program = "\
+fun main(): int {
+    var xs: int[] = [10, 20, 30];
+    var acc: int = 0;
+    for [i, x] in xs { acc = acc + i * x; }
+    return acc;
+}";
+        // 0*10 + 1*20 + 2*30
+        assert_eq!(run(program), Ok(Value::Int(80)));
+    }
+
+    #[test]
     fn arrays_roundtrip_with_builtins() {
         let program = "\
 fun main(): int {
@@ -793,8 +874,8 @@ fun main(): int {
     push(xs, 20);
     push(xs, 12);
     xs[2] = xs[2] + 0;
-    var i = 0;
-    var sum = 0;
+    var i: int = 0;
+    var sum: int = 0;
     while i < len(xs) { sum = sum + xs[i]; i = i + 1; }
     return sum;
 }";
@@ -805,8 +886,8 @@ fun main(): int {
     fn arrays_alias_and_compare_by_identity() {
         let program = "\
 fun main(): bool {
-    const a = [1, 2];
-    const b = a;
+    const a: int[] = [1, 2];
+    const b: int[] = a;
     b[0] = 9;
     return a[0] == 9 && a == b && a != [1, 2];
 }";
@@ -815,7 +896,7 @@ fun main(): bool {
 
     #[test]
     fn out_of_bounds_indexing_is_a_runtime_error() {
-        let result = run("fun main(): int { const xs = [1]; return xs[5]; }");
+        let result = run("fun main(): int { const xs: int[] = [1]; return xs[5]; }");
         assert!(
             result.as_ref().is_err_and(|e| e.message.contains("out of bounds")),
             "{result:?}"
@@ -827,7 +908,7 @@ fun main(): bool {
         let program = "\
 struct P { x: int }
 fun main(): int {
-    var ps = [P { x: 1 }];
+    var ps: P[] = [P { x: 1 }];
     ps[0].x = 7;
     return ps[0].x;
 }";
@@ -861,8 +942,8 @@ fun main(): int {
         let program = "\
 fun square(n: int): int { return n * n; }
 fun main(): int {
-    const a = square(3);
-    var b = 4;
+    const a: int = square(3);
+    var b: int = 4;
     b = b + a;
     return b;
 }";
@@ -933,8 +1014,8 @@ fun main(): int { return abs(-7) + abs(7); }";
     fn while_loop_accumulates() {
         let program = "\
 fun main(): int {
-    var i = 0;
-    var acc = 0;
+    var i: int = 0;
+    var acc: int = 0;
     while i < 5 {
         i = i + 1;
         acc = acc + i;
@@ -949,8 +1030,8 @@ fun main(): int {
         // The inner `const x` shadows the outer `var x` inside the block only.
         let program = "\
 fun main(): int {
-    var x = 1;
-    if true { const x = 10; }
+    var x: int = 1;
+    if true { const x: int = 10; }
     return x;
 }";
         assert_eq!(run(program), Ok(Value::Int(1)));
@@ -961,7 +1042,7 @@ fun main(): int {
         let program = "\
 struct Point { x: int, y: int }
 fun main(): int {
-    const p = Point { x: 3, y: 4 };
+    const p: Point = Point { x: 3, y: 4 };
     return p.x * p.x + p.y * p.y;
 }";
         assert_eq!(run(program), Ok(Value::Int(25)));
@@ -983,7 +1064,7 @@ fun main(): int { return sum(make(1, 2)); }";
 struct Inner { v: int }
 struct Outer { i: Inner }
 fun main(): int {
-    const o = Outer { i: Inner { v: 7 } };
+    const o: Outer = Outer { i: Inner { v: 7 } };
     return o.i.v;
 }";
         assert_eq!(run(program), Ok(Value::Int(7)));
@@ -996,7 +1077,7 @@ fun main(): int {
                 (
                     "main.ys",
                     "import { Pair, make } from \"./lib\";\n\
-                     fun main(): int { const p = make(); return p.a + Pair { a: 1, b: 2 }.b; }"
+                     fun main(): int { const p: Pair = make(); return p.a + Pair { a: 1, b: 2 }.b; }"
                 ),
                 (
                     "lib.ys",
@@ -1013,9 +1094,9 @@ fun main(): int {
         let program = "\
 struct Point { x: int, y: int }
 fun main(): bool {
-    const a = Point { x: 1, y: 2 };
-    const b = Point { x: 1, y: 2 };
-    const c = Point { x: 9, y: 2 };
+    const a: Point = Point { x: 1, y: 2 };
+    const b: Point = Point { x: 1, y: 2 };
+    const c: Point = Point { x: 9, y: 2 };
     return a == b && a != c;
 }";
         assert_eq!(run(program), Ok(Value::Bool(true)));
@@ -1037,8 +1118,8 @@ fun main(): bool {
 struct Inner { v: int }
 struct Outer { i: Inner }
 fun main(): bool {
-    const a = Outer { i: Inner { v: 1 } };
-    const b = Outer { i: Inner { v: 2 } };
+    const a: Outer = Outer { i: Inner { v: 1 } };
+    const b: Outer = Outer { i: Inner { v: 2 } };
     return a != b;
 }";
         assert_eq!(run(program), Ok(Value::Bool(true)));
@@ -1049,7 +1130,7 @@ fun main(): bool {
         let program = "\
 struct Point { x: int, y: int }
 fun main(): int {
-    var p = Point { x: 1, y: 2 };
+    var p: Point = Point { x: 1, y: 2 };
     p.x = 40;
     return p.x + p.y;
 }";
@@ -1062,7 +1143,7 @@ fun main(): int {
 struct Inner { v: int }
 struct Outer { i: Inner }
 fun main(): int {
-    var o = Outer { i: Inner { v: 1 } };
+    var o: Outer = Outer { i: Inner { v: 1 } };
     o.i.v = 9;
     return o.i.v;
 }";
@@ -1074,8 +1155,8 @@ fun main(): int {
         let program = "\
 refstruct P { x: int }
 fun main(): int {
-    const a = P { x: 1 };
-    const b = a;
+    const a: P = P { x: 1 };
+    const b: P = a;
     b.x = 5;
     return a.x;
 }";
@@ -1088,7 +1169,7 @@ fun main(): int {
 refstruct P { x: int }
 fun bump(p: P) { p.x = p.x + 1; }
 fun main(): int {
-    const p = P { x: 1 };
+    const p: P = P { x: 1 };
     bump(p);
     bump(p);
     return p.x;
@@ -1101,9 +1182,9 @@ fun main(): int {
         let program = "\
 refstruct P { x: int }
 fun main(): bool {
-    const a = P { x: 1 };
-    const b = P { x: 1 };
-    const c = a;
+    const a: P = P { x: 1 };
+    const b: P = P { x: 1 };
+    const c: P = a;
     return a == c && a != b;
 }";
         assert_eq!(run(program), Ok(Value::Bool(true)));
@@ -1116,8 +1197,8 @@ fun main(): bool {
         let program = "\
 struct V { x: int }
 fun main(): int {
-    var a = V { x: 1 };
-    var b = a;
+    var a: V = V { x: 1 };
+    var b: V = a;
     b.x = 9;
     return a.x;
 }";
@@ -1130,11 +1211,11 @@ fun main(): int {
 refstruct R { v: int }
 struct Box { r: R }
 fun main(): bool {
-    const r1 = R { v: 1 };
-    const r2 = R { v: 1 };
-    const a = Box { r: r1 };
-    const b = Box { r: r1 };
-    const c = Box { r: r2 };
+    const r1: R = R { v: 1 };
+    const r2: R = R { v: 1 };
+    const a: Box = Box { r: r1 };
+    const b: Box = Box { r: r1 };
+    const c: Box = Box { r: r2 };
     return a == b && a != c;
 }";
         assert_eq!(run(program), Ok(Value::Bool(true)));
@@ -1146,7 +1227,7 @@ fun main(): bool {
 refstruct R { v: int }
 struct Box { r: R }
 fun main(): int {
-    const b = Box { r: R { v: 1 } };
+    const b: Box = Box { r: R { v: 1 } };
     b.r.v = 7;
     return b.r.v;
 }";
@@ -1160,7 +1241,7 @@ fun main(): int {
                 (
                     "main.ys",
                     "import { Counter, bump } from \"./lib\";\n\
-                     fun main(): int { const c = Counter { n: 0 }; bump(c); bump(c); return c.n; }"
+                     fun main(): int { const c: Counter = Counter { n: 0 }; bump(c); bump(c); return c.n; }"
                 ),
                 (
                     "lib.ys",
@@ -1187,7 +1268,7 @@ fun main(): int { return get(null) + get(P { x: 1 }); }";
 refstruct P { x: int }
 fun main(): bool {
     var p: P? = null;
-    const was_null = p == null;
+    const was_null: bool = p == null;
     p = P { x: 1 };
     return was_null && p != null;
 }";
@@ -1199,9 +1280,9 @@ fun main(): bool {
         let program = "\
 refstruct Node { v: int, next: Node? }
 fun main(): int {
-    const head = Node { v: 1, next: Node { v: 2, next: Node { v: 3, next: null } } };
+    const head: Node = Node { v: 1, next: Node { v: 2, next: Node { v: 3, next: null } } };
     var cur: Node? = head;
-    var sum = 0;
+    var sum: int = 0;
     while cur != null {
         cur.v = cur.v * 10;
         sum = sum + cur.v;
@@ -1217,7 +1298,7 @@ fun main(): int {
         let program = "\
 refstruct Node { v: int, next: Node? }
 fun main(): Node {
-    const a = Node { v: 1, next: null };
+    const a: Node = Node { v: 1, next: null };
     a.next = a;
     return a;
 }";
@@ -1271,14 +1352,14 @@ fun sum(t: Tree?): int {
     if t == null { return 0; } else { return sum(t.left) + t.v + sum(t.right); }
 }
 fun min(t: Tree): int {
-    var cur = t;
+    var cur: Tree = t;
     while cur.left != null { cur = cur.left; }
     return cur.v;
 }
 fun main(): bool {
     var root: Tree? = null;
     root = insert(root, 5);
-    const keep = root;
+    const keep: Tree? = root;
     root = insert(root, 3);
     root = insert(root, 8);
     root = insert(root, 1);
@@ -1292,7 +1373,7 @@ fun main(): bool {
         let program = "\
 refstruct Node { v: int, next: Node? }
 fun last(head: Node): int {
-    var cur = head;
+    var cur: Node = head;
     while cur.next != null { cur = cur.next; }
     return cur.v;
 }
@@ -1319,7 +1400,7 @@ fun main(): int {
 refstruct P { x: int }
 fun same(p: P): P { return p; }
 fun main(): bool {
-    const a = P { x: 1 };
+    const a: P = P { x: 1 };
     return same(a) == a;
 }";
         assert_eq!(run(program), Ok(Value::Bool(true)));

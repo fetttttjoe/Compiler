@@ -4,11 +4,13 @@ mod diagnostic;
 mod interpreter;
 mod lexer;
 mod modules;
+mod narrow;
 mod parser;
 mod source;
 mod span;
 mod syntax;
 mod token;
+mod types;
 
 use ast::Item;
 use diagnostic::Diagnostic;
