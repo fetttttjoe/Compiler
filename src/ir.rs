@@ -27,6 +27,27 @@ enum Inst {
         lhs: V,
         rhs: V,
     },
+    /// Integer op with a constant operand (fits i32): spares a vreg and
+    /// an instruction; comparisons compare against the immediate.
+    BinImm {
+        op: BinOp,
+        dst: V,
+        lhs: V,
+        imm: i64,
+    },
+    /// Signed division/remainder by 2^k, strength-reduced to the exact
+    /// truncating shift sequence (bias negative dividends) — idiv costs
+    /// 20-40 cycles, this costs ~4.
+    DivPow2 {
+        dst: V,
+        src: V,
+        k: u32,
+    },
+    RemPow2 {
+        dst: V,
+        src: V,
+        k: u32,
+    },
     Neg(V, V),
     NegF(V, V),
     Not(V, V),
@@ -282,13 +303,71 @@ impl Lowerer<'_> {
                     return None;
                 }
                 let float = self.is_float(lhs);
-                let l = self.expr(lhs)?;
-                let r = self.expr(rhs)?;
                 // Comparisons yield bools; only arithmetic stays float.
                 let arith = !matches!(
                     op,
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
                 );
+                // Constant right operands strength-reduce: power-of-two
+                // div/rem to shift sequences, everything else to an
+                // immediate form (i32 range).
+                if !float {
+                    if let Expr::Int(n, _) = rhs.as_ref() {
+                        let imm_ok = i32::try_from(*n).is_ok();
+                        let pow2 = *n >= 2 && (*n & (*n - 1)) == 0;
+                        match op {
+                            BinOp::Div | BinOp::Rem if pow2 => {
+                                let l = self.expr(lhs)?;
+                                let v = self.fresh(false);
+                                let k = n.trailing_zeros();
+                                self.insts.push(if matches!(op, BinOp::Div) {
+                                    Inst::DivPow2 { dst: v, src: l, k }
+                                } else {
+                                    Inst::RemPow2 { dst: v, src: l, k }
+                                });
+                                return Some(v);
+                            }
+                            BinOp::Add
+                            | BinOp::Sub
+                            | BinOp::Mul
+                            | BinOp::Eq
+                            | BinOp::Ne
+                            | BinOp::Lt
+                            | BinOp::Le
+                            | BinOp::Gt
+                            | BinOp::Ge
+                                if imm_ok =>
+                            {
+                                let l = self.expr(lhs)?;
+                                let v = self.fresh(false);
+                                self.insts.push(Inst::BinImm {
+                                    op: *op,
+                                    dst: v,
+                                    lhs: l,
+                                    imm: *n,
+                                });
+                                return Some(v);
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Commutative constant on the left.
+                    if let Expr::Int(n, _) = lhs.as_ref() {
+                        if matches!(op, BinOp::Add | BinOp::Mul) && i32::try_from(*n).is_ok() {
+                            let r = self.expr(rhs)?;
+                            let v = self.fresh(false);
+                            self.insts.push(Inst::BinImm {
+                                op: *op,
+                                dst: v,
+                                lhs: r,
+                                imm: *n,
+                            });
+                            return Some(v);
+                        }
+                    }
+                }
+                let l = self.expr(lhs)?;
+                let r = self.expr(rhs)?;
                 let v = self.fresh(float && arith);
                 self.insts.push(Inst::Bin {
                     op: *op,
@@ -383,6 +462,10 @@ fn intervals(insts: &[Inst], vregs: usize) -> Vec<Interval> {
             Inst::Const(d, _) => (vec![], Some(*d)),
             Inst::Copy(d, s) => (vec![*s], Some(*d)),
             Inst::Bin { dst, lhs, rhs, .. } => (vec![*lhs, *rhs], Some(*dst)),
+            Inst::BinImm { dst, lhs, .. } => (vec![*lhs], Some(*dst)),
+            Inst::DivPow2 { dst, src, .. } | Inst::RemPow2 { dst, src, .. } => {
+                (vec![*src], Some(*dst))
+            }
             Inst::Neg(d, s) | Inst::NegF(d, s) | Inst::Not(d, s) => (vec![*s], Some(*d)),
             Inst::Call { dst, args, .. } => (args.clone(), Some(*dst)),
             Inst::Ret(v) => (vec![*v], None),
@@ -593,6 +676,80 @@ fn emit(name: &str, module: usize, nparams: usize, lo: Lowerer) -> String {
                 } else {
                     let _ = writeln!(a, "\tmovq {ss}, %rax\n\tmovq %rax, {ds}");
                 }
+            }
+            Inst::BinImm { op, dst, lhs, imm } => {
+                match op {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul => {
+                        // In-place in the destination register when we
+                        // can; imul has a handy three-operand form.
+                        if let Loc::Reg(d) = loc[dst] {
+                            if matches!(op, BinOp::Mul) {
+                                let _ = writeln!(a, "\timulq ${imm}, {}, {d}", at(*lhs));
+                            } else {
+                                if at(*lhs) != at(*dst) {
+                                    let _ = writeln!(a, "\tmovq {}, {d}", at(*lhs));
+                                }
+                                let mnem = if matches!(op, BinOp::Add) {
+                                    "addq"
+                                } else {
+                                    "subq"
+                                };
+                                let _ = writeln!(a, "\t{mnem} ${imm}, {d}");
+                            }
+                        } else {
+                            let _ = writeln!(a, "\tmovq {}, %rax", at(*lhs));
+                            let mnem = match op {
+                                BinOp::Add => "addq",
+                                BinOp::Sub => "subq",
+                                _ => "imulq",
+                            };
+                            let _ = writeln!(a, "\t{mnem} ${imm}, %rax\n\tmovq %rax, {}", at(*dst));
+                        }
+                    }
+                    _ => {
+                        // Comparison against the immediate; cmpq takes a
+                        // register or memory left operand directly.
+                        let cc = match op {
+                            BinOp::Eq => "e",
+                            BinOp::Ne => "ne",
+                            BinOp::Lt => "l",
+                            BinOp::Le => "le",
+                            BinOp::Gt => "g",
+                            _ => "ge",
+                        };
+                        let _ = writeln!(
+                            a,
+                            "\tcmpq ${imm}, {}\n\tset{cc} %al\n\tmovzbq %al, %rax\n\tmovq %rax, {}",
+                            at(*lhs),
+                            at(*dst)
+                        );
+                    }
+                }
+            }
+            Inst::DivPow2 { dst, src, k } => {
+                // Truncating signed shift: bias negative dividends by
+                // 2^k - 1 (cmov keeps it branch-free).
+                let bias = (1i64 << k) - 1;
+                let _ = writeln!(
+                    a,
+                    "\tmovq {}, %rax\n\tleaq {bias}(%rax), %rcx\n\ttestq %rax, %rax\n\
+                     \tcmovnsq %rax, %rcx\n\tsarq ${k}, %rcx\n\tmovq %rcx, {}",
+                    at(*src),
+                    at(*dst)
+                );
+            }
+            Inst::RemPow2 { dst, src, k } => {
+                // n - (n / 2^k) * 2^k keeps the dividend's sign, exactly
+                // like the oracle's Rust `%`.
+                let bias = (1i64 << k) - 1;
+                let _ = writeln!(
+                    a,
+                    "\tmovq {}, %rax\n\tleaq {bias}(%rax), %rcx\n\ttestq %rax, %rax\n\
+                     \tcmovnsq %rax, %rcx\n\tsarq ${k}, %rcx\n\tshlq ${k}, %rcx\n\
+                     \tsubq %rcx, %rax\n\tmovq %rax, {}",
+                    at(*src),
+                    at(*dst)
+                );
             }
             Inst::Neg(d, s) => {
                 let _ = writeln!(

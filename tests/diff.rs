@@ -87,6 +87,24 @@ fn value_above_one_byte_is_masked() {
 }
 
 #[test]
+fn power_of_two_division_at_the_integer_extremes() {
+    // The strength-reduced shift sequences must truncate toward zero
+    // exactly like idiv, i64::MIN included.
+    diff(
+        "pow2edge",
+        "fun main(): int {
+            const min: int = -9223372036854775807 - 1;
+            var r: int = 0;
+            if min / 2 == -4611686018427387904 { r = r + 1; }
+            if min % 2 == 0 { r = r + 10; }
+            if -9 / 4 == -2 { r = r + 100; }
+            if -9 % 4 == -1 { r = r + 1000; }
+            return r % 251;
+        }",
+    );
+}
+
+#[test]
 fn division_truncates_toward_zero() {
     diff("div", "fun main(): int { return -7 / 2; }");
 }
