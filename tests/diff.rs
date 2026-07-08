@@ -424,6 +424,113 @@ fn array_returned_from_a_function() {
 }
 
 #[test]
+fn refstruct_fields_and_aliasing() {
+    diff(
+        "refstruct",
+        "refstruct Counter { n: int, step: int }
+        fun bump(c: Counter) { c.n = c.n + c.step; }
+        fun main(): int {
+            const a: Counter = Counter { n: 5, step: 10 };
+            const b: Counter = a;
+            bump(b);
+            bump(a);
+            return a.n;
+        }",
+    );
+}
+
+#[test]
+fn linked_list_with_optionals() {
+    diff(
+        "list",
+        "refstruct Node { value: int, next: Node? }
+        fun main(): int {
+            var head: Node? = null;
+            var i: int = 1;
+            while i <= 10 {
+                head = Node { value: i, next: head };
+                i = i + 1;
+            }
+            var sum: int = 0;
+            var cur: Node? = head;
+            while cur != null {
+                sum = sum + cur.value;
+                cur = cur.next;
+            }
+            return sum;
+        }",
+    );
+}
+
+#[test]
+fn optional_chaining_and_coalescing() {
+    diff(
+        "optchain",
+        "refstruct Node { value: int, next: Node? }
+        fun main(): int {
+            const tail: Node = Node { value: 30, next: null };
+            const head: Node = Node { value: 12, next: tail };
+            const a: Node? = head.next?.next;
+            var r: int = 0;
+            if a == null { r = r + 1; }
+            const b: Node? = head.next ?? head;
+            if b != null { r = r + b.value * 10; }
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn refstruct_identity_equality() {
+    diff(
+        "identity",
+        "refstruct P { x: int }
+        fun main(): int {
+            const a: P = P { x: 1 };
+            const b: P = a;
+            const c: P = P { x: 1 };
+            var r: int = 0;
+            if a == b { r = r + 1; }
+            if a == c { r = r + 10; }
+            if a != c { r = r + 100; }
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn refstructs_inside_arrays() {
+    diff(
+        "refarr",
+        "refstruct Box { v: int }
+        fun main(): int {
+            const boxes: Box[] = [Box { v: 1 }, Box { v: 2 }];
+            push(boxes, Box { v: 3 });
+            boxes[1].v = 20;
+            var total: int = 0;
+            for b in boxes {
+                total = total + b.v;
+            }
+            return total;
+        }",
+    );
+}
+
+#[test]
+fn nested_field_chains() {
+    diff(
+        "chains",
+        "refstruct Inner { v: int }
+        refstruct Outer { inner: Inner, tag: int }
+        fun main(): int {
+            const o: Outer = Outer { inner: Inner { v: 7 }, tag: 3 };
+            o.inner.v = o.inner.v * o.tag;
+            return o.inner.v;
+        }",
+    );
+}
+
+#[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as
     // tall as the chain is long; 6000 terms used to overflow the checker's

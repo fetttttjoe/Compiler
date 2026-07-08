@@ -136,7 +136,9 @@ fn undeliverable_output_is_not_a_silent_success() {
 #[test]
 fn build_rejects_unsupported_constructs_with_a_diagnostic() {
     let dir = tempdir();
-    // floats are still beyond the current codegen slice
+    // floats and value-struct literals are still beyond codegen; value
+    // optionals (int?) are gated because 0 and null would be one bit
+    // pattern in the word-sized model.
     std::fs::write(
         dir.join("uncompilable.ys"),
         "fun main(): int { var f: float = 1.5; f = f * 2.0; return 1; }",
@@ -222,6 +224,45 @@ fn compiled_out_of_bounds_aborts_instead_of_corrupting() {
         .output()
         .expect("failed to run built binary");
     assert_eq!(run.status.signal(), Some(6), "SIGABRT, not silent reads");
+}
+
+/// Value-typed optionals can't compile in the word-sized model (0 and
+/// null would share a bit pattern); reference optionals ride free.
+#[test]
+fn value_optionals_are_not_yet_compilable() {
+    let dir = tempdir();
+    std::fs::write(
+        dir.join("valopt.ys"),
+        "fun main(): int { var x: int? = null; if x == null { return 1; } return 0; }",
+    )
+    .unwrap();
+    let out = compiler(&[
+        "build",
+        dir.join("valopt.ys").to_str().unwrap(),
+        "-o",
+        dir.join("valopt").to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not yet compilable"));
+}
+
+#[test]
+fn value_struct_literals_are_not_yet_compilable() {
+    let dir = tempdir();
+    std::fs::write(
+        dir.join("valstruct.ys"),
+        "struct P { x: int }
+        fun main(): int { const p: P = P { x: 1 }; return p.x; }",
+    )
+    .unwrap();
+    let out = compiler(&[
+        "build",
+        dir.join("valstruct.ys").to_str().unwrap(),
+        "-o",
+        dir.join("valstruct").to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not yet compilable"));
 }
 
 #[test]

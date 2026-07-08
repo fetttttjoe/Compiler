@@ -22,6 +22,16 @@ pub struct Resolutions {
     /// interpreter (and later codegen) knows which literals allocate a
     /// shared object instead of a value.
     pub ref_structs: Vec<HashSet<String>>,
+    /// Every struct definition by (defining module, name) — the type
+    /// exports ADR 0009 reserved for codegen (field layout and by_ref).
+    pub structs: HashMap<(usize, String), StructType>,
+    /// Field-access resolution for codegen: each `Field` expr's span maps
+    /// to its field's declaration index and type. Spans are file-global
+    /// offsets, so they key uniquely across the whole program.
+    pub field_slots: HashMap<Span, (usize, Type)>,
+    /// Struct-literal resolution for codegen: literal span → the defining
+    /// (module, name) its visible name resolved to.
+    pub struct_lits: HashMap<Span, (usize, String)>,
 }
 
 /// One module's declared names with their export flags.
@@ -156,6 +166,8 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
 
     // Pass D: check every function body against its module's view.
     let paths: Vec<&str> = graph.modules.iter().map(|m| m.path.as_str()).collect();
+    let mut field_slots = HashMap::new();
+    let mut struct_lits = HashMap::new();
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             if let Item::Function(f) = item {
@@ -170,6 +182,8 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                     scopes: Vec::new(),
                     nonnull: Vec::new(),
                     ret: Type::Unit,
+                    field_slots: &mut field_slots,
+                    struct_lits: &mut struct_lits,
                 };
                 checker.check_function(f);
             }
@@ -191,6 +205,9 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
         Resolutions {
             functions: fn_aliases,
             ref_structs,
+            structs,
+            field_slots,
+            struct_lits,
         },
         diags,
     )
@@ -269,6 +286,10 @@ struct Checker<'a> {
     /// any call or field write, since aliases can reach them.
     nonnull: Vec<NarrowFrame>,
     ret: Type,
+    /// Codegen resolution tables filled in as expressions type (see
+    /// `Resolutions::field_slots` / `struct_lits`).
+    field_slots: &'a mut HashMap<Span, (usize, Type)>,
+    struct_lits: &'a mut HashMap<Span, (usize, String)>,
 }
 
 impl<'a> Checker<'a> {
@@ -1015,8 +1036,17 @@ impl<'a> Checker<'a> {
         let field_ty = self
             .structs
             .get(&(*sm, struct_name.clone()))
-            .and_then(|st| st.fields.iter().find(|(fname, _)| fname == field))
-            .map(|(_, ty)| ty.clone());
+            .and_then(|st| {
+                st.fields
+                    .iter()
+                    .position(|(fname, _)| fname == field)
+                    .map(|i| (i, st.fields[i].1.clone()))
+            })
+            .map(|(i, ty)| {
+                // Codegen's layout table: declaration index = word offset.
+                self.field_slots.insert(span, (i, ty.clone()));
+                ty
+            });
         match field_ty {
             Some(ty) if optional => match ty {
                 // `a?.b` is optional; an already-optional field stays flat.
@@ -1057,6 +1087,7 @@ impl<'a> Checker<'a> {
             return Type::Error;
         };
         let decl = &structs[key];
+        self.struct_lits.insert(span, key.clone());
         let mut seen = HashSet::new();
         for (fname, value) in fields {
             if !seen.insert(fname.clone()) {

@@ -25,7 +25,7 @@ best_ms() {
 }
 
 names=("$@")
-if [ ${#names[@]} -eq 0 ]; then names=(fib loop_sum primes collatz array_sum); fi
+if [ ${#names[@]} -eq 0 ]; then names=(fib loop_sum primes collatz array_sum list_sum); fi
 
 printf '%-10s %8s %8s %8s\n' bench ys-ms c-ms ratio
 for name in "${names[@]}"; do

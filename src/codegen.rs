@@ -25,6 +25,7 @@ use crate::check::Resolutions;
 use crate::diagnostic::Diagnostic;
 use crate::modules::ModuleGraph;
 use crate::span::Span;
+use crate::types::Type;
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -167,13 +168,35 @@ impl Emitter<'_> {
     /// Emits one function: prologue, register-spilled params, body,
     /// fall-through epilogue (reachable only for unit functions — the
     /// checker proves value-returning bodies always return).
+    /// The `TypeAnn` mirror of `word_type`, for annotations (params,
+    /// returns, `let`) resolved through this module's visible names.
+    fn word_ann(&self, ty: &TypeAnn, module: usize) -> bool {
+        match ty {
+            TypeAnn::Int | TypeAnn::Bool => true,
+            TypeAnn::Named(n) => self.res.ref_structs[module].contains(n),
+            // Element annotations recurse: `int?[]` is as uncompilable
+            // as a bare `int?` slot.
+            TypeAnn::Array(inner) => self.word_ann(inner, module),
+            TypeAnn::Optional(inner) => match inner.as_ref() {
+                TypeAnn::Named(n) => self.res.ref_structs[module].contains(n),
+                TypeAnn::Array(_) => true,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     fn function(&mut self, f: &Function, module: usize) -> Result<(), Diagnostic> {
         for p in &f.params {
-            if !word_sized(&p.ty) {
+            if !self.word_ann(&p.ty, module) {
                 return Err(unsupported("parameters of this type", f.span));
             }
         }
-        if !f.return_type.as_ref().is_none_or(word_sized) {
+        if !f
+            .return_type
+            .as_ref()
+            .is_none_or(|t| self.word_ann(t, module))
+        {
             return Err(unsupported("this return type", f.span));
         }
         if f.params.len() > ARG_REGS.len() {
@@ -274,7 +297,14 @@ impl Emitter<'_> {
 
     fn stmt(&mut self, stmt: &Stmt) -> Result<(), Diagnostic> {
         match stmt {
-            Stmt::Let { name, value, .. } => {
+            Stmt::Let {
+                name, value, ty, ..
+            } => {
+                if let Some(ann) = ty {
+                    if !self.word_ann(ann, self.module) {
+                        return Err(unsupported("bindings of this type", stmt.span()));
+                    }
+                }
                 self.expr(value)?;
                 self.next_slot -= 8;
                 let off = self.next_slot;
@@ -303,6 +333,20 @@ impl Emitter<'_> {
                     self.bounds_check("%rdx");
                     self.asm
                         .push_str("\tmovq 16(%rdx), %rdx\n\tmovq %rax, (%rdx,%rcx,8)\n");
+                }
+                // `?.` links are not places (the parser rejects them), so
+                // a field target is always a plain, checker-proven-safe
+                // dereference: no null check needed.
+                Expr::Field { base, span, .. } => {
+                    let Some((slot, _)) = self.res.field_slots.get(span) else {
+                        return Err(unsupported("this field target", *span));
+                    };
+                    let off = 8 * slot;
+                    self.expr(base)?;
+                    self.push("%rax");
+                    self.expr(value)?;
+                    self.pop("%rcx");
+                    let _ = writeln!(self.asm, "\tmovq %rax, {off}(%rcx)");
                 }
                 other => return Err(unsupported("this assignment target", other.span())),
             },
@@ -407,6 +451,12 @@ impl Emitter<'_> {
             Expr::Bool(b, _) => {
                 let _ = writeln!(self.asm, "\tmovq ${}, %rax", *b as i64);
             }
+            // `null` is handle 0 — sound because value-typed optionals
+            // never compile (annotation, param, field, and array-literal
+            // gates), so 0 is never a legitimate optional payload.
+            Expr::Null(_) => {
+                self.asm.push_str("\txorl %eax, %eax\n");
+            }
             Expr::Ident(name, span) => match self.lookup(name) {
                 Some(off) => {
                     let _ = writeln!(self.asm, "\tmovq {off}(%rbp), %rax");
@@ -452,9 +502,18 @@ impl Emitter<'_> {
             }
             Expr::Binary {
                 op: BinOp::Coalesce,
-                span,
+                lhs,
+                rhs,
                 ..
-            } => return Err(unsupported("operator '??'", *span)),
+            } => {
+                // A null left side is handle 0 (value optionals never
+                // compile); the right side stays lazy, like the oracle.
+                let end = self.fresh_label();
+                self.expr(lhs)?;
+                let _ = writeln!(self.asm, "\ttestq %rax, %rax\n\tjne {end}");
+                self.expr(rhs)?;
+                let _ = writeln!(self.asm, "{end}:");
+            }
             Expr::Binary { op, lhs, rhs, .. } => {
                 // lhs in %rax, rhs in %rcx. Wrapping add/sub/mul match the
                 // interpreter's wrapping ops; idiv truncates toward zero
@@ -521,7 +580,18 @@ impl Emitter<'_> {
                 }
                 self.call(&label_of(*tm, tname));
             }
-            Expr::ArrayLit { elements, .. } => {
+            Expr::ArrayLit { elements, span } => {
+                // A null element could make the literal an `int?[]` —
+                // a value-optional array the word model can't represent.
+                // ponytail: over-strict for `Node?[]` literals too; build
+                // those with push until the checker exports element types.
+                if let Some(null) = elements.iter().find(|e| matches!(e, Expr::Null(_))) {
+                    let _ = span;
+                    return Err(unsupported(
+                        "array literals with null elements",
+                        null.span(),
+                    ));
+                }
                 // Header {len, cap, data*} plus buffer, per ADR 0014.
                 // Allocation happens before element evaluation — the
                 // ordering difference from the oracle is only observable
@@ -559,6 +629,69 @@ impl Emitter<'_> {
                 self.asm
                     .push_str("\tmovq 16(%rax), %rax\n\tmovq (%rax,%rcx,8), %rax\n");
             }
+            Expr::Field {
+                base,
+                optional,
+                span,
+                ..
+            } => {
+                let Some((slot, field_ty)) = self.res.field_slots.get(span) else {
+                    return Err(unsupported("this field access", *span));
+                };
+                let off = 8 * slot;
+                // `p?.x` with a value-typed x yields `int?` — a value
+                // optional the word model can't represent. Handle-typed
+                // fields are fine, already-optional ones stay flat.
+                let nullable_word = match field_ty {
+                    Type::Optional(inner) => ref_shaped(inner, self.res),
+                    other => ref_shaped(other, self.res),
+                };
+                if *optional && !nullable_word {
+                    return Err(unsupported("'?.' on a field of value type", *span));
+                }
+                self.expr(base)?;
+                if *optional {
+                    // Null short-circuits to null (0 stays in %rax).
+                    let end = self.fresh_label();
+                    let _ = writeln!(self.asm, "\ttestq %rax, %rax\n\tje {end}");
+                    let _ = writeln!(self.asm, "\tmovq {off}(%rax), %rax\n{end}:");
+                } else {
+                    // No null check: the checker's narrowing is sound, so
+                    // a plain `.` base is proven non-null (ADR 0007).
+                    let _ = writeln!(self.asm, "\tmovq {off}(%rax), %rax");
+                }
+            }
+            Expr::StructLit { fields, span, .. } => {
+                let Some(key) = self.res.struct_lits.get(span) else {
+                    return Err(unsupported("this struct literal", *span));
+                };
+                let def = &self.res.structs[key];
+                if !def.by_ref {
+                    return Err(unsupported("value struct literals", *span));
+                }
+                if !def.fields.iter().all(|(_, t)| word_type(t, self.res)) {
+                    return Err(unsupported("structs with fields of this type", *span));
+                }
+                // One heap object, fields at declaration-order word
+                // offsets (ADR 0009's C-style layout). The checker proved
+                // the literal complete, so every slot is written.
+                let size = (def.fields.len() * 8).max(8);
+                let _ = writeln!(self.asm, "\tmovq ${size}, %rdi");
+                self.call("malloc@PLT");
+                self.push("%rax");
+                for (fname, value) in fields {
+                    let slot = def
+                        .fields
+                        .iter()
+                        .position(|(dn, _)| dn == fname)
+                        .expect("checker verified the field exists");
+                    self.expr(value)?;
+                    self.pop("%rcx");
+                    let _ = writeln!(self.asm, "\tmovq %rax, {}(%rcx)", 8 * slot);
+                    self.push("%rcx");
+                }
+                self.pop("%rax");
+            }
             other => return Err(unsupported("this expression", other.span())),
         }
         Ok(())
@@ -587,11 +720,25 @@ impl Emitter<'_> {
     }
 }
 
-/// Types the backend can hold in one register/slot today: ints, bools,
-/// and array handles (whatever their element type — elements the backend
-/// can't produce have no compilable literals anyway).
-fn word_sized(ty: &TypeAnn) -> bool {
-    matches!(ty, TypeAnn::Int | TypeAnn::Bool | TypeAnn::Array(_))
+/// A reference-shaped checker type: a handle where 0 means `null`, so a
+/// `T?` of it is a nullable pointer for free (ADR 0009).
+fn ref_shaped(t: &Type, res: &Resolutions) -> bool {
+    match t {
+        Type::Array(_) => true,
+        Type::Struct(m, n) => res.structs[&(*m, n.clone())].by_ref,
+        _ => false,
+    }
+}
+
+/// A checker type the backend can hold in one word: scalars, handles,
+/// and nullable handles. Value structs (multi-word) and value optionals
+/// (0 and null would share a bit pattern) wait for their own slices.
+fn word_type(t: &Type, res: &Resolutions) -> bool {
+    match t {
+        Type::Int | Type::Bool => true,
+        Type::Optional(inner) => ref_shaped(inner, res),
+        other => ref_shaped(other, res),
+    }
 }
 
 fn unsupported(what: &str, span: Span) -> Diagnostic {
