@@ -105,6 +105,34 @@ fn power_of_two_division_at_the_integer_extremes() {
 }
 
 #[test]
+fn constant_division_across_divisors_and_extremes() {
+    // Magic-multiply strength reduction must agree with idiv for every
+    // divisor shape (odd, even, large) across the dividend extremes.
+    diff(
+        "magicdiv",
+        "fun probe(x: int): int {
+            var acc: int = x / 3 + x % 3;
+            acc = acc + x / 7 - x % 7;
+            acc = acc + x / 10 + x % 10;
+            acc = acc + x / 12 - x % 12;
+            acc = acc + x / 1000 + x % 1000;
+            acc = acc + x / 249 - x % 249;
+            return acc;
+        }
+        fun main(): int {
+            const xs: int[] = [0, 1, -1, 2, -2, 6, -6, 7, -7, 41, -41,
+                100, -100, 123456789, -987654321,
+                9223372036854775807, -9223372036854775807 - 1];
+            var acc: int = 0;
+            for x in xs {
+                acc = acc + probe(x);
+            }
+            return acc % 251;
+        }",
+    );
+}
+
+#[test]
 fn division_truncates_toward_zero() {
     diff("div", "fun main(): int { return -7 / 2; }");
 }

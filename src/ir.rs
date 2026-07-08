@@ -48,6 +48,19 @@ enum Inst {
         src: V,
         k: u32,
     },
+    /// Signed division/remainder by an arbitrary positive constant via
+    /// the multiply-shift sequence (Hacker's Delight 10-4) — ~5 cheap
+    /// instructions instead of idiv's 20-40 cycles.
+    DivMagic {
+        dst: V,
+        src: V,
+        d: i64,
+    },
+    RemMagic {
+        dst: V,
+        src: V,
+        d: i64,
+    },
     Neg(V, V),
     NegF(V, V),
     Not(V, V),
@@ -327,6 +340,24 @@ impl Lowerer<'_> {
                                 });
                                 return Some(v);
                             }
+                            BinOp::Div | BinOp::Rem if *n >= 2 => {
+                                let l = self.expr(lhs)?;
+                                let v = self.fresh(false);
+                                self.insts.push(if matches!(op, BinOp::Div) {
+                                    Inst::DivMagic {
+                                        dst: v,
+                                        src: l,
+                                        d: *n,
+                                    }
+                                } else {
+                                    Inst::RemMagic {
+                                        dst: v,
+                                        src: l,
+                                        d: *n,
+                                    }
+                                });
+                                return Some(v);
+                            }
                             BinOp::Add
                             | BinOp::Sub
                             | BinOp::Mul
@@ -463,9 +494,10 @@ fn intervals(insts: &[Inst], vregs: usize) -> Vec<Interval> {
             Inst::Copy(d, s) => (vec![*s], Some(*d)),
             Inst::Bin { dst, lhs, rhs, .. } => (vec![*lhs, *rhs], Some(*dst)),
             Inst::BinImm { dst, lhs, .. } => (vec![*lhs], Some(*dst)),
-            Inst::DivPow2 { dst, src, .. } | Inst::RemPow2 { dst, src, .. } => {
-                (vec![*src], Some(*dst))
-            }
+            Inst::DivPow2 { dst, src, .. }
+            | Inst::RemPow2 { dst, src, .. }
+            | Inst::DivMagic { dst, src, .. }
+            | Inst::RemMagic { dst, src, .. } => (vec![*src], Some(*dst)),
             Inst::Neg(d, s) | Inst::NegF(d, s) | Inst::Not(d, s) => (vec![*s], Some(*d)),
             Inst::Call { dst, args, .. } => (args.clone(), Some(*dst)),
             Inst::Ret(v) => (vec![*v], None),
@@ -606,6 +638,40 @@ fn allocate(
         }
     }
     (loc, used_callee, next_spill)
+}
+
+/// Hacker's Delight 10-4: the multiplier and shift for signed division
+/// by a positive constant. Valid for every i64 dividend, MIN included.
+fn magic_i64(d: i64) -> (i64, u32) {
+    debug_assert!(d >= 2);
+    let ad = d as u128;
+    let two63: u128 = 1 << 63;
+    let anc = two63 - 1 - (two63 % ad);
+    let mut p: u32 = 63;
+    let mut q1 = two63 / anc;
+    let mut r1 = two63 - q1 * anc;
+    let mut q2 = two63 / ad;
+    let mut r2 = two63 - q2 * ad;
+    loop {
+        p += 1;
+        q1 *= 2;
+        r1 *= 2;
+        if r1 >= anc {
+            q1 += 1;
+            r1 -= anc;
+        }
+        q2 *= 2;
+        r2 *= 2;
+        if r2 >= ad {
+            q2 += 1;
+            r2 -= ad;
+        }
+        let delta = ad - r2;
+        if q1 >= delta && !(q1 == delta && r1 == 0) {
+            break;
+        }
+    }
+    ((q2 + 1) as u64 as i64, p - 64)
 }
 
 // ---- Emission ------------------------------------------------------------
@@ -750,6 +816,37 @@ fn emit(name: &str, module: usize, nparams: usize, lo: Lowerer) -> String {
                     at(*src),
                     at(*dst)
                 );
+            }
+            Inst::DivMagic { dst, src, d } | Inst::RemMagic { dst, src, d } => {
+                // q = mulhi(M, n) [+ n when M < 0], >> s, +1 when
+                // negative — the exact idiv result for every dividend.
+                // %rcx/%rdx are reserved scratch; src's home register is
+                // never among them, so re-reading it stays safe.
+                let (m, shift) = magic_i64(*d);
+                let _ = writeln!(
+                    a,
+                    "\tmovq {}, %rax\n\tmovabsq ${m}, %rcx\n\timulq %rcx",
+                    at(*src)
+                );
+                if m < 0 {
+                    let _ = writeln!(a, "\taddq {}, %rdx", at(*src));
+                }
+                if shift > 0 {
+                    let _ = writeln!(a, "\tsarq ${shift}, %rdx");
+                }
+                a.push_str("\tmovq %rdx, %rcx\n\tshrq $63, %rcx\n\taddq %rcx, %rdx\n");
+                if matches!(inst, Inst::RemMagic { .. }) {
+                    // r = n - q * d, keeping the dividend's sign.
+                    let _ = writeln!(
+                        a,
+                        "\tmovabsq ${d}, %rcx\n\timulq %rcx, %rdx\n\tmovq {}, %rax\n\
+                         \tsubq %rdx, %rax\n\tmovq %rax, {}",
+                        at(*src),
+                        at(*dst)
+                    );
+                } else {
+                    let _ = writeln!(a, "\tmovq %rdx, {}", at(*dst));
+                }
             }
             Inst::Neg(d, s) => {
                 let _ = writeln!(
