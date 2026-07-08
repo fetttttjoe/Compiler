@@ -802,6 +802,81 @@ fn assignment_evaluates_the_value_first() {
 }
 
 #[test]
+fn float_arithmetic_and_comparisons() {
+    diff(
+        "floats",
+        "fun main(): int {
+            const a: float = 2.5;
+            var b: float = a * 4.0 - 1.5;
+            b = b / 2.0 + 0.25;
+            var r: int = 0;
+            if b == 4.5 { r = r + 1; }
+            if a < b { r = r + 10; }
+            if b <= 4.5 { r = r + 100; }
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn float_ieee_edge_cases() {
+    diff(
+        "ieee",
+        "fun main(): int {
+            const zero: float = 0.0;
+            const nan: float = zero / zero;
+            const inf: float = 1.0 / zero;
+            var r: int = 0;
+            if nan == nan { r = r + 1; }
+            if nan != nan { r = r + 2; }
+            if nan < 1.0 { r = r + 4; }
+            if nan >= 1.0 { r = r + 8; }
+            if -0.0 == 0.0 { r = r + 16; }
+            if inf > 1000000.0 { r = r + 32; }
+            if -inf < inf { r = r + 64; }
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn float_remainder_matches_fmod() {
+    diff(
+        "fmod",
+        "fun main(): int {
+            var r: int = 0;
+            if 7.5 % 2.0 == 1.5 { r = r + 1; }
+            if -7.5 % 2.0 == -1.5 { r = r + 10; }
+            if 7.5 % -2.0 == 1.5 { r = r + 100; }
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn floats_through_calls_arrays_and_fields() {
+    diff(
+        "floatflow",
+        "refstruct Point { x: float, y: float }
+        fun dist2(p: Point): float { return p.x * p.x + p.y * p.y; }
+        fun main(): int {
+            const p: Point = Point { x: 3.0, y: 4.0 };
+            var samples: float[] = [0.5, 1.5];
+            push(samples, 2.5);
+            var sum: float = 0.0;
+            for s in samples {
+                sum = sum + s;
+            }
+            var r: int = 0;
+            if dist2(p) == 25.0 { r = r + 1; }
+            if sum == 4.5 { r = r + 10; }
+            if -p.x == 0.0 - 3.0 { r = r + 100; }
+            return r;
+        }",
+    );
+}
+
+#[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as
     // tall as the chain is long; 6000 terms used to overflow the checker's

@@ -202,10 +202,12 @@ fn build(
         print_error(&format!("cannot write {}: {e}", asm_path.display()));
         std::process::exit(1);
     }
+    // -lm: float `%` compiles to fmod, which lives in libm.
     match std::process::Command::new("cc")
         .arg(&asm_path)
         .arg("-o")
         .arg(out)
+        .arg("-lm")
         .status()
     {
         Ok(status) if status.success() => {}

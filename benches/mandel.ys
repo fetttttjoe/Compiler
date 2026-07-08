@@ -1,0 +1,31 @@
+fun escapes(cr: float, ci: float): bool {
+    var zr: float = 0.0;
+    var zi: float = 0.0;
+    var i: int = 0;
+    while i < 100 {
+        const zr2: float = zr * zr - zi * zi + cr;
+        zi = 2.0 * zr * zi + ci;
+        zr = zr2;
+        if zr * zr + zi * zi > 4.0 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fun main(): int {
+    var inside: int = 0;
+    var ci: float = -1.25;
+    var y: int = 0;
+    while y < 400 {
+        var cr: float = -2.0;
+        var x: int = 0;
+        while x < 400 {
+            if !escapes(cr, ci) { inside = inside + 1; }
+            cr = cr + 0.00625;
+            x = x + 1;
+        }
+        ci = ci + 0.00625;
+        y = y + 1;
+    }
+    return inside % 251;
+}

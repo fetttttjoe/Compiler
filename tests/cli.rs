@@ -152,26 +152,26 @@ fn undeliverable_output_is_not_a_silent_success() {
     assert!(!status.success(), "ENOSPC must not look like success");
 }
 
+/// Printing floats needs formatting parity with Rust's f64 Display —
+/// its own project, gated until then.
 #[test]
-fn build_rejects_unsupported_constructs_with_a_diagnostic() {
-    let dir = tempdir();
-    // floats and value-struct literals are still beyond codegen; value
-    // optionals (int?) are gated because 0 and null would be one bit
-    // pattern in the word-sized model.
-    std::fs::write(
-        dir.join("uncompilable.ys"),
-        "fun main(): int { var f: float = 1.5; f = f * 2.0; return 1; }",
-    )
-    .unwrap();
-    let out = compiler(&[
-        "build",
-        dir.join("uncompilable.ys").to_str().unwrap(),
-        "-o",
-        dir.join("uncompilable").to_str().unwrap(),
-    ]);
-    assert_eq!(out.status.code(), Some(1));
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("not yet compilable"), "{err}");
+fn printing_floats_is_not_yet_compilable() {
+    assert_not_yet_compilable("printfloat", "fun main(): int { print(1.5); return 0; }");
+}
+
+/// memcmp can't decide float equality (NaN, negative zero), so structs
+/// with float fields can't use the one-memcmp equality path.
+#[test]
+fn equality_on_structs_containing_floats_is_gated() {
+    assert_not_yet_compilable(
+        "floateq",
+        "struct V { f: float }
+        fun main(): int {
+            const a: V = V { f: 1.0 };
+            if a == (V { f: 1.0 }) { return 1; }
+            return 0;
+        }",
+    );
 }
 
 /// The end-to-end milestone: the multi-module fib example compiles to a

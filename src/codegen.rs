@@ -169,13 +169,18 @@ fn ref_shaped(t: &Type, res: &Resolutions) -> bool {
 }
 
 /// The backend's view of a value: one word (scalars, handles), a str
-/// (two-word fat pointer, content equality), or a value struct (N words,
-/// memcmp equality unless a str hides inside).
+/// (two-word fat pointer, content equality), or a value struct.
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Word,
     Str,
-    Struct { words: usize, has_str: bool },
+    /// A value struct: total words + whether one memcmp can decide its
+    /// equality (str fields compare by content, float fields by IEEE —
+    /// NaN and negative zero break bitwise comparison).
+    Struct {
+        words: usize,
+        no_memcmp: bool,
+    },
 }
 
 impl Kind {
@@ -231,7 +236,7 @@ impl Emitter<'_> {
     /// the fuel guard catches it; values that deep can't exist).
     fn kind_of(&self, t: &Type, fuel: usize) -> Option<Kind> {
         match t {
-            Type::Int | Type::Bool => Some(Kind::Word),
+            Type::Int | Type::Bool | Type::Float => Some(Kind::Word),
             // A nullable handle is a word only if the handle itself is a
             // compilable word (an `int?[]?` must stay as gated as `int?`).
             Type::Optional(inner) => (ref_shaped(inner, self.res)
@@ -250,24 +255,25 @@ impl Emitter<'_> {
                 }
                 let next = fuel.checked_sub(1)?;
                 let mut words = 0;
-                let mut has_str = false;
+                let mut no_memcmp = false;
                 for (_, ft) in &def.fields {
+                    no_memcmp |= matches!(ft, Type::Float);
                     match self.kind_of(ft, next)? {
                         Kind::Word => words += 1,
                         Kind::Str => {
                             words += 2;
-                            has_str = true;
+                            no_memcmp = true;
                         }
                         Kind::Struct {
                             words: w,
-                            has_str: h,
+                            no_memcmp: n,
                         } => {
                             words += w;
-                            has_str |= h;
+                            no_memcmp |= n;
                         }
                     }
                 }
-                Some(Kind::Struct { words, has_str })
+                Some(Kind::Struct { words, no_memcmp })
             }
             _ => None,
         }
@@ -291,7 +297,7 @@ impl Emitter<'_> {
     /// `kind_of` for annotations, resolved through `module`'s names.
     fn ann_kind(&self, ty: &TypeAnn, module: usize) -> Option<Kind> {
         match ty {
-            TypeAnn::Int | TypeAnn::Bool => Some(Kind::Word),
+            TypeAnn::Int | TypeAnn::Bool | TypeAnn::Float => Some(Kind::Word),
             TypeAnn::Str => Some(Kind::Str),
             // Element annotations must be single words: `int?[]` is as
             // uncompilable as a bare `int?`, `Point[]` needs strides.
@@ -310,7 +316,6 @@ impl Emitter<'_> {
                 let key = self.res.types[module].get(n)?;
                 self.kind_of(&Type::Struct(key.0, key.1.clone()), FUEL)
             }
-            _ => None,
         }
     }
 
@@ -321,6 +326,12 @@ impl Emitter<'_> {
         def.fields[..index].iter().try_fold(0, |sum, (_, ft)| {
             Some(sum + 8 * self.type_words(ft, FUEL)? as i64)
         })
+    }
+
+    /// True when the checker typed this expression as a float — float
+    /// operations use SSE, everything else shares the integer paths.
+    fn is_float(&self, e: &Expr) -> bool {
+        matches!(self.res.expr_types.get(&e.span()), Some(Type::Float))
     }
 
     /// An expression's backend kind, straight from the checker's
@@ -700,6 +711,11 @@ impl Emitter<'_> {
             Expr::Bool(b, _) => {
                 let _ = writeln!(self.asm, "\tmovq ${}, %rax", *b as i64);
             }
+            // Floats travel as their bit pattern in the integer paths;
+            // only the operations touch SSE.
+            Expr::Float(f, _) => {
+                let _ = writeln!(self.asm, "\tmovabsq ${}, %rax", f.to_bits() as i64);
+            }
             // `null` is handle 0 — sound because value-typed optionals
             // never compile (annotation, param, field, and array-literal
             // gates), so 0 is never a legitimate optional payload.
@@ -725,8 +741,12 @@ impl Emitter<'_> {
                 None => return Err(unsupported("this name", *span)),
             },
             Expr::Unary { op, rhs, .. } => {
+                let float = self.is_float(rhs);
                 self.expr(rhs)?;
                 match op {
+                    // Float negation flips the sign bit, exactly like
+                    // Rust's `-x` (NaN and zero included).
+                    UnOp::Neg if float => self.asm.push_str("\tbtcq $63, %rax\n"),
                     UnOp::Neg => self.asm.push_str("\tnegq %rax\n"),
                     // Bools are exactly 0 or 1, so `!` is one bit flip.
                     UnOp::Not => self.asm.push_str("\txorq $1, %rax\n"),
@@ -827,10 +847,15 @@ impl Emitter<'_> {
                                  \tjmp {end}\n{differ}:\n\txorl %eax, %eax\n{end}:"
                             );
                         }
-                        // A str field inside means one memcmp would
-                        // compare descriptors, not content.
-                        Kind::Struct { has_str: true, .. } => {
-                            return Err(unsupported("'==' on structs containing strings", *span));
+                        // str fields compare by content and float fields
+                        // by IEEE — one memcmp decides neither.
+                        Kind::Struct {
+                            no_memcmp: true, ..
+                        } => {
+                            return Err(unsupported(
+                                "'==' on structs containing strings or floats",
+                                *span,
+                            ));
                         }
                         // Value-struct equality is structural: the layout
                         // is padding-free 8-byte words, so memcmp decides.
@@ -856,6 +881,49 @@ impl Emitter<'_> {
                     }
                     if matches!(op, BinOp::Ne) {
                         self.asm.push_str("\txorq $1, %rax\n");
+                    }
+                    return Ok(());
+                }
+                if self.is_float(lhs) {
+                    // IEEE via SSE: lhs in %xmm0, rhs in %xmm1. Division
+                    // by zero yields inf/NaN (no traps), `%` is fmod, and
+                    // the cmpXXsd predicates give the oracle's unordered
+                    // semantics (NaN == NaN false, NaN != NaN true).
+                    self.expr(lhs)?;
+                    self.push("%rax");
+                    self.expr(rhs)?;
+                    self.asm.push_str("\tmovq %rax, %xmm1\n");
+                    self.pop("%rax");
+                    self.asm.push_str("\tmovq %rax, %xmm0\n");
+                    match op {
+                        BinOp::Add => self.asm.push_str("\taddsd %xmm1, %xmm0\n"),
+                        BinOp::Sub => self.asm.push_str("\tsubsd %xmm1, %xmm0\n"),
+                        BinOp::Mul => self.asm.push_str("\tmulsd %xmm1, %xmm0\n"),
+                        BinOp::Div => self.asm.push_str("\tdivsd %xmm1, %xmm0\n"),
+                        BinOp::Rem => self.call("fmod@PLT"),
+                        // Predicates leave an all-ones/zero mask; Gt/Ge
+                        // swap operands (result lands in %xmm1 then).
+                        BinOp::Eq => self.asm.push_str("\tcmpeqsd %xmm1, %xmm0\n"),
+                        BinOp::Ne => self.asm.push_str("\tcmpneqsd %xmm1, %xmm0\n"),
+                        BinOp::Lt => self.asm.push_str("\tcmpltsd %xmm1, %xmm0\n"),
+                        BinOp::Le => self.asm.push_str("\tcmplesd %xmm1, %xmm0\n"),
+                        BinOp::Gt => self.asm.push_str("\tcmpltsd %xmm0, %xmm1\n"),
+                        BinOp::Ge => self.asm.push_str("\tcmplesd %xmm0, %xmm1\n"),
+                        BinOp::And | BinOp::Or | BinOp::Coalesce => {
+                            unreachable!("handled above")
+                        }
+                    }
+                    let src = if matches!(op, BinOp::Gt | BinOp::Ge) {
+                        "%xmm1"
+                    } else {
+                        "%xmm0"
+                    };
+                    let _ = writeln!(self.asm, "\tmovq {src}, %rax");
+                    if matches!(
+                        op,
+                        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                    ) {
+                        self.asm.push_str("\tandq $1, %rax\n");
                     }
                     return Ok(());
                 }
@@ -1089,7 +1157,6 @@ impl Emitter<'_> {
                     let _ = writeln!(self.asm, "\tleaq {base}(%rbp), %rax");
                 }
             }
-            other => return Err(unsupported("this expression", other.span())),
         }
         Ok(())
     }
@@ -1147,6 +1214,11 @@ impl Emitter<'_> {
                              \tleaq .Lfmt_str(%rip), %rdi\n\txorl %eax, %eax\n",
                         );
                         self.call("printf@PLT");
+                    }
+                    Type::Float => {
+                        // Formatting parity with Rust's f64 Display is
+                        // its own project (shortest round-trip repr).
+                        return Err(unsupported("printing floats", span));
                     }
                     _ => return Err(unsupported("printing values of this type", span)),
                 }
