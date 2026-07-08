@@ -1,5 +1,6 @@
 mod ast;
 mod check;
+mod codegen;
 mod diagnostic;
 mod interpreter;
 mod lexer;
@@ -19,10 +20,27 @@ use std::io::{IsTerminal, Write};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [entry] = args.as_slice() else {
-        let _ = writeln!(std::io::stderr(), "usage: compiler <entry.ys>");
-        std::process::exit(2);
+    // `compiler <entry>` interprets; `compiler build <entry> [-o <out>]`
+    // compiles to a native binary. `out` defaults to the entry's stem in
+    // the current directory.
+    let (entry, build_out) = match args.as_slice() {
+        [entry] => (entry, None),
+        [cmd, entry] if cmd == "build" => (entry, Some(default_out(entry))),
+        [cmd, entry, flag, out] if cmd == "build" && flag == "-o" => {
+            (entry, Some(std::path::PathBuf::from(out)))
+        }
+        _ => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "usage: compiler <entry.ys>\n       compiler build <entry.ys> [-o <out>]"
+            );
+            std::process::exit(2);
+        }
     };
+    if build_out.as_deref() == Some(std::path::Path::new(entry)) {
+        print_error("output binary would overwrite the source file");
+        std::process::exit(1);
+    }
 
     let mut map = SourceMap::new();
     let mut read = |path: &str| std::fs::read_to_string(path).map_err(|e| e.to_string());
@@ -47,6 +65,10 @@ fn main() {
         std::process::exit(1);
     }
 
+    if let Some(out) = build_out {
+        return build(&graph, &out, &map);
+    }
+
     match interpreter::interpret(&graph, &resolutions) {
         Ok((value, heap)) => {
             use std::io::Write;
@@ -60,6 +82,45 @@ fn main() {
             }
         }
         Err(diag) => exit_on_errors(&[diag], &map),
+    }
+}
+
+/// The default `build` output: the entry's file stem in the current
+/// directory (examples/main.ys → ./main).
+fn default_out(entry: &str) -> std::path::PathBuf {
+    std::path::Path::new(entry)
+        .file_stem()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("a.out"))
+}
+
+/// Emits assembly next to `out` (kept on disk — it's the debug artifact)
+/// and links it through the system `cc`.
+fn build(graph: &modules::ModuleGraph, out: &std::path::Path, map: &SourceMap) {
+    let asm = match codegen::compile(graph) {
+        Ok(asm) => asm,
+        Err(diag) => return exit_on_errors(&[diag], map),
+    };
+    let asm_path = out.with_extension("s");
+    if let Err(e) = std::fs::write(&asm_path, asm) {
+        print_error(&format!("cannot write {}: {e}", asm_path.display()));
+        std::process::exit(1);
+    }
+    match std::process::Command::new("cc")
+        .arg(&asm_path)
+        .arg("-o")
+        .arg(out)
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            print_error(&format!("cc failed ({status})"));
+            std::process::exit(1);
+        }
+        Err(e) => {
+            print_error(&format!("cannot run cc: {e}"));
+            std::process::exit(1);
+        }
     }
 }
 

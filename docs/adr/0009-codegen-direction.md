@@ -1,6 +1,8 @@
-# ADR 0009 — Codegen Direction (Proposed)
+# ADR 0009 — Codegen Direction (Accepted)
 
-- **Status:** Proposed — design pinned, no code yet
+- **Status:** Accepted — first milestone landed: `compiler build` compiles
+  `main` returning an int expression, linked via `cc`, exit code diffed
+  against the interpreter in `tests/diff.rs`
 - **Date:** 2026-07-07
 - **Extends:** ADR 0001 (fills the reserved `codegen` seat), ADR 0005
   (value semantics and the efficiency mandate), ADR 0006/0008 (reference

@@ -135,3 +135,35 @@ fn undeliverable_output_is_not_a_silent_success() {
         .unwrap();
     assert!(!status.success(), "ENOSPC must not look like success");
 }
+
+#[test]
+fn build_rejects_unsupported_constructs_with_a_diagnostic() {
+    let dir = tempdir();
+    std::fs::write(
+        dir.join("uncompilable.ys"),
+        "fun main(): int { var x: int = 1; return x; }",
+    )
+    .unwrap();
+    let out = compiler(&[
+        "build",
+        dir.join("uncompilable.ys").to_str().unwrap(),
+        "-o",
+        dir.join("uncompilable").to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not yet compilable"), "{err}");
+}
+
+#[test]
+fn build_refuses_to_overwrite_its_own_source() {
+    let dir = tempdir();
+    // An extensionless entry whose default output stem is the file itself.
+    let src = dir.join("clobber");
+    std::fs::write(&src, "fun main(): int { return 1; }").unwrap();
+    let out = compiler(&["build", "-o", "ignored", src.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2)); // -o before entry is a usage error
+    let out = compiler(&["build", src.to_str().unwrap(), "-o", src.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("overwrite"));
+}
