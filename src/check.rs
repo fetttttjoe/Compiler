@@ -29,15 +29,16 @@ pub struct Resolutions {
     /// to its base struct, field index, and field type. Spans are
     /// file-global offsets, so they key uniquely across the whole program.
     pub field_slots: HashMap<Span, FieldSlot>,
-    /// Struct-literal resolution for codegen: literal span → the defining
-    /// (module, name) its visible name resolved to.
-    pub struct_lits: HashMap<Span, (usize, String)>,
     /// Per module: every visible type name → its defining (module, name),
     /// so codegen can resolve `Named` annotations to `structs` entries.
     pub types: Vec<Alias>,
-    /// The argument type of each `print` call (keyed by call span), so
-    /// codegen picks the right formatting without re-deriving types.
-    pub print_types: HashMap<Span, Type>,
+    /// Every function's resolved signature by (defining module, name).
+    pub sigs: HashMap<(usize, String), FnSig>,
+    /// The type of every checked expression, keyed by its span (spans are
+    /// file-global offsets, unique program-wide). Narrowed where narrowing
+    /// applies — which is exactly what codegen wants. Codegen never
+    /// re-derives a type.
+    pub expr_types: HashMap<Span, Type>,
 }
 
 /// A resolved field access (see `Resolutions::field_slots`).
@@ -180,8 +181,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
     // Pass D: check every function body against its module's view.
     let paths: Vec<&str> = graph.modules.iter().map(|m| m.path.as_str()).collect();
     let mut field_slots = HashMap::new();
-    let mut struct_lits = HashMap::new();
-    let mut print_types = HashMap::new();
+    let mut expr_types = HashMap::new();
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             if let Item::Function(f) = item {
@@ -197,11 +197,25 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                     nonnull: Vec::new(),
                     ret: Type::Unit,
                     field_slots: &mut field_slots,
-                    struct_lits: &mut struct_lits,
-                    print_types: &mut print_types,
+                    expr_types: &mut expr_types,
                 };
                 checker.check_function(f);
             }
+        }
+    }
+
+    // Entry rule, owned by the checker so every entry path agrees: the
+    // interpreter calls `main` with no arguments, and compiled main would
+    // read argc/argv as its parameters.
+    if let Some(f) = graph.modules[0].ast.iter().find_map(|item| match item {
+        Item::Function(f) if f.name == "main" => Some(f),
+        _ => None,
+    }) {
+        if !f.params.is_empty() {
+            diags.push(Diagnostic::error(
+                "'main' takes no parameters".to_string(),
+                f.span,
+            ));
         }
     }
 
@@ -222,9 +236,9 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
             ref_structs,
             structs,
             field_slots,
-            struct_lits,
             types: ty_aliases,
-            print_types,
+            sigs,
+            expr_types,
         },
         diags,
     )
@@ -306,8 +320,7 @@ struct Checker<'a> {
     /// Codegen resolution tables filled in as expressions type (see
     /// `Resolutions::field_slots` / `struct_lits`).
     field_slots: &'a mut HashMap<Span, FieldSlot>,
-    struct_lits: &'a mut HashMap<Span, (usize, String)>,
-    print_types: &'a mut HashMap<Span, Type>,
+    expr_types: &'a mut HashMap<Span, Type>,
 }
 
 impl<'a> Checker<'a> {
@@ -666,6 +679,14 @@ impl<'a> Checker<'a> {
     // parser bounds AST height at construction (`MAX_FN_OPS`), and the
     // pipeline runs on a worker stack sized for that bound (main.rs).
     fn type_of_expr(&mut self, expr: &Expr) -> Type {
+        let ty = self.type_of_expr_inner(expr);
+        // The per-expression type table (Resolutions::expr_types) — the
+        // one choke point every typing pass flows through.
+        self.expr_types.insert(expr.span(), ty.clone());
+        ty
+    }
+
+    fn type_of_expr_inner(&mut self, expr: &Expr) -> Type {
         match expr {
             Expr::Int(_, _) => Type::Int,
             Expr::Float(_, _) => Type::Float,
@@ -872,8 +893,7 @@ impl<'a> Checker<'a> {
                     );
                 }
                 for arg in args {
-                    let ty = self.type_of_expr(arg); // any type prints
-                    self.print_types.insert(span, ty);
+                    self.type_of_expr(arg); // any type prints
                 }
                 return Type::Unit;
             }
@@ -1114,7 +1134,6 @@ impl<'a> Checker<'a> {
             return Type::Error;
         };
         let decl = &structs[key];
-        self.struct_lits.insert(span, key.clone());
         let mut seen = HashSet::new();
         for (fname, value) in fields {
             if !seen.insert(fname.clone()) {

@@ -36,6 +36,10 @@ use std::fmt::Write;
 /// System V integer argument registers, in order.
 const ARG_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
 
+/// Recursion bound for layout walks — a recursive value struct has
+/// infinite size; its values can't exist, so hitting this is diagnostic.
+const FUEL: usize = 64;
+
 /// Compiles the checked program to assembly text: every function in every
 /// module (like a C translation unit — an unreachable function must still
 /// compile), calls resolved through the same alias maps the interpreter
@@ -63,27 +67,10 @@ pub fn compile(
         ret_words: 1,
         sret_slot: None,
         res,
-        returns: &HashMap::new(),
         data: String::new(),
         relro: String::new(),
         str_ids: HashMap::new(),
     };
-
-    // Return-size table: which callees hand their value back through a
-    // hidden destination pointer (multi-word value structs).
-    let mut returns = HashMap::new();
-    for (mi, module) in graph.modules.iter().enumerate() {
-        for item in &module.ast {
-            if let Item::Function(f) = item {
-                let kind = match &f.return_type {
-                    None => Kind::Word,
-                    Some(t) => e.ann_kind(t, mi).unwrap_or(Kind::Word),
-                };
-                returns.insert((mi, f.name.clone()), kind);
-            }
-        }
-    }
-    e.returns = &returns;
 
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
@@ -231,8 +218,6 @@ struct Emitter<'a> {
     /// Frame slot holding the incoming sret destination pointer.
     sret_slot: Option<i64>,
     res: &'a Resolutions,
-    /// Return kinds of every user function, for sret call sites.
-    returns: &'a HashMap<(usize, String), Kind>,
     /// Read-only data: string literal bytes (deduplicated) — and their
     /// descriptors, which need load-time relocations (.data.rel.ro).
     data: String,
@@ -292,6 +277,17 @@ impl Emitter<'_> {
         self.kind_of(t, fuel).map(Kind::words)
     }
 
+    /// A callee's return kind, from the checker's signature table.
+    /// Word for unit and for anything not yet compilable (those callees
+    /// fail their own gates before any call site matters).
+    fn ret_kind_of(&self, key: &(usize, String)) -> Kind {
+        self.res
+            .sigs
+            .get(key)
+            .and_then(|sig| self.kind_of(&sig.ret, FUEL))
+            .unwrap_or(Kind::Word)
+    }
+
     /// `kind_of` for annotations, resolved through `module`'s names.
     fn ann_kind(&self, ty: &TypeAnn, module: usize) -> Option<Kind> {
         match ty {
@@ -312,7 +308,7 @@ impl Emitter<'_> {
             },
             TypeAnn::Named(n) => {
                 let key = self.res.types[module].get(n)?;
-                self.kind_of(&Type::Struct(key.0, key.1.clone()), 64)
+                self.kind_of(&Type::Struct(key.0, key.1.clone()), FUEL)
             }
             _ => None,
         }
@@ -323,48 +319,20 @@ impl Emitter<'_> {
     fn offset_of(&self, base: &(usize, String), index: usize) -> Option<i64> {
         let def = &self.res.structs[base];
         def.fields[..index].iter().try_fold(0, |sum, (_, ft)| {
-            Some(sum + 8 * self.type_words(ft, 64)? as i64)
+            Some(sum + 8 * self.type_words(ft, FUEL)? as i64)
         })
     }
 
-    /// An expression's backend kind, from the resolution tables the
-    /// checker exported — everything not struct- or str-shaped is a word.
+    /// An expression's backend kind, straight from the checker's
+    /// per-expression type table — codegen never re-derives a type.
+    /// (The Word fallback covers spans the checker never typed, which a
+    /// checked program only produces for the `null` literal.)
     fn expr_kind(&self, e: &Expr) -> Kind {
-        match e {
-            Expr::Str(..) => Kind::Str,
-            // `+` concatenates when its operands are strings.
-            Expr::Binary {
-                op: BinOp::Add,
-                lhs,
-                ..
-            } => match self.expr_kind(lhs) {
-                Kind::Str => Kind::Str,
-                _ => Kind::Word,
-            },
-            Expr::Ident(name, _) => self.lookup(name).map_or(Kind::Word, |l| l.kind),
-            Expr::Field { span, .. } => self
-                .res
-                .field_slots
-                .get(span)
-                .and_then(|slot| self.kind_of(&slot.ty, 64))
-                .unwrap_or(Kind::Word),
-            Expr::StructLit { span, .. } => self
-                .res
-                .struct_lits
-                .get(span)
-                .filter(|key| !self.res.structs[*key].by_ref)
-                .and_then(|key| self.kind_of(&Type::Struct(key.0, key.1.clone()), 64))
-                .unwrap_or(Kind::Word),
-            Expr::Call { callee, .. } => match callee.as_ref() {
-                Expr::Ident(name, _) => self.res.functions[self.module]
-                    .get(name)
-                    .and_then(|key| self.returns.get(key))
-                    .copied()
-                    .unwrap_or(Kind::Word),
-                _ => Kind::Word,
-            },
-            _ => Kind::Word,
-        }
+        self.res
+            .expr_types
+            .get(&e.span())
+            .and_then(|t| self.kind_of(t, FUEL))
+            .unwrap_or(Kind::Word)
     }
 
     /// Emits one function: body first into a side buffer (so the frame
@@ -376,17 +344,15 @@ impl Emitter<'_> {
         self.next_slot = 0;
         self.min_slot = 0;
         self.depth = 0;
-        self.ret_words = match &f.return_type {
-            None => 1,
-            Some(t) => self
-                .ann_kind(t, module)
-                .ok_or_else(|| unsupported("this return type", f.span))?
-                .words(),
-        };
-        let ret_kind = match &f.return_type {
-            None => Kind::Word,
-            Some(t) => self.ann_kind(t, module).unwrap_or(Kind::Word),
-        };
+        let key = (module, f.name.clone());
+        if f.return_type.is_some() {
+            let sig = &self.res.sigs[&key];
+            if self.kind_of(&sig.ret, FUEL).is_none() {
+                return Err(unsupported("this return type", f.span));
+            }
+        }
+        let ret_kind = self.ret_kind_of(&key);
+        self.ret_words = ret_kind.words();
         let sret = ret_kind != Kind::Word;
         if f.params.len() + sret as usize > ARG_REGS.len() {
             return Err(unsupported("more than 6 parameters", f.span));
@@ -404,9 +370,10 @@ impl Emitter<'_> {
         // Params: scalars and handles arrive by value, value structs as
         // pointers to the caller's storage (read-only by checker rule).
         let mut params = HashMap::new();
-        for (i, p) in f.params.iter().enumerate() {
+        let param_types = self.res.sigs[&key].params.clone();
+        for (i, (p, ty)) in f.params.iter().zip(&param_types).enumerate() {
             let kind = self
-                .ann_kind(&p.ty, module)
+                .kind_of(ty, FUEL)
                 .ok_or_else(|| unsupported("parameters of this type", f.span))?;
             let slot = self.alloc(1);
             let reg = ARG_REGS[i + sret as usize];
@@ -486,6 +453,18 @@ impl Emitter<'_> {
         let _ = writeln!(self.asm, "\tmovq ${words}, %rcx\n\trep movsq");
     }
 
+    /// Stores %rax into the memory operand `dst`, dispatching on kind —
+    /// words move inline, pointer-valued values (structs, strings) copy
+    /// their storage. The one store path every consumer shares.
+    fn store(&mut self, kind: Kind, dst: &str) {
+        if kind == Kind::Word {
+            let _ = writeln!(self.asm, "\tmovq %rax, {dst}");
+        } else {
+            let _ = writeln!(self.asm, "\tleaq {dst}, %rdi\n\tmovq %rax, %rsi");
+            self.copy(kind.words());
+        }
+    }
+
     /// ADR 0008's runtime bounds check: index in %rcx against the length
     /// of the array whose handle is in `hdl`. Unsigned compare catches
     /// negatives; out of bounds aborts — the deferred-trap policy (like
@@ -533,12 +512,7 @@ impl Emitter<'_> {
                 self.expr(value)?;
                 // Dispatch on kind, never on width: a one-field value
                 // struct is one word wide but still pointer-valued.
-                if kind == Kind::Word {
-                    let _ = writeln!(self.asm, "\tmovq %rax, {off}(%rbp)");
-                } else {
-                    let _ = writeln!(self.asm, "\tleaq {off}(%rbp), %rdi\n\tmovq %rax, %rsi");
-                    self.copy(kind.words());
-                }
+                self.store(kind, &format!("{off}(%rbp)"));
                 self.scopes
                     .last_mut()
                     .expect("a scope is always open")
@@ -560,16 +534,7 @@ impl Emitter<'_> {
                         return Err(unsupported("this assignment target", *span));
                     };
                     self.expr(value)?;
-                    if local.kind == Kind::Word {
-                        let _ = writeln!(self.asm, "\tmovq %rax, {}(%rbp)", local.off);
-                    } else {
-                        let _ = writeln!(
-                            self.asm,
-                            "\tleaq {}(%rbp), %rdi\n\tmovq %rax, %rsi",
-                            local.off
-                        );
-                        self.copy(local.kind.words());
-                    }
+                    self.store(local.kind, &format!("{}(%rbp)", local.off));
                 }
                 Expr::Index { base, index, .. } => {
                     // The oracle evaluates the value BEFORE the target's
@@ -595,7 +560,7 @@ impl Emitter<'_> {
                         return Err(unsupported("this field target", *span));
                     };
                     let kind = self
-                        .kind_of(&slot.ty, 64)
+                        .kind_of(&slot.ty, FUEL)
                         .ok_or_else(|| unsupported("fields of this type", *span))?;
                     let off = self
                         .offset_of(&slot.base, slot.index)
@@ -606,12 +571,7 @@ impl Emitter<'_> {
                     self.expr(base)?;
                     self.asm.push_str("\tmovq %rax, %rdi\n");
                     self.pop("%rax");
-                    if kind == Kind::Word {
-                        let _ = writeln!(self.asm, "\tmovq %rax, {off}(%rdi)");
-                    } else {
-                        let _ = writeln!(self.asm, "\tleaq {off}(%rdi), %rdi\n\tmovq %rax, %rsi");
-                        self.copy(kind.words());
-                    }
+                    self.store(kind, &format!("{off}(%rdi)"));
                 }
                 other => return Err(unsupported("this assignment target", other.span())),
             },
@@ -772,44 +732,25 @@ impl Emitter<'_> {
                     UnOp::Not => self.asm.push_str("\txorq $1, %rax\n"),
                 }
             }
+            // The three short-circuit operators share one shape: the left
+            // side IS the result when it decides (false for &&, true for
+            // ||, non-null for ?? — null is handle 0, value optionals
+            // never compile), and the right side stays lazy, like the
+            // oracle — its traps and effects must stay unreached.
             Expr::Binary {
-                op: BinOp::And,
+                op: op @ (BinOp::And | BinOp::Or | BinOp::Coalesce),
                 lhs,
                 rhs,
                 ..
             } => {
-                // Short-circuit: a false left side IS the result (0), and
-                // the right side must never run (the oracle is lazy — its
-                // traps and effects must stay unreached here too).
+                let jcc = if matches!(op, BinOp::And) {
+                    "je"
+                } else {
+                    "jne"
+                };
                 let end = self.fresh_label();
                 self.expr(lhs)?;
-                let _ = writeln!(self.asm, "\ttestq %rax, %rax\n\tje {end}");
-                self.expr(rhs)?;
-                let _ = writeln!(self.asm, "{end}:");
-            }
-            Expr::Binary {
-                op: BinOp::Or,
-                lhs,
-                rhs,
-                ..
-            } => {
-                let end = self.fresh_label();
-                self.expr(lhs)?;
-                let _ = writeln!(self.asm, "\ttestq %rax, %rax\n\tjne {end}");
-                self.expr(rhs)?;
-                let _ = writeln!(self.asm, "{end}:");
-            }
-            Expr::Binary {
-                op: BinOp::Coalesce,
-                lhs,
-                rhs,
-                ..
-            } => {
-                // A null left side is handle 0 (value optionals never
-                // compile); the right side stays lazy, like the oracle.
-                let end = self.fresh_label();
-                self.expr(lhs)?;
-                let _ = writeln!(self.asm, "\ttestq %rax, %rax\n\tjne {end}");
+                let _ = writeln!(self.asm, "\ttestq %rax, %rax\n\t{jcc} {end}");
                 self.expr(rhs)?;
                 let _ = writeln!(self.asm, "{end}:");
             }
@@ -968,7 +909,7 @@ impl Emitter<'_> {
                     // is a builtin.
                     return self.builtin(name, args, *span);
                 };
-                let ret_kind = self.returns.get(key).copied().unwrap_or(Kind::Word);
+                let ret_kind = self.ret_kind_of(key);
                 let sret = ret_kind != Kind::Word;
                 if args.len() + sret as usize > ARG_REGS.len() {
                     return Err(unsupported("calls with more than 6 arguments", *span));
@@ -1064,7 +1005,7 @@ impl Emitter<'_> {
                     return Err(unsupported("this field access", *span));
                 };
                 let field_kind = self
-                    .kind_of(&slot.ty, 64)
+                    .kind_of(&slot.ty, FUEL)
                     .ok_or_else(|| unsupported("fields of this type", *span))?;
                 let off = self
                     .offset_of(&slot.base, slot.index)
@@ -1072,11 +1013,11 @@ impl Emitter<'_> {
                 // `p?.x` with a value-typed x yields `int?` — a value
                 // optional the word model can't represent. Handle-typed
                 // fields are fine, already-optional ones stay flat.
-                let nullable_word = match &slot.ty {
-                    Type::Optional(inner) => ref_shaped(inner, self.res),
-                    other => ref_shaped(other, self.res),
+                let unwrapped = match &slot.ty {
+                    Type::Optional(inner) => inner,
+                    other => other,
                 };
-                if *optional && !nullable_word {
+                if *optional && !ref_shaped(unwrapped, self.res) {
                     return Err(unsupported("'?.' on a field of value type", *span));
                 }
                 self.expr(base)?;
@@ -1097,14 +1038,14 @@ impl Emitter<'_> {
                 }
             }
             Expr::StructLit { fields, span, .. } => {
-                let Some(key) = self.res.struct_lits.get(span) else {
+                let Some(Type::Struct(dm, dn)) = self.res.expr_types.get(span) else {
                     return Err(unsupported("this struct literal", *span));
                 };
-                let def = &self.res.structs[key];
+                let def = &self.res.structs[&(*dm, dn.clone())];
                 let field_kinds: Vec<Kind> = def
                     .fields
                     .iter()
-                    .map(|(_, t)| self.kind_of(t, 64))
+                    .map(|(_, t)| self.kind_of(t, FUEL))
                     .collect::<Option<_>>()
                     .ok_or_else(|| unsupported("structs with fields of this type", *span))?;
                 let offsets: Vec<i64> = field_kinds
@@ -1132,16 +1073,7 @@ impl Emitter<'_> {
                         let i = slot_of(fname);
                         self.expr(value)?;
                         self.pop("%rdx");
-                        if field_kinds[i] == Kind::Word {
-                            let _ = writeln!(self.asm, "\tmovq %rax, {}(%rdx)", offsets[i]);
-                        } else {
-                            let _ = writeln!(
-                                self.asm,
-                                "\tleaq {}(%rdx), %rdi\n\tmovq %rax, %rsi",
-                                offsets[i]
-                            );
-                            self.copy(field_kinds[i].words());
-                        }
+                        self.store(field_kinds[i], &format!("{}(%rdx)", offsets[i]));
                         self.push("%rdx");
                     }
                     self.pop("%rax");
@@ -1152,16 +1084,7 @@ impl Emitter<'_> {
                     for (fname, value) in fields {
                         let i = slot_of(fname);
                         self.expr(value)?;
-                        if field_kinds[i] == Kind::Word {
-                            let _ = writeln!(self.asm, "\tmovq %rax, {}(%rbp)", base + offsets[i]);
-                        } else {
-                            let _ = writeln!(
-                                self.asm,
-                                "\tleaq {}(%rbp), %rdi\n\tmovq %rax, %rsi",
-                                base + offsets[i]
-                            );
-                            self.copy(field_kinds[i].words());
-                        }
+                        self.store(field_kinds[i], &format!("{}(%rbp)", base + offsets[i]));
                     }
                     let _ = writeln!(self.asm, "\tleaq {base}(%rbp), %rax");
                 }
@@ -1194,8 +1117,8 @@ impl Emitter<'_> {
             ("print", [value]) => {
                 let ty = self
                     .res
-                    .print_types
-                    .get(&span)
+                    .expr_types
+                    .get(&value.span())
                     .ok_or_else(|| unsupported("printing this value", span))?;
                 match ty {
                     // printf is varargs: %al must carry the vector-reg
