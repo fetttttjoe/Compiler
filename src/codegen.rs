@@ -12,6 +12,12 @@
 //! i64::MIN / -1 — is deferred (the binary takes a SIGFPE): the
 //! interpreter diagnoses both, and the differential harness only diffs
 //! programs the interpreter runs cleanly.
+//!
+//! Standing obligations for later slices (so they aren't rediscovered
+//! as bugs): the first emitted `call` must keep %rsp 16-byte aligned at
+//! the call site (System V ABI — SSE spills fault without it), and the
+//! first data symbol (string literal, global) must use RIP-relative
+//! addressing, because the system cc links PIE by default.
 
 use crate::ast::{BinOp, Expr, Function, Stmt, TypeAnn, UnOp};
 use crate::diagnostic::Diagnostic;
