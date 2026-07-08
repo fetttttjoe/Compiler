@@ -152,8 +152,15 @@ impl Value {
     }
 }
 
-fn render_struct(name: &str, fields: &[(String, Value)], mut one: impl FnMut(&Value) -> String) -> String {
-    let fields: Vec<String> = fields.iter().map(|(f, v)| format!("{f}: {}", one(v))).collect();
+fn render_struct(
+    name: &str,
+    fields: &[(String, Value)],
+    mut one: impl FnMut(&Value) -> String,
+) -> String {
+    let fields: Vec<String> = fields
+        .iter()
+        .map(|(f, v)| format!("{f}: {}", one(v)))
+        .collect();
     format!("{name} {{ {} }}", fields.join(", "))
 }
 
@@ -332,10 +339,7 @@ impl<'a> Interp<'a> {
                     Value::Array(id) => id,
                     other => {
                         return Err(Diagnostic::error(
-                            format!(
-                                "can only iterate over arrays, found {}",
-                                other.type_name()
-                            ),
+                            format!("can only iterate over arrays, found {}", other.type_name()),
                             *span,
                         ))
                     }
@@ -473,8 +477,9 @@ impl<'a> Interp<'a> {
                         ))
                     }
                 };
-                let Some((target_module, target_name)) =
-                    self.resolutions.functions[self.module].get(name.as_str()).cloned()
+                let Some((target_module, target_name)) = self.resolutions.functions[self.module]
+                    .get(name.as_str())
+                    .cloned()
                 else {
                     // Builtins run only when no user definition shadows them
                     // — mirrors the checker's resolution order. Shape errors
@@ -498,9 +503,7 @@ impl<'a> Interp<'a> {
                     }
                     if name == syntax::BUILTIN_LEN && args.len() == 1 {
                         return match self.eval(&args[0])? {
-                            Value::Array(id) => {
-                                Ok(Value::Int(self.heap.arrays[id].len() as i64))
-                            }
+                            Value::Array(id) => Ok(Value::Int(self.heap.arrays[id].len() as i64)),
                             other => Err(Diagnostic::error(
                                 format!("'len' expects an array, found {}", other.type_name()),
                                 *span,
@@ -623,9 +626,7 @@ impl<'a> Interp<'a> {
                 // A refstruct hop mutates the shared heap object directly —
                 // the aliasing semantics, and the end of the write-back
                 // chain (the handle itself is unchanged).
-                Value::Ref(id) => {
-                    set_in_fields(&mut self.heap.structs[id].fields, name, v, *span)
-                }
+                Value::Ref(id) => set_in_fields(&mut self.heap.structs[id].fields, name, v, *span),
                 // A value hop: set the field in the copy, write the copy
                 // back into its own place.
                 Value::Struct {
@@ -802,6 +803,11 @@ fn int_op(op: BinOp, a: i64, b: i64, span: Span) -> Result<Value, Diagnostic> {
         Sub => Value::Int(a.wrapping_sub(b)),
         Mul => Value::Int(a.wrapping_mul(b)),
         Div | Rem if b == 0 => return Err(Diagnostic::error("division by zero", span)),
+        // The other idiv trap: i64::MIN / -1 has no i64 result (and would
+        // panic Rust's `/` here).
+        Div | Rem if a == i64::MIN && b == -1 => {
+            return Err(Diagnostic::error("division overflow", span))
+        }
         Div => Value::Int(a / b),
         Rem => Value::Int(a % b),
         Eq => Value::Bool(a == b),
@@ -810,7 +816,9 @@ fn int_op(op: BinOp, a: i64, b: i64, span: Span) -> Result<Value, Diagnostic> {
         Le => Value::Bool(a <= b),
         Gt => Value::Bool(a > b),
         Ge => Value::Bool(a >= b),
-        And | Or | Coalesce => unreachable!("short-circuiting operators are handled lazily in eval"),
+        And | Or | Coalesce => {
+            unreachable!("short-circuiting operators are handled lazily in eval")
+        }
     };
     Ok(v)
 }
@@ -832,7 +840,9 @@ fn float_op(op: BinOp, a: f64, b: f64, _span: Span) -> Result<Value, Diagnostic>
         Le => Value::Bool(a <= b),
         Gt => Value::Bool(a > b),
         Ge => Value::Bool(a >= b),
-        And | Or | Coalesce => unreachable!("short-circuiting operators are handled lazily in eval"),
+        And | Or | Coalesce => {
+            unreachable!("short-circuiting operators are handled lazily in eval")
+        }
     };
     Ok(v)
 }
@@ -1047,7 +1057,9 @@ fun main(): bool {
     fn out_of_bounds_indexing_is_a_runtime_error() {
         let result = run("fun main(): int { const xs: int[] = [1]; return xs[5]; }");
         assert!(
-            result.as_ref().is_err_and(|e| e.message.contains("out of bounds")),
+            result
+                .as_ref()
+                .is_err_and(|e| e.message.contains("out of bounds")),
             "{result:?}"
         );
     }
@@ -1084,6 +1096,15 @@ fun main(): int {
     #[test]
     fn division_by_zero_is_a_runtime_error() {
         assert!(run("fun main(): int { return 10 / 0; }").is_err());
+    }
+
+    #[test]
+    fn division_overflow_is_a_runtime_error() {
+        // i64::MIN / -1 has no i64 result; like division by zero it must
+        // be a diagnostic, not a panic (or SIGFPE once compiled).
+        let min = "(0 - 9223372036854775807 - 1)";
+        assert!(run(&format!("fun main(): int {{ return {min} / (0 - 1); }}")).is_err());
+        assert!(run(&format!("fun main(): int {{ return {min} % (0 - 1); }}")).is_err());
     }
 
     #[test]
@@ -1453,7 +1474,10 @@ fun main(): Node {
 }";
         let (value, heap) = run_full(program).unwrap();
         let rendered = value.render(&heap);
-        assert!(rendered.contains("Node") && rendered.contains("..."), "{rendered}");
+        assert!(
+            rendered.contains("Node") && rendered.contains("..."),
+            "{rendered}"
+        );
         assert!(rendered.len() < 500, "unbounded: {} bytes", rendered.len());
     }
 
@@ -1467,7 +1491,8 @@ fun main(): Node {
     #[test]
     fn display_shows_user_values_not_enum_internals() {
         let mut heap = Heap::default();
-        heap.arrays.push(vec![Value::Int(1), Value::Str("x".into()), Value::Null]);
+        heap.arrays
+            .push(vec![Value::Int(1), Value::Str("x".into()), Value::Null]);
         let array = Value::Array(0);
         assert_eq!(array.display(&heap), "[1, x, null]");
         let s = Value::Struct {
@@ -1568,7 +1593,9 @@ fun down(n: int): int {
 fun main(): int { return down(100000); }";
         let result = run(program);
         assert!(
-            result.as_ref().is_err_and(|e| e.message.contains("depth limit")),
+            result
+                .as_ref()
+                .is_err_and(|e| e.message.contains("depth limit")),
             "{result:?}"
         );
     }
@@ -1587,7 +1614,9 @@ fun main() {
 }";
         let result = run(program);
         assert!(
-            result.as_ref().is_err_and(|e| e.message.contains("heap limit")),
+            result
+                .as_ref()
+                .is_err_and(|e| e.message.contains("heap limit")),
             "{result:?}"
         );
     }
@@ -1613,7 +1642,9 @@ fun main(): T {
     fn runaway_recursion_is_a_diagnostic_not_a_crash() {
         let result = run("fun f(): int { return f(); }\nfun main(): int { return f(); }");
         assert!(
-            result.as_ref().is_err_and(|e| e.message.contains("depth limit")),
+            result
+                .as_ref()
+                .is_err_and(|e| e.message.contains("depth limit")),
             "{result:?}"
         );
     }

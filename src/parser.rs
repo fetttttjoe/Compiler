@@ -18,8 +18,11 @@ pub struct Parser<'a> {
 }
 
 /// Recursion ceiling for nested expressions and statements — a stack-safety
-/// guard, not a language limit. Pathological nesting (deep parens, huge
-/// `else if` chains) gets a diagnostic instead of a stack overflow.
+/// guard for the parser's own recursion, not a language limit. Pathological
+/// nesting (deep parens, huge `else if` chains) gets a diagnostic instead of
+/// a stack overflow. Left-associative operator chains parse at constant
+/// depth, so the *height* of the AST they build is bounded separately, by
+/// the checker's `MAX_EXPR_DEPTH`.
 const MAX_NESTING: u32 = 128;
 
 impl<'a> Parser<'a> {
@@ -100,7 +103,11 @@ impl<'a> Parser<'a> {
         } else {
             let tok = self.peek().clone();
             self.error(
-                format!("expected {}, found {}", describe(&kind), describe(&tok.kind)),
+                format!(
+                    "expected {}, found {}",
+                    describe(&kind),
+                    describe(&tok.kind)
+                ),
                 tok.span,
             );
             (tok.span, false)
@@ -167,8 +174,7 @@ impl<'a> Parser<'a> {
                     }
                     if doubled {
                         self.error(
-                            "nested optionals are not allowed — 'T??' is just 'T?'"
-                                .to_string(),
+                            "nested optionals are not allowed — 'T??' is just 'T?'".to_string(),
                             span,
                         );
                     }
@@ -228,7 +234,10 @@ impl<'a> Parser<'a> {
             let param_name = self.expect_identifier();
             self.expect(TokenKind::Colon);
             let ty = self.parse_type();
-            params.push(Param { name: param_name, ty });
+            params.push(Param {
+                name: param_name,
+                ty,
+            });
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
@@ -263,7 +272,10 @@ impl<'a> Parser<'a> {
             let field_name = self.expect_identifier();
             self.expect(TokenKind::Colon);
             let ty = self.parse_type();
-            fields.push(Field { name: field_name, ty });
+            fields.push(Field {
+                name: field_name,
+                ty,
+            });
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
@@ -527,7 +539,10 @@ impl<'a> Parser<'a> {
             (p, tok.span)
         } else {
             self.error(
-                format!("expected a module path string, found {}", describe(&tok.kind)),
+                format!(
+                    "expected a module path string, found {}",
+                    describe(&tok.kind)
+                ),
                 tok.span,
             );
             (String::new(), tok.span)
@@ -618,7 +633,10 @@ impl<'a> Parser<'a> {
                 // to extend — keep the chain's span as-is then.)
                 let (nested, nested_clean) = self.parse_if();
                 clean = nested_clean;
-                if let Stmt::If { span: nested_span, .. } = &nested {
+                if let Stmt::If {
+                    span: nested_span, ..
+                } = &nested
+                {
                     span = start.to(*nested_span);
                 }
                 else_body = Some(vec![nested]);
@@ -693,9 +711,7 @@ impl<'a> Parser<'a> {
                     while !self.at_eof()
                         && !matches!(
                             self.peek().kind,
-                            TokenKind::LeftBrace
-                                | TokenKind::Semicolon
-                                | TokenKind::RightBrace
+                            TokenKind::LeftBrace | TokenKind::Semicolon | TokenKind::RightBrace
                         )
                     {
                         self.bump();
@@ -790,7 +806,6 @@ impl<'a> Parser<'a> {
         }
     }
 }
-
 
 /// Operator precedence, lowest to highest. Declaration order *is* the ranking —
 /// the Pratt binding powers are derived from it, so adding a level means adding
@@ -926,9 +941,7 @@ pub fn parse(tokens: &[Token]) -> (Ast, Vec<Diagnostic>) {
             TokenKind::Export => {
                 parser.bump();
                 match parser.peek().kind {
-                    TokenKind::Fun => {
-                        items.push(Item::Function(parser.parse_function(true)))
-                    }
+                    TokenKind::Fun => items.push(Item::Function(parser.parse_function(true))),
                     TokenKind::Struct | TokenKind::RefStruct => {
                         items.push(Item::Struct(parser.parse_struct(true)))
                     }
@@ -969,7 +982,11 @@ mod tests {
         assert!(diags.is_empty(), "lex errors: {diags:?}");
         let mut p = Parser::new(&tokens);
         let e = p.parse_expr(0);
-        assert!(p.diagnostics.is_empty(), "parse errors: {:?}", p.diagnostics);
+        assert!(
+            p.diagnostics.is_empty(),
+            "parse errors: {:?}",
+            p.diagnostics
+        );
         e
     }
 
@@ -1021,14 +1038,23 @@ mod tests {
         assert!(diags.is_empty(), "lex errors: {diags:?}");
         let mut p = Parser::new(&tokens);
         let (s, _clean) = p.parse_stmt();
-        assert!(p.diagnostics.is_empty(), "parse errors: {:?}", p.diagnostics);
+        assert!(
+            p.diagnostics.is_empty(),
+            "parse errors: {:?}",
+            p.diagnostics
+        );
         s
     }
 
     #[test]
     fn const_binding_is_immutable() {
         match stmt("const x: int = a + 1;") {
-            Stmt::Let { mutable, name, value, .. } => {
+            Stmt::Let {
+                mutable,
+                name,
+                value,
+                ..
+            } => {
                 assert!(!mutable);
                 assert_eq!(name, "x");
                 assert_eq!(value.sexpr(), "(+ a 1)");
@@ -1100,7 +1126,10 @@ mod tests {
             f.params[0].ty,
             TypeAnn::Optional(Box::new(TypeAnn::Named("Point".into())))
         );
-        assert_eq!(f.return_type, Some(TypeAnn::Optional(Box::new(TypeAnn::Int))));
+        assert_eq!(
+            f.return_type,
+            Some(TypeAnn::Optional(Box::new(TypeAnn::Int)))
+        );
     }
 
     #[test]
@@ -1151,7 +1180,12 @@ mod tests {
     #[test]
     fn for_loops_parse() {
         match stmt("for x in xs { print(x); }") {
-            Stmt::For { name, iterable, body, .. } => {
+            Stmt::For {
+                name,
+                iterable,
+                body,
+                ..
+            } => {
                 assert_eq!(name, "x");
                 assert_eq!(iterable.sexpr(), "xs");
                 assert_eq!(body.len(), 1);
@@ -1163,7 +1197,12 @@ mod tests {
     #[test]
     fn for_loops_can_bind_the_index() {
         match stmt("for [i, s] in scores { print(s); }") {
-            Stmt::For { index, name, iterable, .. } => {
+            Stmt::For {
+                index,
+                name,
+                iterable,
+                ..
+            } => {
                 assert_eq!(index.as_deref(), Some("i"));
                 assert_eq!(name, "s");
                 assert_eq!(iterable.sexpr(), "scores");
@@ -1260,7 +1299,8 @@ mod tests {
 
     #[test]
     fn refstruct_sets_the_by_ref_flag() {
-        let (tokens, _) = lex("refstruct P { x: int } export refstruct Q { y: int } struct V { z: int }");
+        let (tokens, _) =
+            lex("refstruct P { x: int } export refstruct Q { y: int } struct V { z: int }");
         let (ast, pd) = parse(&tokens);
         assert!(pd.is_empty(), "parse errors: {pd:?}");
         let Item::Struct(p) = &ast[0] else { panic!() };
@@ -1292,7 +1332,9 @@ mod tests {
         assert!(ld.is_empty(), "{ld:?}");
         let (ast, pd) = parse(&tokens);
         assert!(pd.is_empty(), "parse errors: {pd:?}");
-        let Item::Import(imp) = &ast[0] else { panic!("expected import") };
+        let Item::Import(imp) = &ast[0] else {
+            panic!("expected import")
+        };
         let names: Vec<&str> = imp.names.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["fib", "add"]);
         assert_eq!(imp.path, "./math");
@@ -1300,9 +1342,8 @@ mod tests {
 
     #[test]
     fn export_marks_functions_and_structs() {
-        let (tokens, _) = lex(
-            "export fun f(): int { return 1; } export struct P { x: int } fun g() { }",
-        );
+        let (tokens, _) =
+            lex("export fun f(): int { return 1; } export struct P { x: int } fun g() { }");
         let (ast, pd) = parse(&tokens);
         assert!(pd.is_empty(), "parse errors: {pd:?}");
         let Item::Function(f) = &ast[0] else { panic!() };
@@ -1352,10 +1393,7 @@ mod tests {
 
     #[test]
     fn equality_binds_looser_than_comparison_tighter_than_logic() {
-        assert_eq!(
-            expr("a == b && c < d").sexpr(),
-            "(&& (== a b) (< c d))"
-        );
+        assert_eq!(expr("a == b && c < d").sexpr(), "(&& (== a b) (< c d))");
         assert_eq!(expr("a < b == c >= d").sexpr(), "(== (< a b) (>= c d))");
     }
 
@@ -1369,7 +1407,13 @@ mod tests {
     #[test]
     fn if_with_else_if_chain() {
         let s = stmt("if a { return 1; } else if b { return 2; } else { return 3; }");
-        let Stmt::If { cond, then_body, else_body, .. } = s else {
+        let Stmt::If {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } = s
+        else {
             panic!("expected If, got something else");
         };
         assert_eq!(cond.sexpr(), "a");
@@ -1377,7 +1421,12 @@ mod tests {
         // The `else if` is a single nested If in the else body.
         let else_body = else_body.expect("else body");
         assert_eq!(else_body.len(), 1);
-        let Stmt::If { cond: nested_cond, else_body: nested_else, .. } = &else_body[0] else {
+        let Stmt::If {
+            cond: nested_cond,
+            else_body: nested_else,
+            ..
+        } = &else_body[0]
+        else {
             panic!("expected nested If in else body");
         };
         assert_eq!(nested_cond.sexpr(), "b");
@@ -1399,14 +1448,18 @@ mod tests {
         // `if x { … }` must read `x` as an identifier condition, not the
         // struct literal `x { }`.
         let s = stmt("if x { return 1; }");
-        let Stmt::If { cond, .. } = s else { panic!("expected If") };
+        let Stmt::If { cond, .. } = s else {
+            panic!("expected If")
+        };
         assert_eq!(cond.sexpr(), "x");
     }
 
     #[test]
     fn parenthesized_condition_allows_struct_literals_again() {
         let s = stmt("if (P { x: 1 }).x == 1 { return 1; }");
-        let Stmt::If { cond, .. } = s else { panic!("expected If") };
+        let Stmt::If { cond, .. } = s else {
+            panic!("expected If")
+        };
         assert_eq!(cond.sexpr(), "(== (. (struct P x=1) x) 1)");
     }
 
@@ -1418,7 +1471,9 @@ mod tests {
             lex("fun f(): int { var x: int = 0; if true { const = 1; } x = 5; return x; }");
         let (ast, pd) = parse(&tokens);
         assert_eq!(pd.len(), 1, "{pd:?}");
-        let Item::Function(f) = &ast[0] else { panic!("expected function") };
+        let Item::Function(f) = &ast[0] else {
+            panic!("expected function")
+        };
         assert_eq!(f.body.len(), 4, "x = 5; must survive: {:?}", f.body);
         assert!(matches!(f.body[2], Stmt::Assign { .. }));
     }
@@ -1426,7 +1481,9 @@ mod tests {
     #[test]
     fn struct_literal_allowed_in_call_arguments_inside_condition() {
         let s = stmt("if eq(P { x: 1 }) { return 1; }");
-        let Stmt::If { cond, .. } = s else { panic!("expected If") };
+        let Stmt::If { cond, .. } = s else {
+            panic!("expected If")
+        };
         assert_eq!(cond.sexpr(), "(call eq (struct P x=1))");
     }
 
@@ -1437,7 +1494,9 @@ mod tests {
         let (tokens, _) = lex("fun f(): int { const p: P = P { x: 1 } ) return 1; }");
         let (ast, pd) = parse(&tokens);
         assert_eq!(pd.len(), 1, "one missing-semicolon error only: {pd:?}");
-        let Item::Function(f) = &ast[0] else { panic!("expected function") };
+        let Item::Function(f) = &ast[0] else {
+            panic!("expected function")
+        };
         assert!(matches!(f.body.last(), Some(Stmt::Return { .. })));
     }
 
@@ -1448,8 +1507,14 @@ mod tests {
         // parsed as phantom statements.
         let (tokens, _) = lex("fun f(): int { var x = ; y z w return 1; }");
         let (ast, pd) = parse(&tokens);
-        assert_eq!(pd.len(), 2, "missing expression + missing semicolon: {pd:?}");
-        let Item::Function(f) = &ast[0] else { panic!("expected function") };
+        assert_eq!(
+            pd.len(),
+            2,
+            "missing expression + missing semicolon: {pd:?}"
+        );
+        let Item::Function(f) = &ast[0] else {
+            panic!("expected function")
+        };
         assert_eq!(f.body.len(), 2, "no phantom statements: {:?}", f.body);
         assert!(matches!(f.body.last(), Some(Stmt::Return { .. })));
     }
@@ -1491,8 +1556,14 @@ mod tests {
         // following statement parses cleanly instead of cascading.
         let (tokens, _) = lex("fun f(): int { const = 1 2 3; return 7; }");
         let (ast, pd) = parse(&tokens);
-        assert_eq!(pd.len(), 2, "one missing-name error + one at the `2`: {pd:?}");
-        let Item::Function(f) = &ast[0] else { panic!("expected function") };
+        assert_eq!(
+            pd.len(),
+            2,
+            "one missing-name error + one at the `2`: {pd:?}"
+        );
+        let Item::Function(f) = &ast[0] else {
+            panic!("expected function")
+        };
         assert!(matches!(f.body.last(), Some(Stmt::Return { .. })));
     }
 }

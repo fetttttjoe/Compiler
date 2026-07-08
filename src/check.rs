@@ -6,8 +6,9 @@ use crate::modules::ModuleGraph;
 use crate::narrow::{body_effects, covers, null_checks, NarrowFrame};
 use crate::span::Span;
 use crate::syntax;
-use crate::types::{eq_comparable, fits, is_numeric, poisoned, unconstrained, FnSig, StructType, Type};
-
+use crate::types::{
+    eq_comparable, fits, is_numeric, poisoned, unconstrained, FnSig, StructType, Type,
+};
 
 /// A per-module view: visible name → the (module, name) that defines it.
 type Alias = HashMap<String, (usize, String)>;
@@ -169,6 +170,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                     scopes: Vec::new(),
                     nonnull: Vec::new(),
                     ret: Type::Unit,
+                    expr_depth: 0,
                 };
                 checker.check_function(f);
             }
@@ -224,12 +226,7 @@ fn collect_names(ast: &[Item], diags: &mut Vec<Diagnostic>) -> ModuleNames {
     names
 }
 
-fn resolve_type(
-    ann: &TypeAnn,
-    ty_alias: &Alias,
-    span: Span,
-    diags: &mut Vec<Diagnostic>,
-) -> Type {
+fn resolve_type(ann: &TypeAnn, ty_alias: &Alias, span: Span, diags: &mut Vec<Diagnostic>) -> Type {
     match ann {
         TypeAnn::Int => Type::Int,
         TypeAnn::Float => Type::Float,
@@ -238,9 +235,7 @@ fn resolve_type(
         TypeAnn::Optional(inner) => {
             Type::Optional(Box::new(resolve_type(inner, ty_alias, span, diags)))
         }
-        TypeAnn::Array(inner) => {
-            Type::Array(Box::new(resolve_type(inner, ty_alias, span, diags)))
-        }
+        TypeAnn::Array(inner) => Type::Array(Box::new(resolve_type(inner, ty_alias, span, diags))),
         TypeAnn::Named(name) => match ty_alias.get(name) {
             Some((m, n)) => Type::Struct(*m, n.clone()),
             None => {
@@ -275,7 +270,16 @@ struct Checker<'a> {
     /// any call or field write, since aliases can reach them.
     nonnull: Vec<NarrowFrame>,
     ret: Type,
+    /// Current `type_of_expr` recursion depth (see `MAX_EXPR_DEPTH`).
+    expr_depth: u32,
 }
+
+/// Expression-depth budget — a stack-safety guard like the parser's
+/// `MAX_NESTING`, but for AST *height*, which left-associative operator
+/// chains grow without ever nesting the parser (`1+1+…+1` parses at
+/// constant depth). Every recursive pass downstream of this check fits
+/// comfortably in the 1GB pipeline stack (main.rs) at this bound.
+pub const MAX_EXPR_DEPTH: u32 = 65_536;
 
 impl<'a> Checker<'a> {
     fn error(&mut self, message: String, span: Span) {
@@ -411,8 +415,7 @@ impl<'a> Checker<'a> {
             } => {
                 let ty = match ty {
                     Some(ann) => {
-                        let declared =
-                            resolve_type(ann, self.ty_alias, *span, self.diagnostics);
+                        let declared = resolve_type(ann, self.ty_alias, *span, self.diagnostics);
                         if !self.check_literal_against(value, &declared) {
                             let init_ty = self.type_of_expr(value);
                             if !fits(&init_ty, &declared) {
@@ -516,9 +519,7 @@ impl<'a> Checker<'a> {
                                 format!("cannot infer a type for '{name}' from this iterable"),
                                 iterable.span(),
                             )
-                            .with_help(
-                                "bind the array with an annotated type first".to_string(),
-                            ),
+                            .with_help("bind the array with an annotated type first".to_string()),
                         );
                         Type::Error
                     }
@@ -553,7 +554,11 @@ impl<'a> Checker<'a> {
             Stmt::Expr(e) => {
                 self.type_of_expr(e);
             }
-            Stmt::Assign { target, value, span } => {
+            Stmt::Assign {
+                target,
+                value,
+                span,
+            } => {
                 // Array-literal values are checked against the target's
                 // declared type once it's known (ADR 0010); everything else
                 // is typed now, while narrowing facts are still intact.
@@ -629,6 +634,19 @@ impl<'a> Checker<'a> {
     }
 
     fn type_of_expr(&mut self, expr: &Expr) -> Type {
+        if self.expr_depth >= MAX_EXPR_DEPTH {
+            // Type::Error quiets the cascade (ADR 0008), so this reports
+            // once per over-deep spine, not once per node.
+            self.error("expression too deeply nested".to_string(), expr.span());
+            return Type::Error;
+        }
+        self.expr_depth += 1;
+        let ty = self.type_of_expr_inner(expr);
+        self.expr_depth -= 1;
+        ty
+    }
+
+    fn type_of_expr_inner(&mut self, expr: &Expr) -> Type {
         match expr {
             Expr::Int(_, _) => Type::Int,
             Expr::Float(_, _) => Type::Float,
@@ -695,13 +713,10 @@ impl<'a> Checker<'a> {
                     Some((e, Type::Null)) => {
                         self.diagnostics.push(
                             Diagnostic::error(
-                                "array element type cannot be inferred from 'null'"
-                                    .to_string(),
+                                "array element type cannot be inferred from 'null'".to_string(),
                                 e.span(),
                             )
-                            .with_help(
-                                "start with a non-null element, e.g. [x, null]".to_string(),
-                            ),
+                            .with_help("start with a non-null element, e.g. [x, null]".to_string()),
                         );
                         Type::Error
                     }
@@ -1000,10 +1015,7 @@ impl<'a> Checker<'a> {
             (_, true) => {
                 self.diagnostics.push(
                     Diagnostic::error(
-                        format!(
-                            "'?.' on {}, which is never null",
-                            self.type_name(&base_ty)
-                        ),
+                        format!("'?.' on {}, which is never null", self.type_name(&base_ty)),
                         span,
                     )
                     .with_help("use '.'".to_string()),
@@ -1124,10 +1136,7 @@ impl<'a> Checker<'a> {
 
     fn is_by_ref(&self, t: &Type) -> bool {
         match t {
-            Type::Struct(m, n) => self
-                .structs
-                .get(&(*m, n.clone()))
-                .is_some_and(|s| s.by_ref),
+            Type::Struct(m, n) => self.structs.get(&(*m, n.clone())).is_some_and(|s| s.by_ref),
             _ => false,
         }
     }
@@ -1160,15 +1169,16 @@ impl<'a> Checker<'a> {
             }
             return info.ty.clone();
         }
-        let visible = self.scopes.iter().flat_map(|s| s.keys().map(String::as_str));
+        let visible = self
+            .scopes
+            .iter()
+            .flat_map(|s| s.keys().map(String::as_str));
         self.diagnostics.push(
             Diagnostic::error(format!("undefined variable '{name}'"), span).suggest(name, visible),
         );
         Type::Error
     }
 }
-
-
 
 /// The variable at the root of a place expression (`o.i.v` → `o`).
 fn root_ident(e: &Expr) -> Option<(&str, Span)> {
@@ -1178,7 +1188,6 @@ fn root_ident(e: &Expr) -> Option<(&str, Span)> {
         _ => None,
     }
 }
-
 
 /// Definite-return analysis: does this statement list guarantee a `return` on
 /// every path? An `if` guarantees it only when both branches exist and both
@@ -1254,7 +1263,9 @@ mod tests {
     #[test]
     fn unknown_type_is_an_error() {
         let (_, d) = check(&graph_of("fun f(a: Missing): int { return 1; }"));
-        assert!(d.iter().any(|e| e.message.contains("unknown type 'Missing'")));
+        assert!(d
+            .iter()
+            .any(|e| e.message.contains("unknown type 'Missing'")));
     }
 
     fn diags(src: &str) -> Vec<Diagnostic> {
@@ -1320,8 +1331,8 @@ mod tests {
     fn unannotated_empty_array_requires_an_annotation() {
         let d = diags("fun main() { var xs = []; push(xs, 1); }");
         assert!(
-            d.iter().any(|e| e.message.contains("missing type annotation")
-                && e.help.is_some()),
+            d.iter()
+                .any(|e| e.message.contains("missing type annotation") && e.help.is_some()),
             "{d:?}"
         );
     }
@@ -1334,9 +1345,7 @@ mod tests {
 
     #[test]
     fn empty_literals_nest_in_either_position() {
-        let d = diags(
-            "fun main() { const a: int[][] = [[1], []]; const b: int[][] = [[], [1]]; }",
-        );
+        let d = diags("fun main() { const a: int[][] = [[1], []]; const b: int[][] = [[], [1]]; }");
         assert!(d.is_empty(), "unexpected: {d:?}");
     }
 
@@ -1367,10 +1376,7 @@ mod tests {
     #[test]
     fn empty_literal_into_a_non_array_names_it_cleanly() {
         let d = diags("fun f(a: int) { } fun main() { f([]); }");
-        assert!(
-            d.iter().any(|e| e.message.contains("found []")),
-            "{d:?}"
-        );
+        assert!(d.iter().any(|e| e.message.contains("found []")), "{d:?}");
     }
 
     // --- Literal-vs-declaration checking at every declared position ---
@@ -1408,8 +1414,9 @@ mod tests {
     fn null_elements_against_non_optional_declarations_get_a_hint() {
         let d = diags("fun f() { var xs: int[] = [null, 1]; }");
         assert!(
-            d.iter().any(|e| e.message.contains("expected int, found null")
-                && e.help.as_deref().is_some_and(|h| h.contains("optional"))),
+            d.iter()
+                .any(|e| e.message.contains("expected int, found null")
+                    && e.help.as_deref().is_some_and(|h| h.contains("optional"))),
             "{d:?}"
         );
     }
@@ -1417,10 +1424,7 @@ mod tests {
     #[test]
     fn missing_annotation_error_leads_for_uninferable_literals() {
         let d = diags("fun f() { var xs = [null]; }");
-        assert!(
-            d[0].message.contains("missing type annotation"),
-            "{d:?}"
-        );
+        assert!(d[0].message.contains("missing type annotation"), "{d:?}");
     }
 
     #[test]
@@ -1453,8 +1457,8 @@ mod tests {
     fn every_binding_requires_a_type_annotation() {
         let d = diags("fun f() { var x = 5; }");
         assert!(
-            d.iter().any(|e| e.message.contains("missing type annotation for 'x'")
-                && e.help.is_some()),
+            d.iter()
+                .any(|e| e.message.contains("missing type annotation for 'x'") && e.help.is_some()),
             "{d:?}"
         );
     }
@@ -1467,7 +1471,8 @@ mod tests {
         assert!(d.is_empty(), "unexpected: {d:?}");
         let d = diags("fun f() { var xs: int?[] = [1, \"a\"]; }");
         assert!(
-            d.iter().any(|e| e.message.contains("expected int?, found string")),
+            d.iter()
+                .any(|e| e.message.contains("expected int?, found string")),
             "{d:?}"
         );
     }
@@ -1482,12 +1487,14 @@ mod tests {
         assert!(d.is_empty(), "unexpected: {d:?}");
         let d = diags("fun f(xs: int[]) { for x in xs { x = 1; } }");
         assert!(
-            d.iter().any(|e| e.message.contains("cannot assign to const 'x'")),
+            d.iter()
+                .any(|e| e.message.contains("cannot assign to const 'x'")),
             "{d:?}"
         );
         let d = diags("fun f(n: int) { for x in n { } }");
         assert!(
-            d.iter().any(|e| e.message.contains("can only iterate over arrays")),
+            d.iter()
+                .any(|e| e.message.contains("can only iterate over arrays")),
             "{d:?}"
         );
     }
@@ -1510,13 +1517,12 @@ mod tests {
 
     #[test]
     fn for_index_bindings_are_int_and_const() {
-        let d = diags(
-            "fun f(xs: string[]) { for [i, s] in xs { print(s); print(i + 1); } }",
-        );
+        let d = diags("fun f(xs: string[]) { for [i, s] in xs { print(s); print(i + 1); } }");
         assert!(d.is_empty(), "unexpected: {d:?}");
         let d = diags("fun f(xs: int[]) { for [i, x] in xs { i = 0; } }");
         assert!(
-            d.iter().any(|e| e.message.contains("cannot assign to const 'i'")),
+            d.iter()
+                .any(|e| e.message.contains("cannot assign to const 'i'")),
             "{d:?}"
         );
         let d = diags("fun f(xs: int[]) { for [x, x] in xs { } }");
@@ -1561,7 +1567,8 @@ mod tests {
     fn array_elements_must_share_one_type() {
         let d = diags("fun f() { const xs: int[] = [1, \"a\"]; }");
         assert!(
-            d.iter().any(|e| e.message.contains("expected int, found string")),
+            d.iter()
+                .any(|e| e.message.contains("expected int, found string")),
             "{d:?}"
         );
     }
@@ -1575,7 +1582,8 @@ mod tests {
         );
         let d = diags("fun f(): int { return 1[0]; }");
         assert!(
-            d.iter().any(|e| e.message.contains("cannot index into int")),
+            d.iter()
+                .any(|e| e.message.contains("cannot index into int")),
             "{d:?}"
         );
     }
@@ -1615,9 +1623,7 @@ mod tests {
 
     #[test]
     fn comparisons_equality_and_logic_are_well_typed() {
-        let d = diags(
-            "fun f(a: int, b: int): bool { return a < b && a != b || !(a >= b); }",
-        );
+        let d = diags("fun f(a: int, b: int): bool { return a < b && a != b || !(a >= b); }");
         assert!(d.is_empty(), "unexpected: {d:?}");
     }
 
@@ -1688,7 +1694,8 @@ mod tests {
     fn not_requires_bool() {
         let d = diags("fun f(a: int): bool { return !a; }");
         assert!(
-            d.iter().any(|e| e.message.contains("cannot apply '!' to int")),
+            d.iter()
+                .any(|e| e.message.contains("cannot apply '!' to int")),
             "{d:?}"
         );
     }
@@ -1715,8 +1722,9 @@ mod tests {
         );
         let d = diags("fun f(a: int): int { while a { a = a - 1; } return a; }");
         assert!(
-            d.iter()
-                .any(|e| e.message.contains("while condition must be bool, found int")),
+            d.iter().any(|e| e
+                .message
+                .contains("while condition must be bool, found int")),
             "{d:?}"
         );
     }
@@ -1725,7 +1733,8 @@ mod tests {
     fn block_bindings_do_not_escape_their_scope() {
         let d = diags("fun f(a: bool): int { if a { const x: int = 1; } return x; }");
         assert!(
-            d.iter().any(|e| e.message.contains("undefined variable 'x'")),
+            d.iter()
+                .any(|e| e.message.contains("undefined variable 'x'")),
             "{d:?}"
         );
     }
@@ -1735,7 +1744,8 @@ mod tests {
         // Empty body.
         let d = diags("fun f(): int { }");
         assert!(
-            d.iter().any(|e| e.message.contains("not all paths in function 'f' return")),
+            d.iter()
+                .any(|e| e.message.contains("not all paths in function 'f' return")),
             "{d:?}"
         );
         // If without else can fall through.
@@ -1778,7 +1788,10 @@ mod tests {
     #[test]
     fn unknown_and_unexported_imports_have_distinct_errors() {
         let (_, d) = multi(&[
-            ("main.ys", "import { nope } from \"./lib\"; fun main(): int { return 1; }"),
+            (
+                "main.ys",
+                "import { nope } from \"./lib\"; fun main(): int { return 1; }",
+            ),
             ("lib.ys", "fun hidden(): int { return 1; }"),
         ]);
         assert!(
@@ -1787,12 +1800,16 @@ mod tests {
         );
 
         let (_, d) = multi(&[
-            ("main.ys", "import { hidden } from \"./lib\"; fun main(): int { return 1; }"),
+            (
+                "main.ys",
+                "import { hidden } from \"./lib\"; fun main(): int { return 1; }",
+            ),
             ("lib.ys", "fun hidden(): int { return 1; }"),
         ]);
         assert!(
-            d.iter()
-                .any(|e| e.message.contains("'hidden' exists in 'lib.ys' but is not exported")),
+            d.iter().any(|e| e
+                .message
+                .contains("'hidden' exists in 'lib.ys' but is not exported")),
             "{d:?}"
         );
     }
@@ -1837,8 +1854,14 @@ mod tests {
                 "import { a } from \"./a\"; import { b } from \"./b\";\n\
                  fun main(): int { return a() + b(); }",
             ),
-            ("a.ys", "fun helper(): int { return 1; } export fun a(): int { return helper(); }"),
-            ("b.ys", "fun helper(): int { return 2; } export fun b(): int { return helper(); }"),
+            (
+                "a.ys",
+                "fun helper(): int { return 1; } export fun a(): int { return helper(); }",
+            ),
+            (
+                "b.ys",
+                "fun helper(): int { return 2; } export fun b(): int { return helper(); }",
+            ),
         ]);
         assert!(d.is_empty(), "unexpected: {d:?}");
     }
@@ -1874,8 +1897,9 @@ mod tests {
     fn undefined_names_suggest_close_matches() {
         let d = diags("fun f(): int { const account: int = 1; return acount; }");
         assert!(
-            d.iter().any(|e| e.message.contains("undefined variable 'acount'")
-                && e.help.as_deref() == Some("did you mean 'account'?")),
+            d.iter()
+                .any(|e| e.message.contains("undefined variable 'acount'")
+                    && e.help.as_deref() == Some("did you mean 'account'?")),
             "{d:?}"
         );
 
@@ -1884,18 +1908,22 @@ mod tests {
              fun main(): int { const answer: int = 1; return fibonaci(answr); }",
         );
         assert!(
-            d.iter().any(|e| e.message.contains("undefined function 'fibonaci'")
-                && e.help.as_deref() == Some("did you mean 'fibonacci'?")),
+            d.iter()
+                .any(|e| e.message.contains("undefined function 'fibonaci'")
+                    && e.help.as_deref() == Some("did you mean 'fibonacci'?")),
             "{d:?}"
         );
         // Arguments are still checked even when the callee is unknown.
         assert!(
-            d.iter().any(|e| e.message.contains("undefined variable 'answr'")
-                && e.help.as_deref() == Some("did you mean 'answer'?")),
+            d.iter()
+                .any(|e| e.message.contains("undefined variable 'answr'")
+                    && e.help.as_deref() == Some("did you mean 'answer'?")),
             "{d:?}"
         );
 
-        let d = diags("struct Point { x: int } fun f(): int { const p: Pont = Pont { x: 1 }; return 1; }");
+        let d = diags(
+            "struct Point { x: int } fun f(): int { const p: Pont = Pont { x: 1 }; return 1; }",
+        );
         assert!(
             d.iter().any(|e| e.message.contains("unknown struct 'Pont'")
                 && e.help.as_deref() == Some("did you mean 'Point'?")),
@@ -1906,7 +1934,10 @@ mod tests {
     #[test]
     fn unexported_import_gets_an_export_hint() {
         let (_, d) = multi(&[
-            ("main.ys", "import { hidden } from \"./lib\"; fun main(): int { return 1; }"),
+            (
+                "main.ys",
+                "import { hidden } from \"./lib\"; fun main(): int { return 1; }",
+            ),
             ("lib.ys", "fun hidden(): int { return 1; }"),
         ]);
         assert!(
@@ -1921,7 +1952,10 @@ mod tests {
     #[test]
     fn misspelled_import_suggests_an_exported_name() {
         let (_, d) = multi(&[
-            ("main.ys", "import { doubel } from \"./lib\"; fun main(): int { return 1; }"),
+            (
+                "main.ys",
+                "import { doubel } from \"./lib\"; fun main(): int { return 1; }",
+            ),
             ("lib.ys", "export fun double(n: int): int { return n * 2; }"),
         ]);
         assert!(
@@ -1979,23 +2013,26 @@ mod tests {
     #[test]
     fn unknown_field_is_an_error() {
         let d = diags("struct P { x: int } fun f(p: P): int { return p.z; }");
-        assert!(d.iter().any(|e| e.message.contains("no field 'z'")), "{d:?}");
+        assert!(
+            d.iter().any(|e| e.message.contains("no field 'z'")),
+            "{d:?}"
+        );
     }
 
     #[test]
     fn struct_literal_field_type_mismatch_is_an_error() {
         let d = diags("struct P { x: int } fun f(): int { const p: P = P { x: 1.0 }; return 1; }");
         assert!(
-            d.iter().any(|e| e.message.contains("field 'x' expects int")),
+            d.iter()
+                .any(|e| e.message.contains("field 'x' expects int")),
             "{d:?}"
         );
     }
 
     #[test]
     fn duplicate_struct_literal_field_is_an_error() {
-        let d = diags(
-            "struct P { x: int } fun f(): int { const p: P = P { x: 1, x: 2 }; return 1; }",
-        );
+        let d =
+            diags("struct P { x: int } fun f(): int { const p: P = P { x: 1, x: 2 }; return 1; }");
         assert!(
             d.iter().any(|e| e.message.contains("duplicate field 'x'")),
             "{d:?}"
@@ -2006,8 +2043,9 @@ mod tests {
     fn assign_type_mismatch_is_an_error() {
         let d = diags("fun f(): int { var x: int = 1; x = 1.0; return x; }");
         assert!(
-            d.iter()
-                .any(|e| e.message.contains("cannot assign float to variable of type int")),
+            d.iter().any(|e| e
+                .message
+                .contains("cannot assign float to variable of type int")),
             "{d:?}"
         );
     }
@@ -2073,9 +2111,8 @@ mod tests {
 
     #[test]
     fn rebinding_const_refstruct_is_rejected() {
-        let d = diags(
-            "refstruct P { x: int } fun f() { const p: P = P { x: 1 }; p = P { x: 2 }; }",
-        );
+        let d =
+            diags("refstruct P { x: int } fun f() { const p: P = P { x: 1 }; p = P { x: 2 }; }");
         assert!(
             d.iter()
                 .any(|e| e.message.contains("cannot assign to const 'p'")),
@@ -2162,10 +2199,7 @@ mod tests {
     #[test]
     fn optional_chaining_on_a_non_optional_is_rejected() {
         let d = diags("refstruct P { x: int } fun f(p: P): int? { return p?.x; }");
-        assert!(
-            d.iter().any(|e| e.message.contains("never null")),
-            "{d:?}"
-        );
+        assert!(d.iter().any(|e| e.message.contains("never null")), "{d:?}");
     }
 
     #[test]
@@ -2307,9 +2341,7 @@ mod tests {
 
     #[test]
     fn narrowed_value_type_optionals_support_arithmetic() {
-        let d = diags(
-            "fun f(x: int?): int { if x != null { return x + 1; } else { return 0; } }",
-        );
+        let d = diags("fun f(x: int?): int { if x != null { return x + 1; } else { return 0; } }");
         assert!(d.is_empty(), "unexpected: {d:?}");
     }
 

@@ -2,27 +2,15 @@
 //! and the native exit code must match the interpreter's value. Per ADR
 //! 0009 this harness IS the test suite for the backend.
 
-use std::process::{Command, Output};
-
-fn compiler(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_Compiler"))
-        .args(args)
-        .output()
-        .expect("failed to run compiler binary")
-}
-
-/// A per-process scratch directory; tests use distinct file names.
-fn tempdir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("ys-diff-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+mod common;
+use common::{compiler, tempdir};
+use std::process::Command;
 
 /// Runs `program` through the interpreter (the oracle) and the native
 /// build, then asserts the binary's exit code equals the interpreted
 /// value masked to 8 bits (Unix truncates exit codes to one byte).
 fn diff(name: &str, program: &str) {
-    let dir = tempdir();
+    let dir = tempdir("ys-diff-test");
     let src = dir.join(format!("{name}.ys"));
     std::fs::write(&src, program).unwrap();
 
@@ -48,7 +36,9 @@ fn diff(name: &str, program: &str) {
         "build failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let run = Command::new(&bin).output().expect("failed to run built binary");
+    let run = Command::new(&bin)
+        .output()
+        .expect("failed to run built binary");
     assert_eq!(
         run.status.code(),
         Some((value & 0xff) as i32),
@@ -96,5 +86,17 @@ fn remainder_keeps_the_dividend_sign() {
 
 #[test]
 fn literal_beyond_i32_range() {
-    diff("wide", "fun main(): int { return 123456789012345 % 1000 + 7; }");
+    diff(
+        "wide",
+        "fun main(): int { return 123456789012345 % 1000 + 7; }",
+    );
+}
+
+#[test]
+fn long_operator_chain_within_the_depth_budget() {
+    // Left-associative chains parse at constant depth but build an AST as
+    // tall as the chain is long; 6000 terms used to overflow the checker's
+    // stack. Within the budget they must compile and agree with the oracle.
+    let terms = vec!["1"; 6000].join(" + ");
+    diff("chain", &format!("fun main(): int {{ return {terms}; }}"));
 }

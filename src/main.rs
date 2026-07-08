@@ -19,28 +19,35 @@ use source::SourceMap;
 use std::io::{IsTerminal, Write};
 
 fn main() {
+    // Every pass recurses over the AST, so the pipeline runs on a worker
+    // with the same generous stack the interpreter gets (ADR 0011). The
+    // checker's expression-depth budget (check::MAX_EXPR_DEPTH) turns
+    // deep programs into diagnostics long before this stack runs out.
+    std::thread::Builder::new()
+        .name("compiler".into())
+        .stack_size(1 << 30)
+        .spawn(run)
+        .expect("cannot spawn the compiler thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `compiler <entry>` interprets; `compiler build <entry> [-o <out>]`
-    // compiles to a native binary. `out` defaults to the entry's stem in
-    // the current directory.
+    // compiles to a native binary. `build_out`: None = interpret,
+    // Some(None) = build to the default output, Some(Some(p)) = build -o p.
     let (entry, build_out) = match args.as_slice() {
+        [cmd, rest @ ..] if cmd == "build" => match rest {
+            [entry] => (entry, Some(None)),
+            [entry, flag, out] if flag == "-o" => {
+                (entry, Some(Some(std::path::PathBuf::from(out))))
+            }
+            _ => usage(),
+        },
         [entry] => (entry, None),
-        [cmd, entry] if cmd == "build" => (entry, Some(default_out(entry))),
-        [cmd, entry, flag, out] if cmd == "build" && flag == "-o" => {
-            (entry, Some(std::path::PathBuf::from(out)))
-        }
-        _ => {
-            let _ = writeln!(
-                std::io::stderr(),
-                "usage: compiler <entry.ys>\n       compiler build <entry.ys> [-o <out>]"
-            );
-            std::process::exit(2);
-        }
+        _ => usage(),
     };
-    if build_out.as_deref() == Some(std::path::Path::new(entry)) {
-        print_error("output binary would overwrite the source file");
-        std::process::exit(1);
-    }
 
     let mut map = SourceMap::new();
     let mut read = |path: &str| std::fs::read_to_string(path).map_err(|e| e.to_string());
@@ -56,17 +63,18 @@ fn main() {
     let (resolutions, check_diags) = check::check(&graph);
     exit_on_errors(&check_diags, &map);
 
-    let entry_has_main = graph.modules[0]
-        .ast
-        .iter()
-        .any(|item| matches!(item, Item::Function(f) if f.name == "main"));
-    if !entry_has_main {
+    let entry_main = graph.modules[0].ast.iter().find_map(|item| match item {
+        Item::Function(f) if f.name == "main" => Some(f),
+        _ => None,
+    });
+    let Some(main_fn) = entry_main else {
         print_error(&format!("entry file '{entry}' does not define 'main'"));
         std::process::exit(1);
-    }
+    };
 
-    if let Some(out) = build_out {
-        return build(&graph, &out, &map);
+    if let Some(out_flag) = build_out {
+        let out = out_flag.unwrap_or_else(|| default_out(entry));
+        return build(main_fn, &graph, &out, &map);
     }
 
     match interpreter::interpret(&graph, &resolutions) {
@@ -85,23 +93,54 @@ fn main() {
     }
 }
 
+fn usage() -> ! {
+    let _ = writeln!(
+        std::io::stderr(),
+        "usage: compiler <entry.ys>\n       compiler build <entry.ys> [-o <out>]"
+    );
+    std::process::exit(2);
+}
+
 /// The default `build` output: the entry's file stem in the current
-/// directory (examples/main.ys → ./main).
+/// directory (examples/main.ys → ./main). Resolved only after the entry
+/// was read successfully, so it always has a file name.
 fn default_out(entry: &str) -> std::path::PathBuf {
     std::path::Path::new(entry)
         .file_stem()
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("a.out"))
+        .expect("a readable entry file has a name")
 }
 
 /// Emits assembly next to `out` (kept on disk — it's the debug artifact)
 /// and links it through the system `cc`.
-fn build(graph: &modules::ModuleGraph, out: &std::path::Path, map: &SourceMap) {
-    let asm = match codegen::compile(graph) {
+fn build(
+    main_fn: &ast::Function,
+    graph: &modules::ModuleGraph,
+    out: &std::path::Path,
+    map: &SourceMap,
+) {
+    let asm = match codegen::compile(main_fn) {
         Ok(asm) => asm,
         Err(diag) => return exit_on_errors(&[diag], map),
     };
     let asm_path = out.with_extension("s");
+    // Refuse to write over any loaded source file, whatever spelling the
+    // paths use — canonicalize resolves `./`, `..`, and symlinks. A target
+    // that doesn't exist yet can't clobber anything (canonicalize errs).
+    let sources: Vec<std::path::PathBuf> = graph
+        .modules
+        .iter()
+        .filter_map(|m| std::fs::canonicalize(&m.path).ok())
+        .collect();
+    for target in [asm_path.as_path(), out] {
+        if std::fs::canonicalize(target).is_ok_and(|t| sources.contains(&t)) {
+            print_error(&format!(
+                "refusing to overwrite source file '{}'",
+                target.display()
+            ));
+            std::process::exit(1);
+        }
+    }
     if let Err(e) = std::fs::write(&asm_path, asm) {
         print_error(&format!("cannot write {}: {e}", asm_path.display()));
         std::process::exit(1);

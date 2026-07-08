@@ -204,7 +204,10 @@ impl Lexer<'_> {
                         Some(other) => {
                             self.error(
                                 format!("unknown escape '\\{other}'"),
-                                Span::new(self.base + escape_start, self.base + self.pos + other.len_utf8()),
+                                Span::new(
+                                    self.base + escape_start,
+                                    self.base + self.pos + other.len_utf8(),
+                                ),
                             );
                             text.push(other); // recover with the raw character
                         }
@@ -343,7 +346,11 @@ mod tests {
     fn keywords_and_identifiers() {
         assert_eq!(
             kinds("fun foo"),
-            vec![TokenKind::Fun, TokenKind::Identifier("foo".into()), TokenKind::Eof]
+            vec![
+                TokenKind::Fun,
+                TokenKind::Identifier("foo".into()),
+                TokenKind::Eof
+            ]
         );
     }
 
@@ -373,7 +380,11 @@ mod tests {
     fn integer_and_float_literals() {
         assert_eq!(
             kinds("1 2.5"),
-            vec![TokenKind::IntLiteral(1), TokenKind::FloatLiteral(2.5), TokenKind::Eof]
+            vec![
+                TokenKind::IntLiteral(1),
+                TokenKind::FloatLiteral(2.5),
+                TokenKind::Eof
+            ]
         );
     }
 
@@ -383,7 +394,11 @@ mod tests {
         for src in ["fun // c\nx", "fun // c\r\nx", "fun // c\rx"] {
             assert_eq!(
                 kinds(src),
-                vec![TokenKind::Fun, TokenKind::Identifier("x".into()), TokenKind::Eof],
+                vec![
+                    TokenKind::Fun,
+                    TokenKind::Identifier("x".into()),
+                    TokenKind::Eof
+                ],
                 "failed for {src:?}"
             );
         }
@@ -393,7 +408,11 @@ mod tests {
     fn tabs_and_newlines_are_whitespace() {
         assert_eq!(
             kinds("\tfun\r\nx"),
-            vec![TokenKind::Fun, TokenKind::Identifier("x".into()), TokenKind::Eof]
+            vec![
+                TokenKind::Fun,
+                TokenKind::Identifier("x".into()),
+                TokenKind::Eof
+            ]
         );
     }
 
@@ -415,7 +434,9 @@ mod tests {
         );
         let (_, diags) = lex("a &");
         assert!(
-            diags[0].message.contains("expected '&&', found end of input"),
+            diags[0]
+                .message
+                .contains("expected '&&', found end of input"),
             "{diags:?}"
         );
     }
@@ -512,7 +533,10 @@ mod tests {
     fn unterminated_string_reports_a_diagnostic() {
         let (tokens, diags) = lex("\"abc\nx");
         assert_eq!(diags.len(), 1);
-        assert!(diags[0].message.contains("unterminated string"), "{diags:?}");
+        assert!(
+            diags[0].message.contains("unterminated string"),
+            "{diags:?}"
+        );
         // Recovery: lexing continues on the next line.
         assert_eq!(
             tokens.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
@@ -540,10 +564,7 @@ mod tests {
         let (tokens, diags) = lex(r#""a\qb""#);
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("unknown escape"), "{diags:?}");
-        assert_eq!(
-            tokens[0].kind,
-            TokenKind::StringLiteral("aqb".to_string())
-        );
+        assert_eq!(tokens[0].kind, TokenKind::StringLiteral("aqb".to_string()));
     }
 
     #[test]

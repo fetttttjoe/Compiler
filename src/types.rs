@@ -82,15 +82,11 @@ pub(crate) fn fits(value: &Type, target: &Type) -> bool {
         // accepts anything; only transient literals ever have it — a
         // binding can't keep `unknown` (annotation required at `let`).
         (_, Type::Unknown) => true,
-        (_, Type::Optional(inner)) => {
-            matches!(value, Type::Null) || fits(value, inner)
-        }
+        (_, Type::Optional(inner)) => matches!(value, Type::Null) || fits(value, inner),
         // Arrays are invariant — int[] into int?[] would let an alias push
         // null into the int[] — except unconstrained elements on either
         // side: `[]` fits any array slot and accepts any element type.
-        (Type::Array(v), Type::Array(t)) => {
-            unconstrained(v) || unconstrained(t) || v == t
-        }
+        (Type::Array(v), Type::Array(t)) => unconstrained(v) || unconstrained(t) || v == t,
         _ => false,
     }
 }

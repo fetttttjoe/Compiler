@@ -80,7 +80,11 @@ pub(crate) fn contains_call(e: &Expr) -> bool {
 /// What a loop body can do to enclosing narrowing facts on a later
 /// iteration: the places it assigns, and whether it can invalidate field
 /// facts at all (a call or a write through a field, both alias-reaching).
-pub(crate) fn body_effects(stmts: &[Stmt], assigned: &mut HashSet<String>, kills_fields: &mut bool) {
+pub(crate) fn body_effects(
+    stmts: &[Stmt],
+    assigned: &mut HashSet<String>,
+    kills_fields: &mut bool,
+) {
     for stmt in stmts {
         match stmt {
             Stmt::Assign { target, value, .. } => {
@@ -121,9 +125,7 @@ pub(crate) fn body_effects(stmts: &[Stmt], assigned: &mut HashSet<String>, kills
                 }
                 body_effects(body, assigned, kills_fields);
             }
-            Stmt::For {
-                iterable, body, ..
-            } => {
+            Stmt::For { iterable, body, .. } => {
                 if contains_call(iterable) {
                     *kills_fields = true;
                 }

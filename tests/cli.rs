@@ -1,17 +1,9 @@
-use std::process::{Command, Output};
-
-fn compiler(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_Compiler"))
-        .args(args)
-        .output()
-        .expect("failed to run compiler binary")
-}
+mod common;
+use common::{compiler, compiler_in};
 
 /// A per-process scratch directory for tests that write their own programs.
 fn tempdir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("ys-cli-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::tempdir("ys-cli-test")
 }
 
 #[test]
@@ -129,7 +121,12 @@ fn undeliverable_output_is_not_a_silent_success() {
     std::fs::write(dir.join("ok.ys"), "fun main(): int { return 42; }").unwrap();
     let status = Command::new(env!("CARGO_BIN_EXE_Compiler"))
         .arg(dir.join("ok.ys"))
-        .stdout(std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap())
+        .stdout(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        )
         .stderr(Stdio::null())
         .status()
         .unwrap();
@@ -158,12 +155,83 @@ fn build_rejects_unsupported_constructs_with_a_diagnostic() {
 #[test]
 fn build_refuses_to_overwrite_its_own_source() {
     let dir = tempdir();
-    // An extensionless entry whose default output stem is the file itself.
-    let src = dir.join("clobber");
-    std::fs::write(&src, "fun main(): int { return 1; }").unwrap();
-    let out = compiler(&["build", "-o", "ignored", src.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(2)); // -o before entry is a usage error
-    let out = compiler(&["build", src.to_str().unwrap(), "-o", src.to_str().unwrap()]);
+    let program = "fun main(): int { return 1; }";
+    let src = dir.join("clob");
+    std::fs::write(&src, program).unwrap();
+
+    // Extensionless entry: the default output stem IS the source file.
+    let out = compiler_in(&dir, &["build", "clob"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("overwrite"));
+
+    // An alternate spelling of the same file must not fool the guard.
+    let alias = format!("{}/./clob", dir.display());
+    let out = compiler_in(&dir, &["build", "clob", "-o", &alias]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("overwrite"));
+
+    assert_eq!(
+        std::fs::read_to_string(&src).unwrap(),
+        program,
+        "source must survive every refused build"
+    );
+}
+
+#[test]
+fn build_never_writes_assembly_over_a_source_file() {
+    let dir = tempdir();
+    // A source named like an assembly artifact: its default output stems
+    // to "prog", whose .s sibling is the source itself.
+    let program = "fun main(): int { return 2; }";
+    std::fs::write(dir.join("prog.s"), program).unwrap();
+    let out = compiler_in(&dir, &["build", "prog.s"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("overwrite"));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("prog.s")).unwrap(),
+        program
+    );
+}
+
+#[test]
+fn build_usage_errors() {
+    // Entry omitted: must be usage (exit 2), not "cannot read 'build'".
+    let out = compiler(&["build"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("usage:"));
+
+    // Flags are positional for now: -o before the entry is usage too.
+    let out = compiler(&["build", "-o", "out", "x.ys"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// A left-associative operator chain parses at constant depth, so it can
+/// build an AST far taller than the parser's nesting guard allows. The
+/// checker's depth budget must turn it into a diagnostic — not a stack
+/// overflow — on both engines.
+#[test]
+fn deep_operator_chain_is_a_diagnostic_not_a_crash() {
+    let dir = tempdir();
+    let terms = vec!["1"; 70_000].join(" + ");
+    std::fs::write(
+        dir.join("deep.ys"),
+        format!("fun main(): int {{ return {terms}; }}"),
+    )
+    .unwrap();
+    let src = dir.join("deep.ys");
+    let bin = dir.join("deep");
+    let modes: [&[&str]; 2] = [
+        &[src.to_str().unwrap()],
+        &["build", src.to_str().unwrap(), "-o", bin.to_str().unwrap()],
+    ];
+    for args in modes {
+        let out = compiler(args);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?} must exit cleanly, not die on a signal"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("deeply nested"), "{err}");
+    }
 }

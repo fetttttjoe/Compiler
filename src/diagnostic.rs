@@ -40,11 +40,7 @@ impl Diagnostic {
     }
 
     /// Attaches a "did you mean 'x'?" help when a close candidate exists.
-    pub fn suggest<'a>(
-        self,
-        name: &str,
-        candidates: impl IntoIterator<Item = &'a str>,
-    ) -> Self {
+    pub fn suggest<'a>(self, name: &str, candidates: impl IntoIterator<Item = &'a str>) -> Self {
         match closest(name, candidates) {
             Some(suggestion) => self.with_help(format!("did you mean '{suggestion}'?")),
             None => self,
@@ -93,11 +89,17 @@ impl Diagnostic {
         let in_line = loc.col - 1;
         let pad: String = loc.line_text[..in_line]
             .chars()
-            .map(|c| if c == syntax::TAB { syntax::TAB } else { syntax::SPACE })
+            .map(|c| {
+                if c == syntax::TAB {
+                    syntax::TAB
+                } else {
+                    syntax::SPACE
+                }
+            })
             .collect();
         // saturating: a span must never be able to panic the error reporter.
-        let span_len = (self.span.end - self.span.start)
-            .min(loc.line_text.len().saturating_sub(in_line));
+        let span_len =
+            (self.span.end - self.span.start).min(loc.line_text.len().saturating_sub(in_line));
         let carets = "^".repeat(
             loc.line_text[in_line..in_line + span_len]
                 .chars()
@@ -132,10 +134,7 @@ impl Diagnostic {
 /// The allowed edit distance scales with the name's length so short names
 /// don't produce absurd suggestions; ties break alphabetically so hints stay
 /// deterministic even over hash-map candidates.
-pub fn closest<'a>(
-    target: &str,
-    candidates: impl IntoIterator<Item = &'a str>,
-) -> Option<&'a str> {
+pub fn closest<'a>(target: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     let limit = match target.chars().count() {
         0..=2 => 0,
         3..=4 => 1,

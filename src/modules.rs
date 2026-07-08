@@ -223,8 +223,10 @@ fn detect_cycle(modules: &[Module]) -> Option<Diagnostic> {
         if color[v] == UNSEEN {
             if let Some((back_to, span)) = dfs(v, modules, &mut color, &mut stack) {
                 let from = stack.iter().position(|&m| m == back_to).unwrap_or(0);
-                let mut names: Vec<&str> =
-                    stack[from..].iter().map(|&m| modules[m].path.as_str()).collect();
+                let mut names: Vec<&str> = stack[from..]
+                    .iter()
+                    .map(|&m| modules[m].path.as_str())
+                    .collect();
                 names.push(&modules[back_to].path);
                 return Some(Diagnostic::error(
                     format!("import cycle: {}", names.join(" → ")),
@@ -241,10 +243,7 @@ fn detect_cycle(modules: &[Module]) -> Option<Diagnostic> {
 mod tests {
     use super::*;
 
-    fn load(
-        entry: &str,
-        files: &[(&str, &str)],
-    ) -> Result<(ModuleGraph, Vec<Diagnostic>), String> {
+    fn load(entry: &str, files: &[(&str, &str)]) -> Result<(ModuleGraph, Vec<Diagnostic>), String> {
         let store: HashMap<String, String> = files
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -264,8 +263,14 @@ mod tests {
         let (graph, diags) = load(
             "main.ys",
             &[
-                ("main.ys", "import { a } from \"./a\"; fun main(): int { return a(); }"),
-                ("a.ys", "import { b } from \"./b\"; export fun a(): int { return b(); }"),
+                (
+                    "main.ys",
+                    "import { a } from \"./a\"; fun main(): int { return a(); }",
+                ),
+                (
+                    "a.ys",
+                    "import { b } from \"./b\"; export fun a(): int { return b(); }",
+                ),
                 ("b.ys", "export fun b(): int { return 1; }"),
             ],
         )
@@ -287,8 +292,14 @@ mod tests {
                     "import { a } from \"./a\"; import { b } from \"./b\";\n\
                      fun main(): int { return a() + b(); }",
                 ),
-                ("a.ys", "import { s } from \"./shared\"; export fun a(): int { return s(); }"),
-                ("b.ys", "import { s } from \"./shared\"; export fun b(): int { return s(); }"),
+                (
+                    "a.ys",
+                    "import { s } from \"./shared\"; export fun a(): int { return s(); }",
+                ),
+                (
+                    "b.ys",
+                    "import { s } from \"./shared\"; export fun b(): int { return s(); }",
+                ),
                 ("shared.ys", "export fun s(): int { return 1; }"),
             ],
         )
@@ -296,7 +307,10 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
         assert_eq!(graph.modules.len(), 4);
         // Both a and b point at the same shared module.
-        assert_eq!(graph.modules[1].imports[0].target, graph.modules[2].imports[0].target);
+        assert_eq!(
+            graph.modules[1].imports[0].target,
+            graph.modules[2].imports[0].target
+        );
     }
 
     #[test]
@@ -304,7 +318,10 @@ mod tests {
         let (graph, diags) = load(
             "app/main.ys",
             &[
-                ("app/main.ys", "import { x } from \"../lib/x\"; fun main(): int { return x(); }"),
+                (
+                    "app/main.ys",
+                    "import { x } from \"../lib/x\"; fun main(): int { return x(); }",
+                ),
                 ("lib/x.ys", "export fun x(): int { return 1; }"),
             ],
         )
@@ -317,7 +334,10 @@ mod tests {
     fn missing_module_is_reported_at_the_import_path() {
         let (graph, diags) = load(
             "main.ys",
-            &[("main.ys", "import { f } from \"./missing\"; fun main(): int { return 1; }")],
+            &[(
+                "main.ys",
+                "import { f } from \"./missing\"; fun main(): int { return 1; }",
+            )],
         )
         .unwrap();
         assert_eq!(diags.len(), 1, "{diags:?}");
@@ -338,8 +358,14 @@ mod tests {
         let (_, diags) = load(
             "a.ys",
             &[
-                ("a.ys", "import { b } from \"./b\"; export fun a(): int { return 1; }"),
-                ("b.ys", "import { a } from \"./a\"; export fun b(): int { return 1; }"),
+                (
+                    "a.ys",
+                    "import { b } from \"./b\"; export fun a(): int { return 1; }",
+                ),
+                (
+                    "b.ys",
+                    "import { a } from \"./a\"; export fun b(): int { return 1; }",
+                ),
             ],
         )
         .unwrap();

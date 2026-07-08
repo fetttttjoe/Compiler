@@ -8,35 +8,25 @@
 //! left operand. ponytail: no IR and no register allocation until a real
 //! optimization needs them, per ADR 0009.
 //!
-//! Compiled division by zero is deferred: the differential harness only
-//! diffs programs the interpreter runs cleanly.
+//! Compiled behavior on the idiv traps — division by zero and
+//! i64::MIN / -1 — is deferred (the binary takes a SIGFPE): the
+//! interpreter diagnoses both, and the differential harness only diffs
+//! programs the interpreter runs cleanly.
 
-use crate::ast::{BinOp, Expr, Item, Stmt, TypeAnn, UnOp};
+use crate::ast::{BinOp, Expr, Function, Stmt, TypeAnn, UnOp};
 use crate::diagnostic::Diagnostic;
-use crate::modules::ModuleGraph;
 use std::fmt::Write;
 
-/// Compiles the program to assembly text. The caller has already checked
-/// the program and verified the entry module defines `main`.
-pub fn compile(graph: &ModuleGraph) -> Result<String, Diagnostic> {
-    let main = graph.modules[0]
-        .ast
-        .iter()
-        .find_map(|item| match item {
-            Item::Function(f) if f.name == "main" => Some(f),
-            _ => None,
-        })
-        .expect("caller verified the entry defines main");
-
+/// Compiles the checked program's `main` to assembly text.
+pub fn compile(main: &Function) -> Result<String, Diagnostic> {
     if main.return_type != Some(TypeAnn::Int) {
         return Err(unsupported("main not returning int", main.span));
     }
 
     // The GNU-stack note marks the stack non-executable; without it the
     // linker warns and grants an executable stack.
-    let mut asm = String::from(
-        "\t.section .note.GNU-stack,\"\",@progbits\n\t.text\n\t.globl main\nmain:\n",
-    );
+    let mut asm =
+        String::from("\t.section .note.GNU-stack,\"\",@progbits\n\t.text\n\t.globl main\nmain:\n");
     for stmt in &main.body {
         match stmt {
             Stmt::Return {
@@ -54,7 +44,9 @@ pub fn compile(graph: &ModuleGraph) -> Result<String, Diagnostic> {
 /// Emits code leaving the expression's value in %rax. Binary ops park the
 /// left operand on the machine stack while the right side evaluates, then
 /// pop it into %rcx — pushes and pops always balance, so `ret` in
-/// `compile` sees the frame it was called with.
+/// `compile` sees the frame it was called with. Recursion depth is safe:
+/// the checker bounds AST height (MAX_EXPR_DEPTH) and the pipeline runs
+/// on the 1GB worker stack (main.rs).
 fn emit_expr(expr: &Expr, asm: &mut String) -> Result<(), Diagnostic> {
     match expr {
         // movabsq takes a full 64-bit immediate; movq would cap at i32.
@@ -70,8 +62,9 @@ fn emit_expr(expr: &Expr, asm: &mut String) -> Result<(), Diagnostic> {
         Expr::Binary { op, lhs, rhs, span } => {
             // lhs in %rax, rhs in %rcx. Wrapping add/sub/mul match the
             // interpreter's wrapping ops; idiv truncates toward zero and
-            // signs the remainder like the dividend, exactly as Rust's
-            // `/` and `%` do on the oracle side.
+            // signs the remainder like the dividend, matching the oracle
+            // on every input the interpreter runs cleanly (it diagnoses
+            // the idiv traps: /0 and i64::MIN / -1).
             let apply = match op {
                 BinOp::Add => "\taddq %rcx, %rax\n",
                 BinOp::Sub => "\tsubq %rcx, %rax\n",
