@@ -145,6 +145,109 @@ fn assignment_reads_the_old_value() {
 }
 
 #[test]
+fn if_else_branches() {
+    diff(
+        "ifelse",
+        "fun main(): int {
+            var r: int = 0;
+            if 2 < 3 { r = 10; } else { r = 20; }
+            if 5 <= 4 { r = r + 100; } else { r = r + 1; }
+            if r == 11 { return r * 2; }
+            return 0;
+        }",
+    );
+}
+
+#[test]
+fn while_loop_accumulates() {
+    diff(
+        "sum",
+        "fun main(): int {
+            var i: int = 1;
+            var sum: int = 0;
+            while i <= 10 {
+                sum = sum + i;
+                i = i + 1;
+            }
+            return sum;
+        }",
+    );
+}
+
+#[test]
+fn comparisons_and_logic() {
+    diff(
+        "cmp",
+        "fun main(): int {
+            var r: int = 0;
+            const t: bool = 3 > 2;
+            const f: bool = 3 != 3;
+            if t && !f { r = r + 1; }
+            if t || f { r = r + 2; }
+            if f && t { r = r + 4; }
+            if 1 >= 1 { r = r + 8; }
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn logic_short_circuits_past_a_trap() {
+    // The right side would divide by zero; the oracle short-circuits, so
+    // the compiled code must never evaluate it either.
+    diff(
+        "shortcircuit",
+        "fun main(): int {
+            const zero: int = 0;
+            if 1 == 2 && 1 / zero == 0 { return 1; }
+            if 2 == 2 || 1 / zero == 0 { return 42; }
+            return 0;
+        }",
+    );
+}
+
+#[test]
+fn block_scoped_locals_shadow_and_restore() {
+    diff(
+        "blocks",
+        "fun main(): int {
+            var x: int = 1;
+            if x == 1 {
+                var x: int = 50;
+                x = x + 1;
+            }
+            var i: int = 0;
+            while i < 2 {
+                const step: int = 3;
+                x = x + step;
+                i = i + 1;
+            }
+            return x;
+        }",
+    );
+}
+
+#[test]
+fn nested_control_flow() {
+    diff(
+        "nested_cf",
+        "fun main(): int {
+            var total: int = 0;
+            var i: int = 0;
+            while i < 5 {
+                var j: int = 0;
+                while j < 5 {
+                    if (i + j) % 2 == 0 { total = total + i * j; }
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+            return total;
+        }",
+    );
+}
+
+#[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as
     // tall as the chain is long; 6000 terms used to overflow the checker's
