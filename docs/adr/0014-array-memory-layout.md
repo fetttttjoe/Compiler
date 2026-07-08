@@ -1,6 +1,9 @@
 # ADR 0014 — Array Memory Layout: Inline Elements Behind a Handle
 
-- **Status:** Proposed — design pinned, no codegen yet
+- **Status:** Accepted — landed for word-sized elements (int, bool,
+  nested handles): `{len, cap, data*}` header via libc malloc/realloc
+  (never freed, per ADR 0009/0015), `ys_push` doubles capacity, compiled
+  out-of-bounds aborts (deferred-trap policy, like the idiv traps)
 - **Date:** 2026-07-08
 - **Extends:** ADR 0008 (arrays' reference semantics), ADR 0009 (heap
   story), ADR 0012 (laws 1–3: natural layout, no boxing, aliasing as API)

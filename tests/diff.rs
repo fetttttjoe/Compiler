@@ -314,6 +314,116 @@ fn unit_function_called_as_a_statement() {
 }
 
 #[test]
+fn array_literals_and_indexing() {
+    diff(
+        "arrays",
+        "fun main(): int {
+            const xs: int[] = [10, 20, 30, 40];
+            var sum: int = xs[0] + xs[3];
+            xs[1] = xs[1] * 2;
+            sum = sum + xs[1];
+            return sum;
+        }",
+    );
+}
+
+#[test]
+fn push_grows_and_len_tracks() {
+    diff(
+        "push",
+        "fun main(): int {
+            var xs: int[] = [];
+            var i: int = 0;
+            while i < 100 {
+                push(xs, i * 2);
+                i = i + 1;
+            }
+            return len(xs) + xs[99];
+        }",
+    );
+}
+
+#[test]
+fn for_in_iterates_with_index_binding() {
+    diff(
+        "forin",
+        "fun main(): int {
+            const xs: int[] = [5, 6, 7, 8, 9];
+            var total: int = 0;
+            for [i, x] in xs {
+                total = total + i * x;
+            }
+            for x in xs {
+                total = total + x;
+            }
+            return total;
+        }",
+    );
+}
+
+#[test]
+fn for_in_is_live_when_the_body_pushes() {
+    // The oracle re-reads the length each step; pushing inside the body
+    // extends the iteration.
+    diff(
+        "liveiter",
+        "fun main(): int {
+            var xs: int[] = [1, 2];
+            var seen: int = 0;
+            for x in xs {
+                seen = seen + x;
+                if len(xs) < 6 { push(xs, x * 10); }
+            }
+            return seen % 251;
+        }",
+    );
+}
+
+#[test]
+fn arrays_alias_through_handles() {
+    diff(
+        "alias",
+        "fun bump(a: int[]) { a[0] = a[0] + 100; }
+        fun main(): int {
+            const xs: int[] = [7];
+            const ys: int[] = xs;
+            bump(ys);
+            return xs[0];
+        }",
+    );
+}
+
+#[test]
+fn nested_arrays_of_handles() {
+    diff(
+        "nested_arr",
+        "fun main(): int {
+            const grid: int[][] = [[1, 2], [3, 4, 5]];
+            push(grid[0], 9);
+            return grid[0][2] * 10 + grid[1][1] + len(grid[0]);
+        }",
+    );
+}
+
+#[test]
+fn array_returned_from_a_function() {
+    diff(
+        "arr_ret",
+        "fun range(n: int): int[] {
+            var xs: int[] = [];
+            var i: int = 0;
+            while i < n { push(xs, i); i = i + 1; }
+            return xs;
+        }
+        fun main(): int {
+            var total: int = 0;
+            for x in range(20) { total = total + x; }
+            return total;
+        }",
+    );
+}
+
+#[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as
     // tall as the chain is long; 6000 terms used to overflow the checker's

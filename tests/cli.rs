@@ -199,6 +199,31 @@ fn main_with_parameters_is_rejected_by_both_engines() {
     }
 }
 
+/// Compiled out-of-bounds access aborts (SIGABRT) — the deferred-trap
+/// policy, like SIGFPE for the idiv traps: never silent corruption. The
+/// interpreter diagnoses the same program cleanly.
+#[test]
+fn compiled_out_of_bounds_aborts_instead_of_corrupting() {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = tempdir();
+    std::fs::write(
+        dir.join("oob.ys"),
+        "fun main(): int { const xs: int[] = [1, 2]; return xs[5]; }",
+    )
+    .unwrap();
+    let src = dir.join("oob.ys");
+    let out = compiler(&[src.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "oracle diagnoses OOB");
+
+    let bin = dir.join("oob");
+    let out = compiler(&["build", src.to_str().unwrap(), "-o", bin.to_str().unwrap()]);
+    assert!(out.status.success());
+    let run = std::process::Command::new(&bin)
+        .output()
+        .expect("failed to run built binary");
+    assert_eq!(run.status.signal(), Some(6), "SIGABRT, not silent reads");
+}
+
 #[test]
 fn more_than_six_parameters_is_not_yet_compilable() {
     let dir = tempdir();

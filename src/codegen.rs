@@ -63,8 +63,47 @@ pub fn compile(
             }
         }
     }
+    e.asm.push_str(RUNTIME);
     Ok(e.asm)
 }
+
+/// The in-assembly runtime, appended to every program. Arrays follow ADR
+/// 0014: a handle points at a `{len, cap, data*}` header, elements are
+/// inline 8-byte values, buffers come from libc malloc/realloc and are
+/// never freed (the arena/leak story of ADR 0009/0015). `ys_push` grows
+/// by doubling (min 4). The label can't collide with user code — every
+/// user symbol except the entry `main` carries a `_<module>` suffix.
+const RUNTIME: &str = "\
+ys_push:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tmovq 0(%rdi), %rax
+\tcmpq 8(%rdi), %rax
+\tjb .Lys_push_store
+\tmovq 8(%rdi), %rcx
+\ttestq %rcx, %rcx
+\tjne .Lys_push_double
+\tmovq $2, %rcx
+.Lys_push_double:
+\taddq %rcx, %rcx
+\tmovq %rcx, 8(%rdi)
+\tpushq %rdi
+\tpushq %rsi
+\tleaq 0(,%rcx,8), %rsi
+\tmovq 16(%rdi), %rdi
+\tcall realloc@PLT
+\tpopq %rsi
+\tpopq %rdi
+\tmovq %rax, 16(%rdi)
+\tmovq 0(%rdi), %rax
+.Lys_push_store:
+\tmovq 16(%rdi), %rcx
+\tmovq %rsi, (%rcx,%rax,8)
+\tincq %rax
+\tmovq %rax, 0(%rdi)
+\tpopq %rbp
+\tret
+";
 
 /// The assembly symbol for a function: the entry `main` keeps its name
 /// (the C runtime calls it); everything else is suffixed with its module
@@ -97,7 +136,9 @@ fn peak_slots(body: &[Stmt]) -> usize {
                 ..
             } => peak_slots(then_body).max(else_body.as_deref().map_or(0, peak_slots)),
             Stmt::While { body, .. } => peak_slots(body),
-            Stmt::For { index, body, .. } => 1 + usize::from(index.is_some()) + peak_slots(body),
+            // Element + counter (doubles as the index binding) + the
+            // evaluated-once array handle.
+            Stmt::For { body, .. } => 3 + peak_slots(body),
             _ => 0,
         };
         peak = peak.max(live + inner);
@@ -128,14 +169,11 @@ impl Emitter<'_> {
     /// checker proves value-returning bodies always return).
     fn function(&mut self, f: &Function, module: usize) -> Result<(), Diagnostic> {
         for p in &f.params {
-            if !matches!(p.ty, TypeAnn::Int | TypeAnn::Bool) {
+            if !word_sized(&p.ty) {
                 return Err(unsupported("parameters of this type", f.span));
             }
         }
-        if !matches!(
-            f.return_type,
-            None | Some(TypeAnn::Int) | Some(TypeAnn::Bool)
-        ) {
+        if !f.return_type.as_ref().is_none_or(word_sized) {
             return Err(unsupported("this return type", f.span));
         }
         if f.params.len() > ARG_REGS.len() {
@@ -190,6 +228,31 @@ impl Emitter<'_> {
         let _ = writeln!(self.asm, "\tpopq {reg}");
     }
 
+    /// Emits a call with the ABI's 16-byte %rsp alignment: an odd number
+    /// of pending operand pushes leaves %rsp 8 off, fixed up around the
+    /// call. Used for user functions, the runtime, and libc alike.
+    fn call(&mut self, symbol: &str) {
+        let misaligned = self.depth % 2 == 1;
+        if misaligned {
+            self.asm.push_str("\tsubq $8, %rsp\n");
+        }
+        let _ = writeln!(self.asm, "\tcall {symbol}");
+        if misaligned {
+            self.asm.push_str("\taddq $8, %rsp\n");
+        }
+    }
+
+    /// ADR 0008's runtime bounds check: index in %rcx against the length
+    /// of the array whose handle is in `hdl`. Unsigned compare catches
+    /// negatives; out of bounds aborts — the deferred-trap policy (like
+    /// SIGFPE for idiv), never a silent wild access.
+    fn bounds_check(&mut self, hdl: &str) {
+        let ok = self.fresh_label();
+        let _ = writeln!(self.asm, "\tcmpq 0({hdl}), %rcx\n\tjb {ok}");
+        self.call("abort@PLT");
+        let _ = writeln!(self.asm, "{ok}:");
+    }
+
     fn lookup(&self, name: &str) -> Option<i64> {
         self.scopes
             .iter()
@@ -228,6 +291,18 @@ impl Emitter<'_> {
                     };
                     self.expr(value)?;
                     let _ = writeln!(self.asm, "\tmovq %rax, {off}(%rbp)");
+                }
+                Expr::Index { base, index, .. } => {
+                    self.expr(base)?;
+                    self.push("%rax");
+                    self.expr(index)?;
+                    self.push("%rax");
+                    self.expr(value)?;
+                    self.pop("%rcx");
+                    self.pop("%rdx");
+                    self.bounds_check("%rdx");
+                    self.asm
+                        .push_str("\tmovq 16(%rdx), %rdx\n\tmovq %rax, (%rdx,%rcx,8)\n");
                 }
                 other => return Err(unsupported("this assignment target", other.span())),
             },
@@ -273,8 +348,46 @@ impl Emitter<'_> {
                 self.block(body)?;
                 let _ = writeln!(self.asm, "\tjmp {top}\n{end}:");
             }
+            Stmt::For {
+                index,
+                name,
+                iterable,
+                body,
+                ..
+            } => {
+                // The iterable evaluates once; iteration is live — length
+                // re-read every step, element copied out before the body
+                // runs — exactly the oracle's contract (interpreter.rs).
+                // Three hidden slots: handle, counter (doubling as the
+                // index binding), element. Released after the loop.
+                let saved_slot = self.next_slot;
+                self.expr(iterable)?;
+                let (hdl, i, x) = (self.next_slot - 8, self.next_slot - 16, self.next_slot - 24);
+                self.next_slot -= 24;
+                let _ = writeln!(self.asm, "\tmovq %rax, {hdl}(%rbp)\n\tmovq $0, {i}(%rbp)");
+                let top = self.fresh_label();
+                let end = self.fresh_label();
+                let _ = writeln!(
+                    self.asm,
+                    "{top}:\n\tmovq {hdl}(%rbp), %rax\n\tmovq {i}(%rbp), %rcx\n\
+                     \tcmpq 0(%rax), %rcx\n\tjae {end}\n\
+                     \tmovq 16(%rax), %rax\n\tmovq (%rax,%rcx,8), %rax\n\
+                     \tmovq %rax, {x}(%rbp)"
+                );
+                let mut bindings = HashMap::from([(name.clone(), x)]);
+                if let Some(index) = index {
+                    bindings.insert(index.clone(), i);
+                }
+                self.scopes.push(bindings);
+                let inner_slot = self.next_slot;
+                let result = body.iter().try_for_each(|stmt| self.stmt(stmt));
+                self.next_slot = inner_slot;
+                self.scopes.pop();
+                result?;
+                let _ = writeln!(self.asm, "\tincq {i}(%rbp)\n\tjmp {top}\n{end}:");
+                self.next_slot = saved_slot;
+            }
             Stmt::Expr(expr) => self.expr(expr)?, // value discarded
-            other => return Err(unsupported("this statement", other.span())),
         }
         Ok(())
     }
@@ -390,9 +503,8 @@ impl Emitter<'_> {
                 };
                 let Some((tm, tname)) = self.res.functions[self.module].get(name) else {
                     // Resolution order says: no user definition, so this
-                    // is a builtin (print/len/push) — they need runtime
-                    // support that doesn't exist yet.
-                    return Err(unsupported(&format!("builtin '{name}'"), *span));
+                    // is a builtin.
+                    return self.builtin(name, args, *span);
                 };
                 if args.len() > ARG_REGS.len() {
                     return Err(unsupported("calls with more than 6 arguments", *span));
@@ -407,21 +519,79 @@ impl Emitter<'_> {
                 for reg in ARG_REGS[..args.len()].iter().rev() {
                     self.pop(reg);
                 }
-                // The ABI wants %rsp 16-aligned at the call instruction;
-                // an odd number of pending operand pushes leaves it 8 off.
-                let misaligned = self.depth % 2 == 1;
-                if misaligned {
-                    self.asm.push_str("\tsubq $8, %rsp\n");
+                self.call(&label_of(*tm, tname));
+            }
+            Expr::ArrayLit { elements, .. } => {
+                // Header {len, cap, data*} plus buffer, per ADR 0014.
+                // Allocation happens before element evaluation — the
+                // ordering difference from the oracle is only observable
+                // through traps, which the harness excludes.
+                let n = elements.len();
+                self.asm.push_str("\tmovq $24, %rdi\n");
+                self.call("malloc@PLT");
+                self.push("%rax");
+                let _ = writeln!(self.asm, "\tmovq ${}, %rdi", 8 * n.max(1));
+                self.call("malloc@PLT");
+                self.pop("%rcx");
+                let _ = writeln!(
+                    self.asm,
+                    "\tmovq %rax, 16(%rcx)\n\tmovq ${n}, 0(%rcx)\n\tmovq ${n}, 8(%rcx)"
+                );
+                for (i, element) in elements.iter().enumerate() {
+                    self.push("%rcx");
+                    self.expr(element)?;
+                    self.pop("%rcx");
+                    let _ = writeln!(
+                        self.asm,
+                        "\tmovq 16(%rcx), %rdx\n\tmovq %rax, {}(%rdx)",
+                        8 * i
+                    );
                 }
-                let _ = writeln!(self.asm, "\tcall {}", label_of(*tm, tname));
-                if misaligned {
-                    self.asm.push_str("\taddq $8, %rsp\n");
-                }
+                self.asm.push_str("\tmovq %rcx, %rax\n");
+            }
+            Expr::Index { base, index, .. } => {
+                self.expr(base)?;
+                self.push("%rax");
+                self.expr(index)?;
+                self.asm.push_str("\tmovq %rax, %rcx\n");
+                self.pop("%rax");
+                self.bounds_check("%rax");
+                self.asm
+                    .push_str("\tmovq 16(%rax), %rax\n\tmovq (%rax,%rcx,8), %rax\n");
             }
             other => return Err(unsupported("this expression", other.span())),
         }
         Ok(())
     }
+
+    /// The compilable builtins. `len` is two loads; `push` calls the
+    /// in-assembly runtime (its unit result is whatever's in %rax — the
+    /// checker keeps unit values out of operand positions).
+    fn builtin(&mut self, name: &str, args: &[Expr], span: Span) -> Result<(), Diagnostic> {
+        match (name, args) {
+            ("len", [array]) => {
+                self.expr(array)?;
+                self.asm.push_str("\tmovq 0(%rax), %rax\n");
+            }
+            ("push", [array, value]) => {
+                self.expr(array)?;
+                self.push("%rax");
+                self.expr(value)?;
+                self.asm.push_str("\tmovq %rax, %rsi\n");
+                self.pop("%rdi");
+                self.call("ys_push");
+            }
+            _ => return Err(unsupported(&format!("builtin '{name}'"), span)),
+        }
+        Ok(())
+    }
+}
+
+/// Types the backend can hold in one register/slot today: ints, bools,
+/// and array handles (whatever their element type — elements the backend
+/// can't produce have no compilable literals anyway).
+fn word_sized(ty: &TypeAnn) -> bool {
+    matches!(ty, TypeAnn::Int | TypeAnn::Bool | TypeAnn::Array(_))
 }
 
 fn unsupported(what: &str, span: Span) -> Diagnostic {
