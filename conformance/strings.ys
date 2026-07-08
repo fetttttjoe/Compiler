@@ -1,0 +1,11 @@
+fun greet(name: string): string {
+    return "héllo, " + name + "!";
+}
+fun main(): int {
+    const s: string = greet("wörld");
+    print(s);
+    print(s == "héllo, wörld!");
+    print("" + "" == "");
+    print("ab" == "abc");
+    return 3;
+}

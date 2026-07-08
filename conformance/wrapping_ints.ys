@@ -1,0 +1,9 @@
+fun main(): int {
+    const max: int = 9223372036854775807;
+    print(max + 1);
+    print(max * 2);
+    print(-7 / 2);
+    print(-7 % 2);
+    print(7 / -2);
+    return 42;
+}

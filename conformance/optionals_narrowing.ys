@@ -1,0 +1,22 @@
+refstruct Node { value: int, next: Node? }
+
+fun main(): int {
+    var head: Node? = null;
+    var i: int = 3;
+    while i >= 1 {
+        head = Node { value: i, next: head };
+        i = i - 1;
+    }
+    var cur: Node? = head;
+    while cur != null {
+        print(cur.value);
+        cur = cur.next;
+    }
+    if head != null {
+        const hop: Node? = head.next?.next;
+        if hop != null { print(hop.value); }
+        const fallback: Node = head.next ?? Node { value: 99, next: null };
+        print(fallback.value);
+    }
+    return 7;
+}

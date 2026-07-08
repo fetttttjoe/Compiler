@@ -1,0 +1,9 @@
+fun main(): int {
+    var xs: int[] = [1, 2];
+    for [i, x] in xs {
+        print(i * 100 + x);
+        if len(xs) < 5 { push(xs, x * 10); }
+    }
+    print(len(xs));
+    return len(xs);
+}

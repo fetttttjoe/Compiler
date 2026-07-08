@@ -1,0 +1,12 @@
+fun probe(n: int): bool {
+    print(n);
+    return n > 2;
+}
+
+fun main(): int {
+    if probe(1) && probe(2) { print(100); }
+    if probe(3) || probe(4) { print(200); }
+    const zero: int = 0;
+    if 1 == 2 && 1 / zero == 0 { print(300); }
+    return 9;
+}

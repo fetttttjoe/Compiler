@@ -1,0 +1,16 @@
+struct Point { x: int, y: int }
+fun shifted(p: Point): Point {
+    return Point { x: p.x + 100, y: p.y };
+}
+fun main(): int {
+    const a: Point = Point { x: 1, y: 2 };
+    var b: Point = a;
+    b.x = 50;
+    print(a.x);
+    print(b.x);
+    const c: Point = shifted(a);
+    print(c.x);
+    print(a == Point { x: 1, y: 2 });
+    print(a == b);
+    return a.x + b.x;
+}

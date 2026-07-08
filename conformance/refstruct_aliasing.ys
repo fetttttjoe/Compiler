@@ -1,0 +1,12 @@
+refstruct Counter { n: int }
+fun bump(c: Counter) { c.n = c.n + 1; }
+fun main(): int {
+    const a: Counter = Counter { n: 0 };
+    const b: Counter = a;
+    bump(a);
+    bump(b);
+    print(a.n);
+    print(a == b);
+    print(a == Counter { n: 2 });
+    return a.n;
+}
