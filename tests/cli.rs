@@ -153,6 +153,43 @@ fn build_rejects_unsupported_constructs_with_a_diagnostic() {
     assert!(err.contains("not yet compilable"), "{err}");
 }
 
+/// The end-to-end milestone: the multi-module fib example compiles to a
+/// native binary whose exit code is fib(10) = 55.
+#[test]
+fn builds_the_multi_module_fib_example() {
+    let dir = tempdir();
+    let bin = dir.join("fib_example");
+    let out = compiler(&["build", "examples/main.ys", "-o", bin.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = std::process::Command::new(&bin)
+        .output()
+        .expect("failed to run built binary");
+    assert_eq!(run.status.code(), Some(55));
+}
+
+#[test]
+fn more_than_six_parameters_is_not_yet_compilable() {
+    let dir = tempdir();
+    std::fs::write(
+        dir.join("seven.ys"),
+        "fun f(a: int, b: int, c: int, d: int, e: int, g: int, h: int): int { return a; }
+        fun main(): int { return f(1, 2, 3, 4, 5, 6, 7); }",
+    )
+    .unwrap();
+    let out = compiler(&[
+        "build",
+        dir.join("seven.ys").to_str().unwrap(),
+        "-o",
+        dir.join("seven").to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not yet compilable"));
+}
+
 #[test]
 fn build_refuses_to_overwrite_its_own_source() {
     let dir = tempdir();

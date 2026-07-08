@@ -248,6 +248,72 @@ fn nested_control_flow() {
 }
 
 #[test]
+fn simple_call_with_argument_order() {
+    // Subtraction makes swapped arguments observable.
+    diff(
+        "callorder",
+        "fun sub(a: int, b: int): int { return a - b; }
+        fun main(): int { return sub(50, 8); }",
+    );
+}
+
+#[test]
+fn recursion_computes_fib() {
+    diff(
+        "fib",
+        "fun fib(n: int): int {
+            if n < 2 { return n; }
+            return fib(n - 1) + fib(n - 2);
+        }
+        fun main(): int { return fib(10); }",
+    );
+}
+
+#[test]
+fn six_arguments_fill_every_register() {
+    diff(
+        "sixargs",
+        "fun mix(a: int, b: int, c: int, d: int, e: int, f: int): int {
+            return a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6;
+        }
+        fun main(): int { return mix(1, 2, 3, 4, 5, 6); }",
+    );
+}
+
+#[test]
+fn call_inside_expression_operands() {
+    // A call while the operand stack holds a pending left side exercises
+    // the 16-byte alignment fix-up at the call site.
+    diff(
+        "callinexpr",
+        "fun three(): int { return 3; }
+        fun main(): int { return 1 + three() * 2 + (5 - three()); }",
+    );
+}
+
+#[test]
+fn bool_params_and_returns() {
+    diff(
+        "boolfn",
+        "fun even(n: int): bool { return n % 2 == 0; }
+        fun pick(flag: bool, a: int, b: int): int {
+            if flag { return a; }
+            return b;
+        }
+        fun main(): int { return pick(even(10), 7, 9) * pick(even(3), 100, 11); }",
+    );
+}
+
+#[test]
+fn unit_function_called_as_a_statement() {
+    diff(
+        "unitcall",
+        "fun noop() { return; }
+        fun main(): int { noop(); return 5; }",
+    );
+}
+
+#[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as
     // tall as the chain is long; 6000 terms used to overflow the checker's

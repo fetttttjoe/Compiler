@@ -84,7 +84,7 @@ fn run() {
 
     if let Mode::Build { out } = mode {
         let out = out.unwrap_or_else(|| default_out(entry));
-        return build(main_fn, &graph, &out, &map);
+        return build(main_fn, &graph, &resolutions, &out, &map);
     }
 
     match interpreter::interpret(&graph, &resolutions) {
@@ -155,10 +155,11 @@ fn default_out(entry: &str) -> std::path::PathBuf {
 fn build(
     main_fn: &ast::Function,
     graph: &modules::ModuleGraph,
+    resolutions: &check::Resolutions,
     out: &std::path::Path,
     map: &SourceMap,
 ) {
-    let asm = match codegen::compile(main_fn) {
+    let asm = match codegen::compile(main_fn, graph, resolutions) {
         Ok(asm) => asm,
         Err(diag) => return exit_on_errors(&[diag], map),
     };

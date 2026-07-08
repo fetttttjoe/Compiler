@@ -1,9 +1,9 @@
-//! x86-64 backend (ADR 0009): compiles `main` to AT&T assembly for the
-//! system `cc` to assemble and link. Slice 3 covers int arithmetic,
-//! bools, comparisons, short-circuit logic, locals, and `if`/`while`.
-//! Everything else is a clean "not yet compilable" diagnostic; breadth
-//! arrives slice by slice, each diffed against the interpreter
-//! (see tests/diff.rs).
+//! x86-64 backend (ADR 0009): compiles the program to AT&T assembly for
+//! the system `cc` to assemble and link. Covers int/bool arithmetic,
+//! comparisons, short-circuit logic, locals, `if`/`while`, and direct
+//! calls (≤6 register args, System V). Everything else is a clean
+//! "not yet compilable" diagnostic; breadth arrives slice by slice,
+//! each diffed against the interpreter (see tests/diff.rs).
 //!
 //! Scheme: recursive emission into %rax, machine stack for the pending
 //! left operand. ponytail: no IR and no register allocation until a real
@@ -20,46 +20,61 @@
 //! first data symbol (string literal, global) must use RIP-relative
 //! addressing, because the system cc links PIE by default.
 
-use crate::ast::{BinOp, Expr, Function, Stmt, TypeAnn, UnOp};
+use crate::ast::{BinOp, Expr, Function, Item, Stmt, TypeAnn, UnOp};
+use crate::check::Resolutions;
 use crate::diagnostic::Diagnostic;
+use crate::modules::ModuleGraph;
 use crate::span::Span;
 use std::collections::HashMap;
 use std::fmt::Write;
 
-/// Compiles the checked program's `main` to assembly text.
-pub fn compile(main: &Function) -> Result<String, Diagnostic> {
-    if main.return_type != Some(TypeAnn::Int) {
-        return Err(unsupported("main not returning int", main.span));
+/// System V integer argument registers, in order.
+const ARG_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
+
+/// Compiles the checked program to assembly text: every function in every
+/// module (like a C translation unit — an unreachable function must still
+/// compile), calls resolved through the same alias maps the interpreter
+/// uses. `main_fn` is the entry module's `main`, already verified to
+/// exist by the caller.
+pub fn compile(
+    main_fn: &Function,
+    graph: &ModuleGraph,
+    res: &Resolutions,
+) -> Result<String, Diagnostic> {
+    if main_fn.return_type != Some(TypeAnn::Int) {
+        return Err(unsupported("main not returning int", main_fn.span));
     }
 
     // The GNU-stack note marks the stack non-executable; without it the
     // linker warns and grants an executable stack.
-    let mut asm =
-        String::from("\t.section .note.GNU-stack,\"\",@progbits\n\t.text\n\t.globl main\nmain:\n");
-
-    // Slots are rbp-relative because operand pushes move %rsp. Every
-    // `let` site gets its own slot (blocks nest, so one-slot-per-name is
-    // no longer sound); the frame stays 16-byte aligned — free now,
-    // mandatory once calls exist.
-    asm.push_str("\tpushq %rbp\n\tmovq %rsp, %rbp\n");
-    let frame = (count_lets(&main.body) * 8 + 15) & !15;
-    if frame > 0 {
-        let _ = writeln!(asm, "\tsubq ${frame}, %rsp");
-    }
-
     let mut e = Emitter {
-        asm,
-        scopes: vec![HashMap::new()],
+        asm: String::from("\t.section .note.GNU-stack,\"\",@progbits\n\t.text\n"),
+        scopes: Vec::new(),
         next_slot: 0,
         labels: 0,
+        depth: 0,
+        module: 0,
+        res,
     };
-    for stmt in &main.body {
-        e.stmt(stmt)?;
+    for (mi, module) in graph.modules.iter().enumerate() {
+        for item in &module.ast {
+            if let Item::Function(f) = item {
+                e.function(f, mi)?;
+            }
+        }
     }
-    // Unreachable for int main (the checker proves every path returns),
-    // but keeps a fall-through frame balanced once unit functions exist.
-    e.asm.push_str("\tleave\n\tret\n");
     Ok(e.asm)
+}
+
+/// The assembly symbol for a function: the entry `main` keeps its name
+/// (the C runtime calls it); everything else is suffixed with its module
+/// index, which decodes uniquely (the suffix after the last underscore).
+fn label_of(module: usize, name: &str) -> String {
+    if module == 0 && name == "main" {
+        name.to_string()
+    } else {
+        format!("{name}_{module}")
+    }
 }
 
 /// Slots needed for a body: one per `let` site, blocks included.
@@ -78,19 +93,89 @@ fn count_lets(body: &[Stmt]) -> usize {
         .sum()
 }
 
-struct Emitter {
+struct Emitter<'a> {
     asm: String,
     /// Innermost-last scope stack; each block pushes and pops one frame.
     scopes: Vec<HashMap<String, i64>>,
     /// Slots handed out so far — every `let` site takes a fresh one.
     next_slot: i64,
+    /// Global label counter — jump labels must be unique per file.
     labels: usize,
+    /// Outstanding operand pushes. %rsp sits 16-aligned at statement
+    /// level, so this parity decides the call-site alignment fix-up.
+    depth: usize,
+    /// The module whose function is being emitted — call names resolve
+    /// through its alias map.
+    module: usize,
+    res: &'a Resolutions,
 }
 
-impl Emitter {
+impl Emitter<'_> {
+    /// Emits one function: prologue, register-spilled params, body,
+    /// fall-through epilogue (reachable only for unit functions — the
+    /// checker proves value-returning bodies always return).
+    fn function(&mut self, f: &Function, module: usize) -> Result<(), Diagnostic> {
+        for p in &f.params {
+            if !matches!(p.ty, TypeAnn::Int | TypeAnn::Bool) {
+                return Err(unsupported("parameters of this type", f.span));
+            }
+        }
+        if !matches!(
+            f.return_type,
+            None | Some(TypeAnn::Int) | Some(TypeAnn::Bool)
+        ) {
+            return Err(unsupported("this return type", f.span));
+        }
+        if f.params.len() > ARG_REGS.len() {
+            return Err(unsupported("more than 6 parameters", f.span));
+        }
+
+        self.module = module;
+        self.next_slot = 0;
+        self.depth = 0;
+        let label = label_of(module, &f.name);
+        if label == "main" {
+            self.asm.push_str("\t.globl main\n");
+        }
+        let _ = writeln!(self.asm, "{label}:");
+
+        // Slots are rbp-relative because operand pushes move %rsp; the
+        // frame is 16-byte aligned so %rsp parity at any point is just
+        // the outstanding push count.
+        self.asm.push_str("\tpushq %rbp\n\tmovq %rsp, %rbp\n");
+        let frame = ((f.params.len() + count_lets(&f.body)) * 8 + 15) & !15;
+        if frame > 0 {
+            let _ = writeln!(self.asm, "\tsubq ${frame}, %rsp");
+        }
+
+        let mut params = HashMap::new();
+        for (i, p) in f.params.iter().enumerate() {
+            self.next_slot -= 8;
+            let _ = writeln!(self.asm, "\tmovq {}, {}(%rbp)", ARG_REGS[i], self.next_slot);
+            params.insert(p.name.clone(), self.next_slot);
+        }
+        self.scopes = vec![params];
+
+        for stmt in &f.body {
+            self.stmt(stmt)?;
+        }
+        self.asm.push_str("\tleave\n\tret\n");
+        Ok(())
+    }
+
     fn fresh_label(&mut self) -> String {
         self.labels += 1;
         format!(".L{}", self.labels)
+    }
+
+    fn push(&mut self, reg: &str) {
+        self.depth += 1;
+        let _ = writeln!(self.asm, "\tpushq {reg}");
+    }
+
+    fn pop(&mut self, reg: &str) {
+        self.depth -= 1;
+        let _ = writeln!(self.asm, "\tpopq {reg}");
     }
 
     fn lookup(&self, name: &str) -> Option<i64> {
@@ -129,10 +214,12 @@ impl Emitter {
                 }
                 other => return Err(unsupported("this assignment target", other.span())),
             },
-            Stmt::Return {
-                value: Some(expr), ..
-            } => {
-                self.expr(expr)?;
+            Stmt::Return { value, .. } => {
+                if let Some(expr) = value {
+                    self.expr(expr)?;
+                }
+                // `leave` restores %rsp from %rbp, so pending operand
+                // pushes on this path unwind with the frame.
                 self.asm.push_str("\tleave\n\tret\n");
             }
             Stmt::If {
@@ -258,10 +345,45 @@ impl Emitter {
                     }
                 };
                 self.expr(lhs)?;
-                self.asm.push_str("\tpushq %rax\n");
+                self.push("%rax");
                 self.expr(rhs)?;
-                self.asm.push_str("\tmovq %rax, %rcx\n\tpopq %rax\n");
+                self.asm.push_str("\tmovq %rax, %rcx\n");
+                self.pop("%rax");
                 self.asm.push_str(apply);
+            }
+            Expr::Call { callee, args, span } => {
+                let Expr::Ident(name, _) = callee.as_ref() else {
+                    return Err(unsupported("this callee", *span));
+                };
+                let Some((tm, tname)) = self.res.functions[self.module].get(name) else {
+                    // Resolution order says: no user definition, so this
+                    // is a builtin (print/len/push) — they need runtime
+                    // support that doesn't exist yet.
+                    return Err(unsupported(&format!("builtin '{name}'"), *span));
+                };
+                if args.len() > ARG_REGS.len() {
+                    return Err(unsupported("calls with more than 6 arguments", *span));
+                }
+                // Evaluate args left to right onto the stack (a later
+                // arg's subexpressions would clobber earlier registers),
+                // then pop into the ABI registers in reverse.
+                for arg in args {
+                    self.expr(arg)?;
+                    self.push("%rax");
+                }
+                for reg in ARG_REGS[..args.len()].iter().rev() {
+                    self.pop(reg);
+                }
+                // The ABI wants %rsp 16-aligned at the call instruction;
+                // an odd number of pending operand pushes leaves it 8 off.
+                let misaligned = self.depth % 2 == 1;
+                if misaligned {
+                    self.asm.push_str("\tsubq $8, %rsp\n");
+                }
+                let _ = writeln!(self.asm, "\tcall {}", label_of(*tm, tname));
+                if misaligned {
+                    self.asm.push_str("\taddq $8, %rsp\n");
+                }
             }
             other => return Err(unsupported("this expression", other.span())),
         }
