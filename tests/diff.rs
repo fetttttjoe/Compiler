@@ -93,6 +93,58 @@ fn literal_beyond_i32_range() {
 }
 
 #[test]
+fn locals_and_assignment() {
+    diff(
+        "locals",
+        "fun main(): int { var x: int = 5; x = x + 37; return x; }",
+    );
+}
+
+#[test]
+fn locals_depend_on_each_other() {
+    diff(
+        "deps",
+        "fun main(): int {
+            const a: int = 6;
+            const b: int = a * 7;
+            var c: int = b - a;
+            c = c + a % 4;
+            return c * 2 - b;
+        }",
+    );
+}
+
+#[test]
+fn many_locals_fill_many_slots() {
+    // 20 slots exercise frame sizing past one 16-byte alignment unit.
+    let decls: String = (0..20)
+        .map(|i| format!("var x{i}: int = {i} * 3;"))
+        .collect();
+    let sum = (0..20)
+        .map(|i| format!("x{i}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    diff(
+        "slots",
+        &format!("fun main(): int {{ {decls} return {sum}; }}"),
+    );
+}
+
+#[test]
+fn assignment_reads_the_old_value() {
+    diff(
+        "swapish",
+        "fun main(): int {
+            var a: int = 3;
+            var b: int = 10;
+            a = b - a;
+            b = b - a;
+            return a * 100 + b;
+        }",
+    );
+}
+
+#[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as
     // tall as the chain is long; 6000 terms used to overflow the checker's

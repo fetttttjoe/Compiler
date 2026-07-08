@@ -21,6 +21,7 @@
 
 use crate::ast::{BinOp, Expr, Function, Stmt, TypeAnn, UnOp};
 use crate::diagnostic::Diagnostic;
+use std::collections::HashMap;
 use std::fmt::Write;
 
 /// Compiles the checked program's `main` to assembly text.
@@ -29,22 +30,64 @@ pub fn compile(main: &Function) -> Result<String, Diagnostic> {
         return Err(unsupported("main not returning int", main.span));
     }
 
+    // One 8-byte rbp-relative slot per binding name. The body is flat
+    // until control flow compiles (no blocks), so a same-scope shadow can
+    // share its predecessor's name→slot entry: the initializer reads the
+    // old value before the store rebinds it. Duplicates waste a slot.
+    let locals: HashMap<&str, i64> = main
+        .body
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Let { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .enumerate()
+        .map(|(i, name)| (name, -8 * (i as i64 + 1)))
+        .collect();
+
     // The GNU-stack note marks the stack non-executable; without it the
     // linker warns and grants an executable stack.
     let mut asm =
         String::from("\t.section .note.GNU-stack,\"\",@progbits\n\t.text\n\t.globl main\nmain:\n");
+    // Slots are rbp-relative because operand pushes move %rsp. Frame kept
+    // 16-byte aligned — free now, mandatory once calls exist.
+    asm.push_str("\tpushq %rbp\n\tmovq %rsp, %rbp\n");
+    let frame = (locals.len() * 8 + 15) & !15;
+    if frame > 0 {
+        let _ = writeln!(asm, "\tsubq ${frame}, %rsp");
+    }
+
     for stmt in &main.body {
-        match stmt {
-            Stmt::Return {
-                value: Some(expr), ..
-            } => {
-                emit_expr(expr, &mut asm)?;
-                asm.push_str("\tret\n");
-            }
-            other => return Err(unsupported("this statement", other.span())),
-        }
+        emit_stmt(stmt, &locals, &mut asm)?;
     }
     Ok(asm)
+}
+
+fn emit_stmt(stmt: &Stmt, locals: &HashMap<&str, i64>, asm: &mut String) -> Result<(), Diagnostic> {
+    match stmt {
+        Stmt::Let { name, value, .. } => {
+            emit_expr(value, locals, asm)?;
+            let off = locals[name.as_str()];
+            let _ = writeln!(asm, "\tmovq %rax, {off}(%rbp)");
+        }
+        Stmt::Assign { target, value, .. } => match target {
+            Expr::Ident(name, _) if locals.contains_key(name.as_str()) => {
+                emit_expr(value, locals, asm)?;
+                let off = locals[name.as_str()];
+                let _ = writeln!(asm, "\tmovq %rax, {off}(%rbp)");
+            }
+            other => return Err(unsupported("this assignment target", other.span())),
+        },
+        Stmt::Return {
+            value: Some(expr), ..
+        } => {
+            emit_expr(expr, locals, asm)?;
+            asm.push_str("\tleave\n\tret\n");
+        }
+        Stmt::Expr(expr) => emit_expr(expr, locals, asm)?, // value discarded
+        other => return Err(unsupported("this statement", other.span())),
+    }
+    Ok(())
 }
 
 /// Emits code leaving the expression's value in %rax. Binary ops park the
@@ -53,16 +96,24 @@ pub fn compile(main: &Function) -> Result<String, Diagnostic> {
 /// `compile` sees the frame it was called with. Recursion depth is safe:
 /// the parser bounds AST height at construction (MAX_FN_OPS) and the
 /// pipeline runs on a worker stack sized for that bound (main.rs).
-fn emit_expr(expr: &Expr, asm: &mut String) -> Result<(), Diagnostic> {
+fn emit_expr(expr: &Expr, locals: &HashMap<&str, i64>, asm: &mut String) -> Result<(), Diagnostic> {
     match expr {
         // movabsq takes a full 64-bit immediate; movq would cap at i32.
         Expr::Int(n, _) => {
             let _ = writeln!(asm, "\tmovabsq ${n}, %rax");
         }
+        Expr::Ident(name, span) => match locals.get(name.as_str()) {
+            Some(off) => {
+                let _ = writeln!(asm, "\tmovq {off}(%rbp), %rax");
+            }
+            // The checker resolved it, but not to a local we can compile
+            // yet (e.g. a function name used as a value).
+            None => return Err(unsupported("this name", *span)),
+        },
         Expr::Unary {
             op: UnOp::Neg, rhs, ..
         } => {
-            emit_expr(rhs, asm)?;
+            emit_expr(rhs, locals, asm)?;
             asm.push_str("\tnegq %rax\n");
         }
         Expr::Binary { op, lhs, rhs, span } => {
@@ -79,9 +130,9 @@ fn emit_expr(expr: &Expr, asm: &mut String) -> Result<(), Diagnostic> {
                 BinOp::Rem => "\tcqto\n\tidivq %rcx\n\tmovq %rdx, %rax\n",
                 _ => return Err(unsupported(&format!("operator '{}'", op.symbol()), *span)),
             };
-            emit_expr(lhs, asm)?;
+            emit_expr(lhs, locals, asm)?;
             asm.push_str("\tpushq %rax\n");
-            emit_expr(rhs, asm)?;
+            emit_expr(rhs, locals, asm)?;
             asm.push_str("\tmovq %rax, %rcx\n\tpopq %rax\n");
             asm.push_str(apply);
         }

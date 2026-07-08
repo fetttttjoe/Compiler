@@ -136,9 +136,10 @@ fn undeliverable_output_is_not_a_silent_success() {
 #[test]
 fn build_rejects_unsupported_constructs_with_a_diagnostic() {
     let dir = tempdir();
+    // while loops are still beyond the current codegen slice
     std::fs::write(
         dir.join("uncompilable.ys"),
-        "fun main(): int { var x: int = 1; return x; }",
+        "fun main(): int { var x: int = 1; while x < 3 { x = x + 1; } return x; }",
     )
     .unwrap();
     let out = compiler(&[
