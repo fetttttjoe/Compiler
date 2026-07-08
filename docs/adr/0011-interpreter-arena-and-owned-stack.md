@@ -29,7 +29,7 @@ blocked the real fix.
    is capped: exceeding `MAX_HEAP_CELLS` is a "heap limit exceeded"
    diagnostic, not an OOM kill.
 2. **The interpreter owns its stack.** `interpret()` runs the program on
-   a dedicated scoped thread with an explicit 256MB (lazily committed)
+   a dedicated scoped thread with an explicit 1GB (lazily committed)
    stack — possible only because arena handles make `Value` `Send`. No
    caller environment, test harness, or rlimit shapes behavior.
 3. **One depth budget for everything that recurses natively.** Calls,

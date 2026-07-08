@@ -170,7 +170,6 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                     scopes: Vec::new(),
                     nonnull: Vec::new(),
                     ret: Type::Unit,
-                    expr_depth: 0,
                 };
                 checker.check_function(f);
             }
@@ -270,16 +269,7 @@ struct Checker<'a> {
     /// any call or field write, since aliases can reach them.
     nonnull: Vec<NarrowFrame>,
     ret: Type,
-    /// Current `type_of_expr` recursion depth (see `MAX_EXPR_DEPTH`).
-    expr_depth: u32,
 }
-
-/// Expression-depth budget — a stack-safety guard like the parser's
-/// `MAX_NESTING`, but for AST *height*, which left-associative operator
-/// chains grow without ever nesting the parser (`1+1+…+1` parses at
-/// constant depth). Every recursive pass downstream of this check fits
-/// comfortably in the 1GB pipeline stack (main.rs) at this bound.
-pub const MAX_EXPR_DEPTH: u32 = 65_536;
 
 impl<'a> Checker<'a> {
     fn error(&mut self, message: String, span: Span) {
@@ -633,20 +623,10 @@ impl<'a> Checker<'a> {
         }
     }
 
+    // Recursion here (and in every later pass) is stack-safe because the
+    // parser bounds AST height at construction (`MAX_FN_OPS`), and the
+    // pipeline runs on a worker stack sized for that bound (main.rs).
     fn type_of_expr(&mut self, expr: &Expr) -> Type {
-        if self.expr_depth >= MAX_EXPR_DEPTH {
-            // Type::Error quiets the cascade (ADR 0008), so this reports
-            // once per over-deep spine, not once per node.
-            self.error("expression too deeply nested".to_string(), expr.span());
-            return Type::Error;
-        }
-        self.expr_depth += 1;
-        let ty = self.type_of_expr_inner(expr);
-        self.expr_depth -= 1;
-        ty
-    }
-
-    fn type_of_expr_inner(&mut self, expr: &Expr) -> Type {
         match expr {
             Expr::Int(_, _) => Type::Int,
             Expr::Float(_, _) => Type::Float,

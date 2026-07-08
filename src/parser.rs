@@ -15,15 +15,27 @@ pub struct Parser<'a> {
     pub struct_literals_allowed: bool,
     /// Current expression/statement nesting depth (see `MAX_NESTING`).
     pub depth: u32,
+    /// Chain-built expression nodes in the current function (see `MAX_FN_OPS`).
+    fn_ops: u32,
+    /// True once the current function's operator budget was reported.
+    fn_ops_reported: bool,
 }
 
 /// Recursion ceiling for nested expressions and statements — a stack-safety
 /// guard for the parser's own recursion, not a language limit. Pathological
 /// nesting (deep parens, huge `else if` chains) gets a diagnostic instead of
-/// a stack overflow. Left-associative operator chains parse at constant
-/// depth, so the *height* of the AST they build is bounded separately, by
-/// the checker's `MAX_EXPR_DEPTH`.
+/// a stack overflow. Operator/postfix chains parse at constant depth, so the
+/// AST height they build is bounded separately, by `MAX_FN_OPS`.
 const MAX_NESTING: u32 = 128;
+
+/// Chain-built nodes (binary operators and `.`/`[]`/`()` links) allowed per
+/// function. Chains grow AST height without nesting the parser, and every
+/// later pass — checker, narrowing, codegen, even drop glue — recurses per
+/// level of that height. Bounding it here, at construction, protects them
+/// all at once. Sized well under the interpreter's 65_536-unit eval budget
+/// (so anything the parser admits also runs) and far under what the
+/// pipeline worker stack fits (main.rs).
+const MAX_FN_OPS: u32 = 32_768;
 
 impl<'a> Parser<'a> {
     /// Creates a parser over a token stream (which must end in `Eof`).
@@ -34,7 +46,30 @@ impl<'a> Parser<'a> {
             diagnostics: Vec::new(),
             struct_literals_allowed: true,
             depth: 0,
+            fn_ops: 0,
+            fn_ops_reported: false,
         }
+    }
+
+    /// Claims budget for one chain-built node. On overflow: reports once
+    /// per function and returns false — the caller keeps its unwrapped
+    /// lhs, freezing the tree's growth while parsing still consumes
+    /// tokens normally, so exactly one diagnostic surfaces.
+    fn claim_op(&mut self, span: Span) -> bool {
+        if self.fn_ops < MAX_FN_OPS {
+            self.fn_ops += 1;
+            return true;
+        }
+        if !self.fn_ops_reported {
+            self.fn_ops_reported = true;
+            self.error(
+                format!(
+                    "function exceeds {MAX_FN_OPS} operators — split it into smaller functions"
+                ),
+                span,
+            );
+        }
+        false
     }
 
     /// Claims one level of nesting. On overflow: reports a diagnostic,
@@ -226,6 +261,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_function(&mut self, exported: bool) -> Function {
+        self.fn_ops = 0;
+        self.fn_ops_reported = false;
         let start = self.expect(TokenKind::Fun);
         let name = self.expect_identifier();
         self.expect(TokenKind::LeftParen);
@@ -348,15 +385,18 @@ impl<'a> Parser<'a> {
             if prec.left_bp() < min_bp {
                 break;
             }
+            let op_span = self.peek().span;
             self.bump(); // operator
             let rhs = self.parse_expr(prec.right_bp());
-            let span = lhs.span().to(rhs.span());
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                span,
-            };
+            if self.claim_op(op_span) {
+                let span = lhs.span().to(rhs.span());
+                lhs = Expr::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span,
+                };
+            }
         }
         lhs
     }
@@ -449,6 +489,9 @@ impl<'a> Parser<'a> {
                 }
                 self.struct_literals_allowed = prev;
                 let end = self.expect(TokenKind::RightParen);
+                if !self.claim_op(end) {
+                    return lhs;
+                }
                 let span = lhs.span().to(end);
                 Expr::Call {
                     callee: Box::new(lhs),
@@ -465,6 +508,9 @@ impl<'a> Parser<'a> {
                 let index = self.parse_expr(0);
                 self.struct_literals_allowed = prev;
                 let end = self.expect(TokenKind::RightBracket);
+                if !self.claim_op(end) {
+                    return lhs;
+                }
                 let span = lhs.span().to(end);
                 Expr::Index {
                     base: Box::new(lhs),
@@ -486,6 +532,9 @@ impl<'a> Parser<'a> {
                         (String::new(), field.span)
                     }
                 };
+                if !self.claim_op(name_span) {
+                    return lhs;
+                }
                 let span = lhs.span().to(name_span);
                 Expr::Field {
                     base: Box::new(lhs),
@@ -1565,5 +1614,63 @@ mod tests {
             panic!("expected function")
         };
         assert!(matches!(f.body.last(), Some(Stmt::Return { .. })));
+    }
+
+    /// Budget tests build trees up to MAX_FN_OPS tall; run them on a
+    /// stack that comfortably fits the drop glue (test threads get 2MB).
+    fn on_big_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn budget_diags(src: &str) -> Vec<Diagnostic> {
+        let (tokens, lex_diags) = lex(src);
+        assert!(lex_diags.is_empty(), "lex errors: {lex_diags:?}");
+        let (ast, diags) = parse(&tokens);
+        drop(ast); // dropping the frozen tree must not overflow either
+        diags
+    }
+
+    #[test]
+    fn operator_chains_charge_the_function_budget() {
+        on_big_stack(|| {
+            let chain = vec!["1"; MAX_FN_OPS as usize + 10].join(" + ");
+            let diags = budget_diags(&format!("fun f(): int {{ return {chain}; }}"));
+            let hits = diags
+                .iter()
+                .filter(|d| d.message.contains("operators"))
+                .count();
+            assert_eq!(hits, 1, "reported once per function: {}", diags.len());
+        });
+    }
+
+    #[test]
+    fn field_chains_charge_the_same_budget() {
+        on_big_stack(|| {
+            let links = ".f".repeat(MAX_FN_OPS as usize + 10);
+            let diags = budget_diags(&format!("fun f(): int {{ return x{links}; }}"));
+            assert_eq!(
+                diags
+                    .iter()
+                    .filter(|d| d.message.contains("operators"))
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn operator_budget_resets_between_functions() {
+        on_big_stack(|| {
+            // Each function is under the cap; only a leaked counter would trip.
+            let chain = vec!["1"; 20_000].join(" + ");
+            let src =
+                format!("fun a(): int {{ return {chain}; }}\nfun b(): int {{ return {chain}; }}");
+            assert!(budget_diags(&src).is_empty());
+        });
     }
 }

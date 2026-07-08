@@ -170,6 +170,13 @@ fn build_refuses_to_overwrite_its_own_source() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("overwrite"));
 
+    // Nor a hard link (same inode behind a different path).
+    let _ = std::fs::remove_file(dir.join("lnk"));
+    std::fs::hard_link(&src, dir.join("lnk")).unwrap();
+    let out = compiler_in(&dir, &["build", "clob", "-o", "lnk"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("overwrite"));
+
     assert_eq!(
         std::fs::read_to_string(&src).unwrap(),
         program,
@@ -226,9 +233,10 @@ fn build_flags_work_in_any_order() {
 }
 
 /// A left-associative operator chain parses at constant depth, so it can
-/// build an AST far taller than the parser's nesting guard allows. The
-/// checker's depth budget must turn it into a diagnostic — not a stack
-/// overflow — on both engines.
+/// build an AST far taller than the parser's nesting guard could see. The
+/// parser's per-function operator budget must turn it into a diagnostic —
+/// not a stack overflow — before any pass walks the tree. (Interpret and
+/// build share the path up to the diagnostic, so one invocation covers both.)
 #[test]
 fn deep_operator_chain_is_a_diagnostic_not_a_crash() {
     let dir = tempdir();
@@ -238,20 +246,77 @@ fn deep_operator_chain_is_a_diagnostic_not_a_crash() {
         format!("fun main(): int {{ return {terms}; }}"),
     )
     .unwrap();
-    let src = dir.join("deep.ys");
-    let bin = dir.join("deep");
-    let modes: [&[&str]; 2] = [
-        &[src.to_str().unwrap()],
-        &["build", src.to_str().unwrap(), "-o", bin.to_str().unwrap()],
-    ];
-    for args in modes {
-        let out = compiler(args);
-        assert_eq!(
-            out.status.code(),
-            Some(1),
-            "{args:?} must exit cleanly, not die on a signal"
-        );
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.contains("deeply nested"), "{err}");
-    }
+    let out = compiler(&[dir.join("deep.ys").to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "must exit cleanly, not die on a signal"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("operators"), "{err}");
+}
+
+/// The other face of the same crash class: a `&&` chain in a condition
+/// reaches the narrowing walkers, which recurse per clause with no budget
+/// of their own. The parser bound protects them by construction.
+#[test]
+fn deep_condition_chain_is_a_diagnostic_not_a_crash() {
+    let dir = tempdir();
+    let cond = vec!["true"; 40_000].join(" && ");
+    std::fs::write(
+        dir.join("deepcond.ys"),
+        format!("fun main(): int {{ while {cond} {{ return 1; }} return 0; }}"),
+    )
+    .unwrap();
+    let out = compiler(&[dir.join("deepcond.ys").to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "must exit cleanly, not die on a signal"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("operators"));
+}
+
+#[test]
+fn build_never_writes_assembly_through_a_symlink() {
+    let dir = tempdir();
+    std::fs::write(dir.join("ok.ys"), "fun main(): int { return 3; }").unwrap();
+    std::fs::write(dir.join("victim.txt"), "IMPORTANT DATA").unwrap();
+    let _ = std::fs::remove_file(dir.join("point.s"));
+    std::os::unix::fs::symlink("victim.txt", dir.join("point.s")).unwrap();
+    // The derived assembly path point.s is a symlink to an innocent file.
+    let out = compiler_in(&dir, &["build", "ok.ys", "-o", "point"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("symlink"));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("victim.txt")).unwrap(),
+        "IMPORTANT DATA"
+    );
+}
+
+#[test]
+fn build_output_may_not_collide_with_its_assembly_file() {
+    let dir = tempdir();
+    std::fs::write(dir.join("ok.ys"), "fun main(): int { return 3; }").unwrap();
+    // -o ending in .s: cc's input and output would be the same file.
+    let out = compiler_in(&dir, &["build", "ok.ys", "-o", "foo.s"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("collides"));
+    assert!(!dir.join("foo.s").exists(), "nothing may be written");
+}
+
+#[test]
+fn double_dash_allows_dashed_source_names() {
+    let dir = tempdir();
+    std::fs::write(dir.join("-o.ys"), "fun main(): int { return 5; }").unwrap();
+    let out = compiler_in(&dir, &["build", "-o", "dashout", "--", "-o.ys"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = std::process::Command::new(dir.join("dashout"))
+        .output()
+        .expect("failed to run built binary");
+    assert_eq!(run.status.code(), Some(5));
 }

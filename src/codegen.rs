@@ -45,8 +45,8 @@ pub fn compile(main: &Function) -> Result<String, Diagnostic> {
 /// left operand on the machine stack while the right side evaluates, then
 /// pop it into %rcx — pushes and pops always balance, so `ret` in
 /// `compile` sees the frame it was called with. Recursion depth is safe:
-/// the checker bounds AST height (MAX_EXPR_DEPTH) and the pipeline runs
-/// on the 1GB worker stack (main.rs).
+/// the parser bounds AST height at construction (MAX_FN_OPS) and the
+/// pipeline runs on a worker stack sized for that bound (main.rs).
 fn emit_expr(expr: &Expr, asm: &mut String) -> Result<(), Diagnostic> {
     match expr {
         // movabsq takes a full 64-bit immediate; movq would cap at i32.

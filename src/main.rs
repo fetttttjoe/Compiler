@@ -18,31 +18,44 @@ use diagnostic::Diagnostic;
 use source::SourceMap;
 use std::io::{IsTerminal, Write};
 
+/// Worker stack for the compiler passes. The parser bounds AST height at
+/// MAX_FN_OPS (32_768); the fattest recursive pass (the checker, ~2KB per
+/// debug frame) needs ~64MB at that height, so 256MB is 4× headroom. The
+/// interpreter still owns its separate 1GB stack with its own eval budget
+/// (ADR 0011).
+const PIPELINE_STACK_BYTES: usize = 256 << 20;
+
 fn main() {
-    // Every pass recurses over the AST, so the pipeline runs on a worker
-    // with the same generous stack the interpreter gets (ADR 0011). The
-    // checker's expression-depth budget (check::MAX_EXPR_DEPTH) turns
-    // deep programs into diagnostics long before this stack runs out.
-    std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("compiler".into())
-        .stack_size(1 << 30)
+        .stack_size(PIPELINE_STACK_BYTES)
         .spawn(run)
-        .expect("cannot spawn the compiler thread")
-        .join()
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    {
+        Ok(worker) => worker
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+        // Constrained hosts (tight rlimits) may refuse the reservation.
+        // ponytail: run on the default stack rather than not at all —
+        // only pathologically deep programs could outgrow it there.
+        Err(_) => run(),
+    }
+}
+
+/// How to run the checked program: `compiler <entry>` interprets,
+/// `compiler build <entry> [-o <out>]` compiles to a native binary.
+enum Mode {
+    Interpret,
+    Build { out: Option<std::path::PathBuf> },
 }
 
 fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // `compiler <entry>` interprets; `compiler build <entry> [-o <out>]`
-    // compiles to a native binary. `build_out`: None = interpret,
-    // Some(None) = build to the default output, Some(Some(p)) = build -o p.
-    let (entry, build_out) = match args.as_slice() {
+    let (entry, mode) = match args.as_slice() {
         [cmd, rest @ ..] if cmd == "build" => {
             let (entry, out) = parse_build_args(rest);
-            (entry, Some(out))
+            (entry, Mode::Build { out })
         }
-        [entry] => (entry, None),
+        [entry] => (entry, Mode::Interpret),
         _ => usage(),
     };
 
@@ -69,8 +82,8 @@ fn run() {
         std::process::exit(1);
     };
 
-    if let Some(out_flag) = build_out {
-        let out = out_flag.unwrap_or_else(|| default_out(entry));
+    if let Mode::Build { out } = mode {
+        let out = out.unwrap_or_else(|| default_out(entry));
         return build(main_fn, &graph, &out, &map);
     }
 
@@ -91,19 +104,23 @@ fn run() {
 }
 
 /// `build`'s arguments in any order: exactly one entry file, `-o <out>`
-/// anywhere. Anything else — unknown flags, a second entry, a dangling
+/// anywhere, and `--` ending flag parsing so dashed file names stay
+/// reachable. Anything else — unknown flags, a second entry, a dangling
 /// `-o` — is a usage error.
 fn parse_build_args(rest: &[String]) -> (&String, Option<std::path::PathBuf>) {
     let mut entry = None;
     let mut out = None;
+    let mut flags_done = false;
     let mut args = rest.iter();
     while let Some(arg) = args.next() {
-        if arg == "-o" {
+        if !flags_done && arg == "--" {
+            flags_done = true;
+        } else if !flags_done && arg == "-o" {
             match args.next() {
                 Some(path) if out.is_none() => out = Some(std::path::PathBuf::from(path)),
                 _ => usage(),
             }
-        } else if arg.starts_with('-') || entry.is_some() {
+        } else if (!flags_done && arg.starts_with('-')) || entry.is_some() {
             usage();
         } else {
             entry = Some(arg);
@@ -146,16 +163,33 @@ fn build(
         Err(diag) => return exit_on_errors(&[diag], map),
     };
     let asm_path = out.with_extension("s");
-    // Refuse to write over any loaded source file, whatever spelling the
-    // paths use — canonicalize resolves `./`, `..`, and symlinks. A target
-    // that doesn't exist yet can't clobber anything (canonicalize errs).
-    let sources: Vec<std::path::PathBuf> = graph
-        .modules
-        .iter()
-        .filter_map(|m| std::fs::canonicalize(&m.path).ok())
-        .collect();
+    // `with_extension` is the identity on `.s` names: cc's input and
+    // output would be the same file.
+    if asm_path == out {
+        print_error(&format!(
+            "output '{}' collides with its assembly file — pick a name not ending in .s",
+            out.display()
+        ));
+        std::process::exit(1);
+    }
+    // The assembly path is derived, not user-chosen — never write it
+    // through a pre-existing symlink to somewhere the user didn't name.
+    if std::fs::symlink_metadata(&asm_path).is_ok_and(|m| m.file_type().is_symlink()) {
+        print_error(&format!(
+            "assembly path '{}' is a symlink — refusing to write through it",
+            asm_path.display()
+        ));
+        std::process::exit(1);
+    }
+    // Never write over a loaded source file. Same-file means same inode,
+    // so `./` spellings, symlink chains, and hard links can't disguise
+    // one; a target that doesn't exist yet can't destroy anything.
     for target in [asm_path.as_path(), out] {
-        if std::fs::canonicalize(target).is_ok_and(|t| sources.contains(&t)) {
+        if graph
+            .modules
+            .iter()
+            .any(|m| same_file(target, std::path::Path::new(&m.path)))
+        {
             print_error(&format!(
                 "refusing to overwrite source file '{}'",
                 target.display()
@@ -182,6 +216,15 @@ fn build(
             print_error(&format!("cannot run cc: {e}"));
             std::process::exit(1);
         }
+    }
+}
+
+/// True when both paths name the same existing file (device + inode).
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
     }
 }
 
