@@ -1005,6 +1005,9 @@ impl<'a> Checker<'a> {
         let (Type::Array(elem), Expr::ArrayLit { elements, .. }) = (target, value) else {
             return false;
         };
+        // This path bypasses type_of_expr, but the per-expression type
+        // table must stay total: the literal's type IS the declared one.
+        self.expr_types.insert(value.span(), expected.clone());
         for element in elements {
             if self.check_literal_against(element, elem) {
                 continue;

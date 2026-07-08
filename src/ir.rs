@@ -69,6 +69,36 @@ enum Inst {
         label: String,
         args: Vec<V>,
     },
+    /// A runtime/libc call (malloc, ys_push): a clobber point like Call.
+    CallRt {
+        dst: V,
+        sym: &'static str,
+        args: Vec<V>,
+    },
+    /// Array header init: buf into 16(hdr), len into 0/8(hdr).
+    StoreHdr {
+        hdr: V,
+        buf: V,
+        len: usize,
+    },
+    /// Literal element store at a constant slot: val into 8*i(buf).
+    BufSet {
+        buf: V,
+        slot: usize,
+        val: V,
+    },
+    Len(V, V),
+    /// Bounds-checked element read/write (ADR 0008's runtime check).
+    Index {
+        dst: V,
+        arr: V,
+        idx: V,
+    },
+    IndexSet {
+        arr: V,
+        idx: V,
+        val: V,
+    },
     Ret(V),
     Jmp(Lbl),
     /// Falls through when `cond` is nonzero, jumps when zero.
@@ -76,9 +106,12 @@ enum Inst {
     Label(Lbl),
 }
 
-/// Everything word-typed the first tier accepts.
+/// Everything word-typed this tier accepts: scalars and array handles
+/// (compilable array elements are always single words, so indexing and
+/// iteration stay word-sized too). Aggregates and strings still belong
+/// to the direct tier.
 fn word_scalar(t: &Type) -> bool {
-    matches!(t, Type::Int | Type::Bool | Type::Float)
+    matches!(t, Type::Int | Type::Bool | Type::Float | Type::Array(_))
 }
 
 struct Lowerer<'a> {
@@ -190,14 +223,21 @@ impl Lowerer<'_> {
                     .expect("a scope is always open")
                     .insert(name.clone(), slot);
             }
-            Stmt::Assign { target, value, .. } => {
-                let Expr::Ident(name, _) = target else {
-                    return None;
-                };
-                let dst = self.lookup(name)?;
-                let v = self.expr(value)?;
-                self.insts.push(Inst::Copy(dst, v));
-            }
+            Stmt::Assign { target, value, .. } => match target {
+                Expr::Ident(name, _) => {
+                    let dst = self.lookup(name)?;
+                    let v = self.expr(value)?;
+                    self.insts.push(Inst::Copy(dst, v));
+                }
+                Expr::Index { base, index, .. } => {
+                    // The oracle evaluates the value before the target.
+                    let val = self.expr(value)?;
+                    let arr = self.expr(base)?;
+                    let idx = self.expr(index)?;
+                    self.insts.push(Inst::IndexSet { arr, idx, val });
+                }
+                _ => return None,
+            },
             Stmt::Return { value, .. } => match value {
                 Some(expr) => {
                     let v = self.expr(expr)?;
@@ -246,7 +286,60 @@ impl Lowerer<'_> {
             Stmt::Expr(expr) => {
                 self.expr(expr)?;
             }
-            Stmt::For { .. } => return None,
+            Stmt::For {
+                index,
+                name,
+                iterable,
+                body,
+                ..
+            } => {
+                // Live iteration, the oracle's contract: length re-read
+                // every step, element copied out before the body runs.
+                let elem_float = matches!(
+                    self.res.expr_types.get(&iterable.span()),
+                    Some(Type::Array(inner)) if **inner == Type::Float
+                );
+                let arr = self.expr(iterable)?;
+                let i = self.fresh(false);
+                self.insts.push(Inst::Const(i, 0));
+                let x = self.fresh(elem_float);
+                let top = self.fresh_label();
+                let end = self.fresh_label();
+                self.insts.push(Inst::Label(top));
+                let n = self.fresh(false);
+                self.insts.push(Inst::Len(n, arr));
+                let cond = self.fresh(false);
+                self.insts.push(Inst::Bin {
+                    op: BinOp::Lt,
+                    float: false,
+                    dst: cond,
+                    lhs: i,
+                    rhs: n,
+                });
+                self.insts.push(Inst::BrZero(cond, end));
+                self.insts.push(Inst::Index {
+                    dst: x,
+                    arr,
+                    idx: i,
+                });
+                let mut bindings = HashMap::new();
+                bindings.insert(name.clone(), x);
+                if let Some(ix) = index {
+                    bindings.insert(ix.clone(), i);
+                }
+                self.scopes.push(bindings);
+                let result = body.iter().try_for_each(|stmt| self.stmt(stmt));
+                self.scopes.pop();
+                result?;
+                self.insts.push(Inst::BinImm {
+                    op: BinOp::Add,
+                    dst: i,
+                    lhs: i,
+                    imm: 1,
+                });
+                self.insts.push(Inst::Jmp(top));
+                self.insts.push(Inst::Label(end));
+            }
         }
         Some(())
     }
@@ -409,6 +502,53 @@ impl Lowerer<'_> {
                 });
                 Some(v)
             }
+            Expr::ArrayLit { elements, span } => {
+                // Elements of compilable arrays are always words; null
+                // literals are gated language-wide (value optionals).
+                if !matches!(self.res.expr_types.get(span), Some(Type::Array(_))) {
+                    return None;
+                }
+                let c24 = self.fresh(false);
+                self.insts.push(Inst::Const(c24, 24));
+                let hdr = self.fresh(false);
+                self.insts.push(Inst::CallRt {
+                    dst: hdr,
+                    sym: "malloc@PLT",
+                    args: vec![c24],
+                });
+                let size = self.fresh(false);
+                self.insts
+                    .push(Inst::Const(size, 8 * elements.len().max(1) as i64));
+                let buf = self.fresh(false);
+                self.insts.push(Inst::CallRt {
+                    dst: buf,
+                    sym: "malloc@PLT",
+                    args: vec![size],
+                });
+                self.insts.push(Inst::StoreHdr {
+                    hdr,
+                    buf,
+                    len: elements.len(),
+                });
+                for (slot, element) in elements.iter().enumerate() {
+                    let val = self.expr(element)?;
+                    self.insts.push(Inst::BufSet { buf, slot, val });
+                }
+                Some(hdr)
+            }
+            Expr::Index { base, index, span } => {
+                if !self.word_expr(span) {
+                    return None;
+                }
+                let arr = self.expr(base)?;
+                let idx = self.expr(index)?;
+                let dst = self.fresh(
+                    self.word_expr(span)
+                        && matches!(self.res.expr_types.get(span), Some(Type::Float)),
+                );
+                self.insts.push(Inst::Index { dst, arr, idx });
+                Some(dst)
+            }
             Expr::Call { callee, args, span } => {
                 if !self
                     .res
@@ -421,7 +561,29 @@ impl Lowerer<'_> {
                 let Expr::Ident(name, _) = callee.as_ref() else {
                     return None;
                 };
-                // Builtins (print/len/push) belong to the direct tier.
+                // Builtins: len and push lower; print stays direct-tier.
+                if !self.res.functions[self.module].contains_key(name) {
+                    match (name.as_str(), args.as_slice()) {
+                        ("len", [array]) => {
+                            let arr = self.expr(array)?;
+                            let dst = self.fresh(false);
+                            self.insts.push(Inst::Len(dst, arr));
+                            return Some(dst);
+                        }
+                        ("push", [array, value]) => {
+                            let arr = self.expr(array)?;
+                            let val = self.expr(value)?;
+                            let dst = self.fresh(false);
+                            self.insts.push(Inst::CallRt {
+                                dst,
+                                sym: "ys_push",
+                                args: vec![arr, val],
+                            });
+                            return Some(dst);
+                        }
+                        _ => return None,
+                    }
+                }
                 let key = self.res.functions[self.module].get(name)?;
                 let sig = self.res.sigs.get(key)?;
                 if !sig.params.iter().all(word_scalar) || args.len() > 6 {
@@ -499,7 +661,14 @@ fn intervals(insts: &[Inst], vregs: usize) -> Vec<Interval> {
             | Inst::DivMagic { dst, src, .. }
             | Inst::RemMagic { dst, src, .. } => (vec![*src], Some(*dst)),
             Inst::Neg(d, s) | Inst::NegF(d, s) | Inst::Not(d, s) => (vec![*s], Some(*d)),
-            Inst::Call { dst, args, .. } => (args.clone(), Some(*dst)),
+            Inst::Call { dst, args, .. } | Inst::CallRt { dst, args, .. } => {
+                (args.clone(), Some(*dst))
+            }
+            Inst::StoreHdr { hdr, buf, .. } => (vec![*hdr, *buf], None),
+            Inst::BufSet { buf, val, .. } => (vec![*buf, *val], None),
+            Inst::Len(d, arr) => (vec![*arr], Some(*d)),
+            Inst::Index { dst, arr, idx } => (vec![*arr, *idx], Some(*dst)),
+            Inst::IndexSet { arr, idx, val } => (vec![*arr, *idx, *val], None),
             Inst::Ret(v) => (vec![*v], None),
             Inst::BrZero(v, _) => (vec![*v], None),
             Inst::Jmp(_) | Inst::Label(_) => (vec![], None),
@@ -555,7 +724,7 @@ fn intervals(insts: &[Inst], vregs: usize) -> Vec<Interval> {
         }
     }
     for (i, inst) in insts.iter().enumerate() {
-        let is_call = matches!(inst, Inst::Call { .. })
+        let is_call = matches!(inst, Inst::Call { .. } | Inst::CallRt { .. })
             || matches!(
                 inst,
                 Inst::Bin {
@@ -718,6 +887,7 @@ fn emit(name: &str, module: usize, nparams: usize, lo: Lowerer) -> String {
         }
     }
 
+    let mut bounds = 0usize;
     for inst in &lo.insts {
         match inst {
             Inst::Const(d, n) => {
@@ -973,6 +1143,63 @@ fn emit(name: &str, module: usize, nparams: usize, lo: Lowerer) -> String {
                     }
                     let _ = writeln!(a, "\tmovq %rax, {}", at(*dst));
                 }
+            }
+            Inst::CallRt { dst, sym, args } => {
+                for (i, v) in args.iter().enumerate() {
+                    let _ = writeln!(a, "\tmovq {}, {}", at(*v), ARG_REGS[i]);
+                }
+                let _ = writeln!(a, "\tcall {sym}");
+                if let Some(l) = loc.get(dst) {
+                    let _ = writeln!(a, "\tmovq %rax, {}", operand(*l));
+                }
+            }
+            Inst::StoreHdr { hdr, buf, len } => {
+                let _ = writeln!(
+                    a,
+                    "\tmovq {}, %rax\n\tmovq {}, %rcx\n\tmovq %rcx, 16(%rax)\n\
+                     \tmovq ${len}, 0(%rax)\n\tmovq ${len}, 8(%rax)",
+                    at(*hdr),
+                    at(*buf)
+                );
+            }
+            Inst::BufSet { buf, slot, val } => {
+                let _ = writeln!(
+                    a,
+                    "\tmovq {}, %rax\n\tmovq {}, %rcx\n\tmovq %rcx, {}(%rax)",
+                    at(*buf),
+                    at(*val),
+                    8 * slot
+                );
+            }
+            Inst::Len(d, arr) => {
+                let _ = writeln!(a, "\tmovq {}, %rax\n\tmovq 0(%rax), %rax", at(*arr));
+                let _ = writeln!(a, "\tmovq %rax, {}", at(*d));
+            }
+            Inst::Index { dst, arr, idx } => {
+                bounds += 1;
+                let _ = writeln!(
+                    a,
+                    "\tmovq {}, %rax\n\tmovq {}, %rcx\n\tcmpq 0(%rax), %rcx\n\
+                     \tjb .LTB{module}_{name}_{bounds}\n\tcall abort@PLT\n\
+                     .LTB{module}_{name}_{bounds}:\n\
+                     \tmovq 16(%rax), %rax\n\tmovq (%rax,%rcx,8), %rax",
+                    at(*arr),
+                    at(*idx)
+                );
+                let _ = writeln!(a, "\tmovq %rax, {}", at(*dst));
+            }
+            Inst::IndexSet { arr, idx, val } => {
+                bounds += 1;
+                let _ = writeln!(
+                    a,
+                    "\tmovq {}, %rax\n\tmovq {}, %rcx\n\tcmpq 0(%rax), %rcx\n\
+                     \tjb .LTB{module}_{name}_{bounds}\n\tcall abort@PLT\n\
+                     .LTB{module}_{name}_{bounds}:\n\
+                     \tmovq 16(%rax), %rax\n\tmovq {}, %rdx\n\tmovq %rdx, (%rax,%rcx,8)",
+                    at(*arr),
+                    at(*idx),
+                    at(*val)
+                );
             }
             Inst::Call { dst, label, args } => {
                 for (i, v) in args.iter().enumerate() {
