@@ -1,6 +1,8 @@
 # ADR 0013 — String Representation: Immutable Fat Pointers
 
-- **Status:** Proposed — design pinned, no codegen yet
+- **Status:** Accepted — landed: literals are fully static rodata
+  `{ptr, len}` descriptors (deduplicated), copies ride the value-struct
+  machinery, equality is length-then-memcmp, `print` formats via printf
 - **Date:** 2026-07-08
 - **Extends:** ADR 0005 (nothing implicit — including hidden copies),
   ADR 0012 (laws 1 and 2: natural layout, stated before the feature
