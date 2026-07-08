@@ -38,13 +38,10 @@ fn run() {
     // compiles to a native binary. `build_out`: None = interpret,
     // Some(None) = build to the default output, Some(Some(p)) = build -o p.
     let (entry, build_out) = match args.as_slice() {
-        [cmd, rest @ ..] if cmd == "build" => match rest {
-            [entry] => (entry, Some(None)),
-            [entry, flag, out] if flag == "-o" => {
-                (entry, Some(Some(std::path::PathBuf::from(out))))
-            }
-            _ => usage(),
-        },
+        [cmd, rest @ ..] if cmd == "build" => {
+            let (entry, out) = parse_build_args(rest);
+            (entry, Some(out))
+        }
         [entry] => (entry, None),
         _ => usage(),
     };
@@ -90,6 +87,31 @@ fn run() {
             }
         }
         Err(diag) => exit_on_errors(&[diag], &map),
+    }
+}
+
+/// `build`'s arguments in any order: exactly one entry file, `-o <out>`
+/// anywhere. Anything else — unknown flags, a second entry, a dangling
+/// `-o` — is a usage error.
+fn parse_build_args(rest: &[String]) -> (&String, Option<std::path::PathBuf>) {
+    let mut entry = None;
+    let mut out = None;
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        if arg == "-o" {
+            match args.next() {
+                Some(path) if out.is_none() => out = Some(std::path::PathBuf::from(path)),
+                _ => usage(),
+            }
+        } else if arg.starts_with('-') || entry.is_some() {
+            usage();
+        } else {
+            entry = Some(arg);
+        }
+    }
+    match entry {
+        Some(entry) => (entry, out),
+        None => usage(),
     }
 }
 

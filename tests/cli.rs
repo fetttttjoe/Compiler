@@ -200,9 +200,29 @@ fn build_usage_errors() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("usage:"));
 
-    // Flags are positional for now: -o before the entry is usage too.
-    let out = compiler(&["build", "-o", "out", "x.ys"]);
+    // -o without a value, two entries, and an unknown flag are usage too.
+    let out = compiler(&["build", "x.ys", "-o"]);
     assert_eq!(out.status.code(), Some(2));
+    let out = compiler(&["build", "x.ys", "y.ys"]);
+    assert_eq!(out.status.code(), Some(2));
+    let out = compiler(&["build", "--wat", "x.ys"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn build_flags_work_in_any_order() {
+    let dir = tempdir();
+    std::fs::write(dir.join("seven.ys"), "fun main(): int { return 7; }").unwrap();
+    let out = compiler_in(&dir, &["build", "-o", "lucky", "seven.ys"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = std::process::Command::new(dir.join("lucky"))
+        .output()
+        .expect("failed to run built binary");
+    assert_eq!(run.status.code(), Some(7));
 }
 
 /// A left-associative operator chain parses at constant depth, so it can
