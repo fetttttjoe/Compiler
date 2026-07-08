@@ -290,6 +290,38 @@ fn arrays_of_value_structs_are_not_yet_compilable() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("not yet compilable"));
 }
 
+/// Value-optional elements must stay gated through EVERY route to an
+/// array type: outer optionals and struct fields included (a pushed 0
+/// would be bit-identical to null).
+#[test]
+fn value_optional_arrays_are_gated_through_every_route() {
+    let dir = tempdir();
+    for (name, src) in [
+        (
+            "outeropt",
+            "fun main(): int { var xs: int?[]? = []; return 0; }",
+        ),
+        (
+            "fieldroute",
+            "refstruct S { xs: int?[] }
+             fun main(): int { const s: S = S { xs: [] }; return 0; }",
+        ),
+    ] {
+        std::fs::write(dir.join(format!("{name}.ys")), src).unwrap();
+        let out = compiler(&[
+            "build",
+            dir.join(format!("{name}.ys")).to_str().unwrap(),
+            "-o",
+            dir.join(name).to_str().unwrap(),
+        ]);
+        assert_eq!(out.status.code(), Some(1), "{name}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("not yet compilable"),
+            "{name}"
+        );
+    }
+}
+
 /// Printing aggregates needs the debug renderer the runtime doesn't
 /// have yet; scalars and strings print, the rest diagnoses.
 #[test]

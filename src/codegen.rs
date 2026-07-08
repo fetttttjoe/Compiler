@@ -7,12 +7,13 @@
 //! (see tests/diff.rs).
 //!
 //! Scheme: recursive emission into %rax, machine stack for the pending
-//! left operand. Every value is one word — scalars and handles by value,
-//! value structs by *pointer* to frame/heap storage (copied at `let`,
-//! assignment, and return; passing a pointer uncopied is sound because
-//! the checker forbids writes through const value params). ponytail: no
-//! IR and no register allocation until a real optimization needs them,
-//! per ADR 0009.
+//! left operand. Every expression value is one word — scalars and
+//! handles by value; value structs and strings by *pointer* to storage,
+//! copied wherever the oracle copies: `let`, assignment, return, each
+//! call argument at evaluation time, and equality's left operand (a
+//! later evaluation may mutate the storage through a refstruct alias).
+//! ponytail: no IR and no register allocation until a real optimization
+//! needs them, per ADR 0009.
 //!
 //! Compiled behavior on the idiv traps — division by zero and
 //! i64::MIN / -1 — is deferred (the binary takes a SIGFPE): the
@@ -64,6 +65,7 @@ pub fn compile(
         res,
         returns: &HashMap::new(),
         data: String::new(),
+        relro: String::new(),
         str_ids: HashMap::new(),
     };
 
@@ -91,10 +93,16 @@ pub fn compile(
         }
     }
     e.asm.push_str(RUNTIME);
-    // Read-only data: printf formats, bool spellings, string literals —
-    // all RIP-relative (the system cc links PIE by default).
+    // Read-only data: printf formats, bool spellings, string bytes — all
+    // RIP-relative (the system cc links PIE by default). Descriptors hold
+    // an absolute address needing a load-time relocation, so they live in
+    // .data.rel.ro, not .rodata (TEXTREL would break `-z text` linking).
     e.asm.push_str(RODATA);
     e.asm.push_str(&e.data);
+    if !e.relro.is_empty() {
+        e.asm.push_str("\t.section .data.rel.ro\n");
+        e.asm.push_str(&e.relro);
+    }
     Ok(e.asm)
 }
 
@@ -225,8 +233,10 @@ struct Emitter<'a> {
     res: &'a Resolutions,
     /// Return kinds of every user function, for sret call sites.
     returns: &'a HashMap<(usize, String), Kind>,
-    /// Read-only data: string literal bytes + descriptors, deduplicated.
+    /// Read-only data: string literal bytes (deduplicated) — and their
+    /// descriptors, which need load-time relocations (.data.rel.ro).
     data: String,
+    relro: String,
     str_ids: HashMap<String, usize>,
 }
 
@@ -237,8 +247,16 @@ impl Emitter<'_> {
     fn kind_of(&self, t: &Type, fuel: usize) -> Option<Kind> {
         match t {
             Type::Int | Type::Bool => Some(Kind::Word),
-            Type::Optional(inner) => ref_shaped(inner, self.res).then_some(Kind::Word),
-            Type::Array(_) => Some(Kind::Word),
+            // A nullable handle is a word only if the handle itself is a
+            // compilable word (an `int?[]?` must stay as gated as `int?`).
+            Type::Optional(inner) => (ref_shaped(inner, self.res)
+                && self.kind_of(inner, fuel.checked_sub(1)?)? == Kind::Word)
+                .then_some(Kind::Word),
+            // Elements must be single words (ADR 0014's stride seat); a
+            // value-optional element would alias 0 with null.
+            Type::Array(inner) => {
+                (self.kind_of(inner, fuel.checked_sub(1)?)? == Kind::Word).then_some(Kind::Word)
+            }
             Type::Str => Some(Kind::Str),
             Type::Struct(m, n) => {
                 let def = &self.res.structs[&(*m, n.clone())];
@@ -288,7 +306,8 @@ impl Emitter<'_> {
                 TypeAnn::Named(n) => self.res.ref_structs[module]
                     .contains(n)
                     .then_some(Kind::Word),
-                TypeAnn::Array(_) => Some(Kind::Word),
+                // The Array arm validates the element type too.
+                TypeAnn::Array(_) => self.ann_kind(inner, module),
                 _ => None,
             },
             TypeAnn::Named(n) => {
@@ -313,6 +332,15 @@ impl Emitter<'_> {
     fn expr_kind(&self, e: &Expr) -> Kind {
         match e {
             Expr::Str(..) => Kind::Str,
+            // `+` concatenates when its operands are strings.
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs,
+                ..
+            } => match self.expr_kind(lhs) {
+                Kind::Str => Kind::Str,
+                _ => Kind::Word,
+            },
             Expr::Ident(name, _) => self.lookup(name).map_or(Kind::Word, |l| l.kind),
             Expr::Field { span, .. } => self
                 .res
@@ -355,7 +383,11 @@ impl Emitter<'_> {
                 .ok_or_else(|| unsupported("this return type", f.span))?
                 .words(),
         };
-        let sret = self.ret_words > 1;
+        let ret_kind = match &f.return_type {
+            None => Kind::Word,
+            Some(t) => self.ann_kind(t, module).unwrap_or(Kind::Word),
+        };
+        let sret = ret_kind != Kind::Word;
         if f.params.len() + sret as usize > ARG_REGS.len() {
             return Err(unsupported("more than 6 parameters", f.span));
         }
@@ -384,7 +416,7 @@ impl Emitter<'_> {
                 Local {
                     off: slot,
                     kind,
-                    indirect: kind.words() > 1,
+                    indirect: kind != Kind::Word,
                 },
             );
         }
@@ -497,14 +529,15 @@ impl Emitter<'_> {
                     }
                 }
                 let kind = self.expr_kind(value);
-                let words = kind.words();
-                let off = self.alloc(words);
+                let off = self.alloc(kind.words());
                 self.expr(value)?;
-                if words == 1 {
+                // Dispatch on kind, never on width: a one-field value
+                // struct is one word wide but still pointer-valued.
+                if kind == Kind::Word {
                     let _ = writeln!(self.asm, "\tmovq %rax, {off}(%rbp)");
                 } else {
                     let _ = writeln!(self.asm, "\tleaq {off}(%rbp), %rdi\n\tmovq %rax, %rsi");
-                    self.copy(words);
+                    self.copy(kind.words());
                 }
                 self.scopes
                     .last_mut()
@@ -527,7 +560,7 @@ impl Emitter<'_> {
                         return Err(unsupported("this assignment target", *span));
                     };
                     self.expr(value)?;
-                    if local.kind.words() == 1 {
+                    if local.kind == Kind::Word {
                         let _ = writeln!(self.asm, "\tmovq %rax, {}(%rbp)", local.off);
                     } else {
                         let _ = writeln!(
@@ -539,13 +572,17 @@ impl Emitter<'_> {
                     }
                 }
                 Expr::Index { base, index, .. } => {
+                    // The oracle evaluates the value BEFORE the target's
+                    // base and index — side effects must interleave the
+                    // same way.
+                    self.expr(value)?;
+                    self.push("%rax");
                     self.expr(base)?;
                     self.push("%rax");
                     self.expr(index)?;
-                    self.push("%rax");
-                    self.expr(value)?;
-                    self.pop("%rcx");
+                    self.asm.push_str("\tmovq %rax, %rcx\n");
                     self.pop("%rdx");
+                    self.pop("%rax");
                     self.bounds_check("%rdx");
                     self.asm
                         .push_str("\tmovq 16(%rdx), %rdx\n\tmovq %rax, (%rdx,%rcx,8)\n");
@@ -557,21 +594,23 @@ impl Emitter<'_> {
                     let Some(slot) = self.res.field_slots.get(span) else {
                         return Err(unsupported("this field target", *span));
                     };
-                    let words = self
-                        .type_words(&slot.ty, 64)
+                    let kind = self
+                        .kind_of(&slot.ty, 64)
                         .ok_or_else(|| unsupported("fields of this type", *span))?;
                     let off = self
                         .offset_of(&slot.base, slot.index)
                         .ok_or_else(|| unsupported("this struct layout", *span))?;
-                    self.expr(base)?;
-                    self.push("%rax");
+                    // Value before target base — the oracle's order.
                     self.expr(value)?;
-                    self.pop("%rdi");
-                    if words == 1 {
+                    self.push("%rax");
+                    self.expr(base)?;
+                    self.asm.push_str("\tmovq %rax, %rdi\n");
+                    self.pop("%rax");
+                    if kind == Kind::Word {
                         let _ = writeln!(self.asm, "\tmovq %rax, {off}(%rdi)");
                     } else {
                         let _ = writeln!(self.asm, "\tleaq {off}(%rdi), %rdi\n\tmovq %rax, %rsi");
-                        self.copy(words);
+                        self.copy(kind.words());
                     }
                 }
                 other => return Err(unsupported("this assignment target", other.span())),
@@ -714,7 +753,7 @@ impl Emitter<'_> {
                 let _ = writeln!(self.asm, "\tleaq .Lsd{id}(%rip), %rax");
             }
             Expr::Ident(name, span) => match self.lookup(name) {
-                Some(local) if local.kind.words() == 1 || local.indirect => {
+                Some(local) if local.kind == Kind::Word || local.indirect => {
                     let _ = writeln!(self.asm, "\tmovq {}(%rbp), %rax", local.off);
                 }
                 // A by-value struct/str local: its value IS the frame slots.
@@ -776,16 +815,63 @@ impl Emitter<'_> {
             }
             Expr::Binary { op, lhs, rhs, span } => {
                 let kind = self.expr_kind(lhs);
+                // Concatenation: the one explicitly allocating string
+                // operation (ADR 0013) — new buffer, both byte runs
+                // copied, fresh descriptor in a statement temp.
+                if kind == Kind::Str && matches!(op, BinOp::Add) {
+                    let l = self.alloc(1);
+                    let r = self.alloc(1);
+                    let buf = self.alloc(1);
+                    let out = self.alloc(2);
+                    self.expr(lhs)?;
+                    let _ = writeln!(self.asm, "\tmovq %rax, {l}(%rbp)");
+                    self.expr(rhs)?;
+                    let _ = writeln!(self.asm, "\tmovq %rax, {r}(%rbp)");
+                    let _ = writeln!(
+                        self.asm,
+                        "\tmovq {l}(%rbp), %rax\n\tmovq 8(%rax), %rdi\n\
+                         \tmovq {r}(%rbp), %rax\n\taddq 8(%rax), %rdi"
+                    );
+                    self.call("malloc@PLT");
+                    let _ = writeln!(
+                        self.asm,
+                        "\tmovq %rax, {buf}(%rbp)\n\tmovq %rax, %rdi\n\
+                         \tmovq {l}(%rbp), %rax\n\tmovq 0(%rax), %rsi\n\tmovq 8(%rax), %rdx"
+                    );
+                    self.call("memcpy@PLT");
+                    let _ = writeln!(
+                        self.asm,
+                        "\tmovq {buf}(%rbp), %rdi\n\tmovq {l}(%rbp), %rax\n\
+                         \taddq 8(%rax), %rdi\n\
+                         \tmovq {r}(%rbp), %rax\n\tmovq 0(%rax), %rsi\n\tmovq 8(%rax), %rdx"
+                    );
+                    self.call("memcpy@PLT");
+                    let _ = writeln!(
+                        self.asm,
+                        "\tmovq {buf}(%rbp), %rax\n\tmovq %rax, {out}(%rbp)\n\
+                         \tmovq {l}(%rbp), %rax\n\tmovq 8(%rax), %rcx\n\
+                         \tmovq {r}(%rbp), %rax\n\taddq 8(%rax), %rcx\n\
+                         \tmovq %rcx, {}(%rbp)\n\tleaq {out}(%rbp), %rax",
+                        out + 8
+                    );
+                    return Ok(());
+                }
                 if matches!(op, BinOp::Eq | BinOp::Ne) && kind != Kind::Word {
+                    // The right side may mutate the left side's storage
+                    // through an alias, and the oracle compares the value
+                    // from before — so snapshot the left operand first.
                     match kind {
                         // Content equality (ADR 0013): length first, then
                         // the bytes. The checker guarantees both sides
                         // share one type.
                         Kind::Str => {
                             self.expr(lhs)?;
-                            self.push("%rax");
+                            let snap = self.alloc(2);
+                            let _ =
+                                writeln!(self.asm, "\tleaq {snap}(%rbp), %rdi\n\tmovq %rax, %rsi");
+                            self.copy(2);
                             self.expr(rhs)?;
-                            self.pop("%rcx");
+                            let _ = writeln!(self.asm, "\tleaq {snap}(%rbp), %rcx");
                             let differ = self.fresh_label();
                             let end = self.fresh_label();
                             let _ = writeln!(
@@ -809,11 +895,16 @@ impl Emitter<'_> {
                         // is padding-free 8-byte words, so memcmp decides.
                         Kind::Struct { words, .. } => {
                             self.expr(lhs)?;
-                            self.push("%rax");
+                            let snap = self.alloc(words);
+                            let _ =
+                                writeln!(self.asm, "\tleaq {snap}(%rbp), %rdi\n\tmovq %rax, %rsi");
+                            self.copy(words);
                             self.expr(rhs)?;
-                            self.asm.push_str("\tmovq %rax, %rsi\n");
-                            self.pop("%rdi");
-                            let _ = writeln!(self.asm, "\tmovq ${}, %rdx", 8 * words);
+                            let _ = writeln!(
+                                self.asm,
+                                "\tmovq %rax, %rsi\n\tleaq {snap}(%rbp), %rdi\n\tmovq ${}, %rdx",
+                                8 * words
+                            );
                             self.call("memcmp@PLT");
                             let _ = writeln!(
                                 self.asm,
@@ -877,19 +968,30 @@ impl Emitter<'_> {
                     // is a builtin.
                     return self.builtin(name, args, *span);
                 };
-                let ret_words = self.returns.get(key).copied().unwrap_or(Kind::Word).words();
-                let sret = ret_words > 1;
+                let ret_kind = self.returns.get(key).copied().unwrap_or(Kind::Word);
+                let sret = ret_kind != Kind::Word;
                 if args.len() + sret as usize > ARG_REGS.len() {
                     return Err(unsupported("calls with more than 6 arguments", *span));
                 }
                 // A struct-returning callee writes into a fresh temp here
                 // in the caller's frame (freed at statement end).
-                let dest = sret.then(|| self.alloc(ret_words));
+                let dest = sret.then(|| self.alloc(ret_kind.words()));
                 // Evaluate args left to right onto the stack (a later
                 // arg's subexpressions would clobber earlier registers),
-                // then pop into the ABI registers in reverse.
+                // then pop into the ABI registers in reverse. Multi-word
+                // values are copied into private temps AT EVALUATION TIME:
+                // the oracle copies arguments as it evaluates them, so a
+                // later arg mutating the storage through an alias must not
+                // be visible (and the callee's storage stays immutable).
                 for arg in args {
                     self.expr(arg)?;
+                    let kind = self.expr_kind(arg);
+                    if kind != Kind::Word {
+                        let tmp = self.alloc(kind.words());
+                        let _ = writeln!(self.asm, "\tleaq {tmp}(%rbp), %rdi\n\tmovq %rax, %rsi");
+                        self.copy(kind.words());
+                        let _ = writeln!(self.asm, "\tleaq {tmp}(%rbp), %rax");
+                    }
                     self.push("%rax");
                 }
                 let shifted = &ARG_REGS[sret as usize..sret as usize + args.len()];
@@ -912,7 +1014,7 @@ impl Emitter<'_> {
                         null.span(),
                     ));
                 }
-                if let Some(wide) = elements.iter().find(|e| self.expr_kind(e).words() > 1) {
+                if let Some(wide) = elements.iter().find(|e| self.expr_kind(e) != Kind::Word) {
                     return Err(unsupported("arrays of multi-word values", wide.span()));
                 }
                 // Header {len, cap, data*} plus buffer, per ADR 0014.
@@ -961,8 +1063,8 @@ impl Emitter<'_> {
                 let Some(slot) = self.res.field_slots.get(span) else {
                     return Err(unsupported("this field access", *span));
                 };
-                let words = self
-                    .type_words(&slot.ty, 64)
+                let field_kind = self
+                    .kind_of(&slot.ty, 64)
                     .ok_or_else(|| unsupported("fields of this type", *span))?;
                 let off = self
                     .offset_of(&slot.base, slot.index)
@@ -983,13 +1085,14 @@ impl Emitter<'_> {
                     let end = self.fresh_label();
                     let _ = writeln!(self.asm, "\ttestq %rax, %rax\n\tje {end}");
                     let _ = writeln!(self.asm, "\tmovq {off}(%rax), %rax\n{end}:");
-                } else if words == 1 {
+                } else if field_kind == Kind::Word {
                     // No null check: the checker's narrowing is sound, so
                     // a plain `.` base is proven non-null (ADR 0007).
                     let _ = writeln!(self.asm, "\tmovq {off}(%rax), %rax");
                 } else {
-                    // A struct-typed field's value is its storage inside
-                    // the base — an interior pointer; consumers copy.
+                    // A struct/str-typed field's value is its storage
+                    // inside the base — an interior pointer; consumers
+                    // copy.
                     let _ = writeln!(self.asm, "\tleaq {off}(%rax), %rax");
                 }
             }
@@ -998,21 +1101,21 @@ impl Emitter<'_> {
                     return Err(unsupported("this struct literal", *span));
                 };
                 let def = &self.res.structs[key];
-                let field_words: Vec<usize> = def
+                let field_kinds: Vec<Kind> = def
                     .fields
                     .iter()
-                    .map(|(_, t)| self.type_words(t, 64))
+                    .map(|(_, t)| self.kind_of(t, 64))
                     .collect::<Option<_>>()
                     .ok_or_else(|| unsupported("structs with fields of this type", *span))?;
-                let offsets: Vec<i64> = field_words
+                let offsets: Vec<i64> = field_kinds
                     .iter()
-                    .scan(0i64, |acc, w| {
+                    .scan(0i64, |acc, k| {
                         let off = *acc;
-                        *acc += 8 * *w as i64;
+                        *acc += 8 * k.words() as i64;
                         Some(off)
                     })
                     .collect();
-                let total: usize = field_words.iter().sum();
+                let total: usize = field_kinds.iter().map(|k| k.words()).sum();
                 let slot_of = |fname: &str| {
                     def.fields
                         .iter()
@@ -1029,7 +1132,7 @@ impl Emitter<'_> {
                         let i = slot_of(fname);
                         self.expr(value)?;
                         self.pop("%rdx");
-                        if field_words[i] == 1 {
+                        if field_kinds[i] == Kind::Word {
                             let _ = writeln!(self.asm, "\tmovq %rax, {}(%rdx)", offsets[i]);
                         } else {
                             let _ = writeln!(
@@ -1037,7 +1140,7 @@ impl Emitter<'_> {
                                 "\tleaq {}(%rdx), %rdi\n\tmovq %rax, %rsi",
                                 offsets[i]
                             );
-                            self.copy(field_words[i]);
+                            self.copy(field_kinds[i].words());
                         }
                         self.push("%rdx");
                     }
@@ -1049,7 +1152,7 @@ impl Emitter<'_> {
                     for (fname, value) in fields {
                         let i = slot_of(fname);
                         self.expr(value)?;
-                        if field_words[i] == 1 {
+                        if field_kinds[i] == Kind::Word {
                             let _ = writeln!(self.asm, "\tmovq %rax, {}(%rbp)", base + offsets[i]);
                         } else {
                             let _ = writeln!(
@@ -1057,7 +1160,7 @@ impl Emitter<'_> {
                                 "\tleaq {}(%rbp), %rdi\n\tmovq %rax, %rsi",
                                 base + offsets[i]
                             );
-                            self.copy(field_words[i]);
+                            self.copy(field_kinds[i].words());
                         }
                     }
                     let _ = writeln!(self.asm, "\tleaq {base}(%rbp), %rax");
@@ -1078,7 +1181,7 @@ impl Emitter<'_> {
                 self.asm.push_str("\tmovq 0(%rax), %rax\n");
             }
             ("push", [array, value]) => {
-                if self.expr_kind(value).words() > 1 {
+                if self.expr_kind(value) != Kind::Word {
                     return Err(unsupported("arrays of multi-word values", value.span()));
                 }
                 self.expr(array)?;
@@ -1144,7 +1247,7 @@ impl Emitter<'_> {
             let _ = writeln!(self.data, "\t.byte {}", bytes.join(","));
         }
         let _ = writeln!(
-            self.data,
+            self.relro,
             "\t.balign 8\n.Lsd{id}:\n\t.quad .Lsb{id}\n\t.quad {}",
             text.len()
         );

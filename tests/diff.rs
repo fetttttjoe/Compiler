@@ -714,6 +714,94 @@ fn strings_inside_structs() {
 }
 
 #[test]
+fn string_concatenation_allocates() {
+    diff(
+        "concat",
+        "fun main(): int {
+            const a: string = \"foo\";
+            var s: string = a + \"bar\";
+            s = s + \"!\";
+            print(s);
+            print(\"x\" + \"y\" + \"z\");
+            print(\"\" + \"\");
+            if a + \"bar\" == \"foobar\" { return 7; }
+            return 0;
+        }",
+    );
+}
+
+#[test]
+fn struct_params_copy_at_the_call() {
+    // The callee mutates the underlying storage through an alias; the
+    // param must have been copied at argument evaluation, like the oracle.
+    diff(
+        "paramcopy",
+        "struct Pos { x: int, y: int }
+        refstruct Entity { pos: Pos, hp: int }
+        fun f(p: Pos, e: Entity): int { e.pos.x = 99; return p.x; }
+        fun main(): int {
+            const e: Entity = Entity { pos: Pos { x: 1, y: 2 }, hp: 0 };
+            return f(e.pos, e) * 100 + e.pos.x;
+        }",
+    );
+}
+
+#[test]
+fn equality_snapshots_its_left_operand() {
+    // The right side mutates the left side's storage during evaluation;
+    // the oracle compares the value from before.
+    diff(
+        "eqsnapshot",
+        "struct Pos { x: int, y: int }
+        refstruct Entity { pos: Pos, hp: int }
+        fun clobber(e: Entity): Pos {
+            e.pos.x = 77;
+            return Pos { x: 1, y: 2 };
+        }
+        fun main(): int {
+            const e: Entity = Entity { pos: Pos { x: 1, y: 2 }, hp: 0 };
+            if e.pos == clobber(e) { return 1; }
+            return 2;
+        }",
+    );
+}
+
+#[test]
+fn single_word_value_structs_are_still_pointers() {
+    // Kind::Struct{words:1} must never be mistaken for an inline word.
+    diff(
+        "onefield",
+        "struct V { z: int }
+        fun getz(v: V): int { return v.z; }
+        fun main(): int {
+            const a: V = V { z: 42 };
+            const b: int = 999;
+            var r: int = 0;
+            if a == (V { z: 42 }) { r = r + 1; }
+            return a.z + getz(a) + r + b - 999;
+        }",
+    );
+}
+
+#[test]
+fn assignment_evaluates_the_value_first() {
+    // The oracle evaluates the RHS before the target's base and index;
+    // print side effects expose the order.
+    diff(
+        "assignorder",
+        "fun eff(n: int): int { print(n); return n; }
+        refstruct B { v: int }
+        fun main(): int {
+            var xs: int[] = [10, 20, 30];
+            xs[eff(1)] = eff(2) + eff(3);
+            const bs: B[] = [B { v: 7 }];
+            bs[eff(0)].v = eff(5);
+            return xs[1] + bs[0].v;
+        }",
+    );
+}
+
+#[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as
     // tall as the chain is long; 6000 terms used to overflow the checker's
