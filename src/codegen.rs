@@ -75,7 +75,13 @@ pub fn compile(
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             if let Item::Function(f) = item {
-                e.function(f, mi)?;
+                // The optimizing tier (ADR 0016) takes any function it
+                // fully covers; both tiers share the ABI, so mixed
+                // binaries interoperate freely.
+                match crate::ir::lower(f, mi, res) {
+                    Some(tiered) => e.asm.push_str(&tiered),
+                    None => e.function(f, mi)?,
+                }
             }
         }
     }
@@ -150,7 +156,7 @@ ys_push:
 /// The assembly symbol for a function: the entry `main` keeps its name
 /// (the C runtime calls it); everything else is suffixed with its module
 /// index, which decodes uniquely (the suffix after the last underscore).
-fn label_of(module: usize, name: &str) -> String {
+pub(crate) fn label_of(module: usize, name: &str) -> String {
     if module == 0 && name == "main" {
         name.to_string()
     } else {

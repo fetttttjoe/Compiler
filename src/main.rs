@@ -3,6 +3,7 @@ mod check;
 mod codegen;
 mod diagnostic;
 mod interpreter;
+mod ir;
 mod lexer;
 mod modules;
 mod narrow;
