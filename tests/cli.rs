@@ -1,6 +1,25 @@
 mod common;
 use common::{compiler, compiler_in};
 
+/// Builds `src` and asserts the clean slice-gate diagnostic. The gate
+/// set shrinks slice by slice; when it empties, delete this helper.
+fn assert_not_yet_compilable(name: &str, src: &str) {
+    let dir = tempdir();
+    std::fs::write(dir.join(format!("{name}.ys")), src).unwrap();
+    let out = compiler(&[
+        "build",
+        dir.join(format!("{name}.ys")).to_str().unwrap(),
+        "-o",
+        dir.join(name).to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{name}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not yet compilable"),
+        "{name}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A per-process scratch directory for tests that write their own programs.
 fn tempdir() -> std::path::PathBuf {
     common::tempdir("ys-cli-test")
@@ -230,20 +249,10 @@ fn compiled_out_of_bounds_aborts_instead_of_corrupting() {
 /// null would share a bit pattern); reference optionals ride free.
 #[test]
 fn value_optionals_are_not_yet_compilable() {
-    let dir = tempdir();
-    std::fs::write(
-        dir.join("valopt.ys"),
+    assert_not_yet_compilable(
+        "valopt",
         "fun main(): int { var x: int? = null; if x == null { return 1; } return 0; }",
-    )
-    .unwrap();
-    let out = compiler(&[
-        "build",
-        dir.join("valopt.ys").to_str().unwrap(),
-        "-o",
-        dir.join("valopt").to_str().unwrap(),
-    ]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not yet compilable"));
+    );
 }
 
 /// A recursive value struct has infinite size; the checker allows the
@@ -251,43 +260,23 @@ fn value_optionals_are_not_yet_compilable() {
 /// diagnose instead of recursing forever.
 #[test]
 fn recursive_value_struct_is_a_clean_diagnostic() {
-    let dir = tempdir();
-    std::fs::write(
-        dir.join("recur.ys"),
+    assert_not_yet_compilable(
+        "recur",
         "struct S { s: S }
         fun f(p: S): int { return 0; }
         fun main(): int { return 1; }",
-    )
-    .unwrap();
-    let out = compiler(&[
-        "build",
-        dir.join("recur.ys").to_str().unwrap(),
-        "-o",
-        dir.join("recur").to_str().unwrap(),
-    ]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not yet compilable"));
+    );
 }
 
 /// Arrays of multi-word values need stride machinery ys_push and the
 /// indexers don't have yet.
 #[test]
 fn arrays_of_value_structs_are_not_yet_compilable() {
-    let dir = tempdir();
-    std::fs::write(
-        dir.join("valarr.ys"),
+    assert_not_yet_compilable(
+        "valarr",
         "struct P { x: int, y: int }
         fun main(): int { const ps: P[] = [P { x: 1, y: 2 }]; return ps[0].x; }",
-    )
-    .unwrap();
-    let out = compiler(&[
-        "build",
-        dir.join("valarr.ys").to_str().unwrap(),
-        "-o",
-        dir.join("valarr").to_str().unwrap(),
-    ]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not yet compilable"));
+    );
 }
 
 /// Value-optional elements must stay gated through EVERY route to an
@@ -295,71 +284,35 @@ fn arrays_of_value_structs_are_not_yet_compilable() {
 /// would be bit-identical to null).
 #[test]
 fn value_optional_arrays_are_gated_through_every_route() {
-    let dir = tempdir();
-    for (name, src) in [
-        (
-            "outeropt",
-            "fun main(): int { var xs: int?[]? = []; return 0; }",
-        ),
-        (
-            "fieldroute",
-            "refstruct S { xs: int?[] }
-             fun main(): int { const s: S = S { xs: [] }; return 0; }",
-        ),
-    ] {
-        std::fs::write(dir.join(format!("{name}.ys")), src).unwrap();
-        let out = compiler(&[
-            "build",
-            dir.join(format!("{name}.ys")).to_str().unwrap(),
-            "-o",
-            dir.join(name).to_str().unwrap(),
-        ]);
-        assert_eq!(out.status.code(), Some(1), "{name}");
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("not yet compilable"),
-            "{name}"
-        );
-    }
+    assert_not_yet_compilable(
+        "outeropt",
+        "fun main(): int { var xs: int?[]? = []; return 0; }",
+    );
+    assert_not_yet_compilable(
+        "fieldroute",
+        "refstruct S { xs: int?[] }
+         fun main(): int { const s: S = S { xs: [] }; return 0; }",
+    );
 }
 
 /// Printing aggregates needs the debug renderer the runtime doesn't
 /// have yet; scalars and strings print, the rest diagnoses.
 #[test]
 fn printing_structs_is_not_yet_compilable() {
-    let dir = tempdir();
-    std::fs::write(
-        dir.join("printstruct.ys"),
+    assert_not_yet_compilable(
+        "printstruct",
         "refstruct P { x: int }
         fun main(): int { print(P { x: 1 }); return 0; }",
-    )
-    .unwrap();
-    let out = compiler(&[
-        "build",
-        dir.join("printstruct.ys").to_str().unwrap(),
-        "-o",
-        dir.join("printstruct").to_str().unwrap(),
-    ]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not yet compilable"));
+    );
 }
 
 #[test]
 fn more_than_six_parameters_is_not_yet_compilable() {
-    let dir = tempdir();
-    std::fs::write(
-        dir.join("seven.ys"),
+    assert_not_yet_compilable(
+        "seven",
         "fun f(a: int, b: int, c: int, d: int, e: int, g: int, h: int): int { return a; }
         fun main(): int { return f(1, 2, 3, 4, 5, 6, 7); }",
-    )
-    .unwrap();
-    let out = compiler(&[
-        "build",
-        dir.join("seven.ys").to_str().unwrap(),
-        "-o",
-        dir.join("seven").to_str().unwrap(),
-    ]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not yet compilable"));
+    );
 }
 
 #[test]

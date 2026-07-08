@@ -54,7 +54,11 @@ pub enum Value {
     /// Fields sorted by name (literals may write them in any order, and
     /// sorting makes `PartialEq` order-independent); lookup is a linear
     /// scan — structs are small, and the checker guarantees the field
-    /// exists.
+    /// exists. NOTE: the sort is observable language spec, not just a
+    /// convenience — `print` renders fields in this (name-sorted) order
+    /// and the differential harness compares stdout byte-for-byte, so a
+    /// future codegen struct renderer must sort by name too, NOT walk
+    /// declaration-order layout.
     Struct {
         name: String,
         fields: Vec<(String, Value)>,
