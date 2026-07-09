@@ -150,6 +150,52 @@ fn huge_power_of_two_divisors_still_compile() {
 }
 
 #[test]
+fn for_in_over_an_empty_array_never_runs() {
+    diff(
+        "emptyiter",
+        "fun main(): int {
+            var xs: int[] = [];
+            var hits: int = 0;
+            for x in xs { hits = hits + x + 100; }
+            return hits + len(xs) + 9;
+        }",
+    );
+}
+
+#[test]
+fn min_int_through_the_magic_path_for_huge_divisors() {
+    // 2^32 skips the shift sequence (k > 31) and must take the magic
+    // path even at the i64 extremes.
+    diff(
+        "minhuge",
+        "fun main(): int {
+            const min: int = -9223372036854775807 - 1;
+            var r: int = (min / 4294967296) % 251;
+            r = r + (min % 4294967296) % 251;
+            return r % 251;
+        }",
+    );
+}
+
+#[test]
+fn string_concat_reassigned_in_a_loop() {
+    diff(
+        "concatloop",
+        "fun main(): int {
+            var s: string = \"x\";
+            var i: int = 0;
+            while i < 5 {
+                s = s + \"y\" + \"z\";
+                i = i + 1;
+            }
+            print(s);
+            if s == \"xyzyzyzyzyz\" { return 1; }
+            return 0;
+        }",
+    );
+}
+
+#[test]
 fn division_truncates_toward_zero() {
     diff("div", "fun main(): int { return -7 / 2; }");
 }
