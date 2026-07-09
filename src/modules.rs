@@ -1,3 +1,9 @@
+//! Multi-file programs: starting from the entry file, discover each
+//! wave of `import`s, lex+parse the wave in parallel, repeat until the
+//! graph closes, then reject cycles. Modules are numbered in discovery
+//! order — the entry file is always index 0, which keeps everything
+//! downstream deterministic.
+
 use std::collections::HashMap;
 use std::path::{Component, Path};
 

@@ -1,3 +1,8 @@
+//! The syntax tree the parser produces and every later phase consumes.
+//! Plain data: items (functions, structs, imports), statements, and
+//! expressions, each carrying the span diagnostics point at. The
+//! `sexpr` rendering exists only for shape assertions in tests.
+
 use crate::span::Span;
 
 pub type Ast = Vec<Item>;

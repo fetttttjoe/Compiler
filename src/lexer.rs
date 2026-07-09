@@ -1,3 +1,9 @@
+//! Source text → tokens. One linear scan with one character of
+//! lookahead; every token carries its span. Escapes are decoded here
+//! (bad ones recover with the raw character), comments and whitespace
+//! vanish, and the stream always ends with an `Eof` sentinel the parser
+//! relies on.
+
 use crate::diagnostic::Diagnostic;
 use crate::span::Span;
 use crate::syntax;

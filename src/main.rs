@@ -1,3 +1,9 @@
+//! The driver: argument parsing, the load → check → run/build pipeline,
+//! and everything that touches the outside world (files, `cc`, exit
+//! codes). Compiler passes run on a worker thread with a stack sized
+//! for the parser's AST-height bound; the safety guards in `build`
+//! protect source files from being overwritten by outputs.
+
 mod ast;
 mod check;
 mod codegen;

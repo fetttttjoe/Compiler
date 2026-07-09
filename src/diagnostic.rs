@@ -1,3 +1,8 @@
+//! Error reporting: a `Diagnostic` is a message, a span, and an
+//! optional help line, rendered with the source line, a caret gutter,
+//! and optional color. Every error path in the compiler — lexer to
+//! backend — flows through this one shape, so all errors look alike.
+
 use crate::source::SourceMap;
 use crate::span::Span;
 use crate::syntax;
