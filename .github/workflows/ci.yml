@@ -1,0 +1,39 @@
+# CI (ADR 0017/0018 discipline): every push runs the full quality bar —
+# format, lints as errors, the whole test suite (unit + CLI + diff +
+# conformance), a deterministic fuzz sweep, and the benchmark suite.
+# Benchmark TIMINGS are report-only (shared runners jitter too much to
+# gate on); the runner's ys-vs-C exit-code agreement check DOES gate.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: format
+        run: cargo fmt --check
+
+      - name: lints are errors
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: tests (unit, cli, differential, conformance)
+        run: cargo test
+
+      - name: differential fuzz (deterministic seeds)
+        run: python3 tools/fuzz.py 0 60
+
+      - name: benchmarks vs C -O2
+        run: |
+          ./benches/run.sh | tee bench.txt
+          {
+            echo "### Benchmarks (ys vs C -O2 — timings informational)"
+            echo '```'
+            cat bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
