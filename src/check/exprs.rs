@@ -477,10 +477,10 @@ impl Checker<'_> {
                     value.span(),
                 );
             }
-            if let Some((_, expected)) = decl.fields.iter().find(|(dn, _)| dn == fname) {
-                if self.check_literal_against(value, &expected.clone()) {
-                    continue;
-                }
+            if let Some((_, expected)) = decl.fields.iter().find(|(dn, _)| dn == fname)
+                && self.check_literal_against(value, &expected.clone())
+            {
+                continue;
             }
             let got = self.type_of_expr(value);
             match decl.fields.iter().find(|(dn, _)| dn == fname) {
@@ -554,10 +554,10 @@ impl Checker<'_> {
     pub(super) fn lookup(&mut self, name: &str, span: Span) -> Type {
         if let Some(info) = self.find_var(name) {
             // A narrowed optional reads as its inner type.
-            if self.is_nonnull(name) {
-                if let Type::Optional(inner) = &info.ty {
-                    return (**inner).clone();
-                }
+            if self.is_nonnull(name)
+                && let Type::Optional(inner) = &info.ty
+            {
+                return (**inner).clone();
             }
             return info.ty.clone();
         }

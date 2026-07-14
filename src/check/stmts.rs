@@ -194,10 +194,10 @@ impl Checker<'_> {
             }
             Stmt::Return { value, span } => {
                 let ret = self.ret.clone();
-                if let Some(e) = value {
-                    if self.check_literal_against(e, &ret) {
-                        return;
-                    }
+                if let Some(e) = value
+                    && self.check_literal_against(e, &ret)
+                {
+                    return;
                 }
                 let ty = match value {
                     Some(e) => self.type_of_expr(e),
@@ -351,10 +351,10 @@ impl Checker<'_> {
                 // value may be null again. (The value above was typed while
                 // still narrowed, so `cur = cur.next` checks out. Prefixes
                 // stay narrowed, so a guarded `cur.left.v = 1` still types.)
-                if self.has_facts() {
-                    if let Some(path) = target.place_path() {
-                        self.unnarrow(&path);
-                    }
+                if self.has_facts()
+                    && let Some(path) = target.place_path()
+                {
+                    self.unnarrow(&path);
                 }
                 // Typing the target may emit its own errors (unknown field);
                 // stop here when it does — mutability/mismatch checks on an

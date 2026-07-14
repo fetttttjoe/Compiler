@@ -5,8 +5,8 @@
 //! this backend never pushes operands, so %rsp stays aligned at every
 //! call site with no fix-ups.
 
-use super::regalloc::{allocate, intervals, Loc, ARG_REGS, CALLEE_SAVED};
-use super::{cc, FunctionIr, Inst, V};
+use super::regalloc::{ARG_REGS, CALLEE_SAVED, Loc, allocate, intervals};
+use super::{FunctionIr, Inst, V, cc};
 use crate::ast::BinOp;
 use crate::codegen::label_of;
 use std::collections::HashMap;
@@ -160,11 +160,11 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                 let _ = writeln!(a, "\tmovq %rax, {}", at(*dst));
             }
             Inst::LeaSym { dst, sym } => {
-                if let Some(Loc::Reg(r)) = loc.get(dst) {
-                    if !r.starts_with("%x") {
-                        let _ = writeln!(a, "\tleaq {sym}(%rip), {r}");
-                        continue;
-                    }
+                if let Some(Loc::Reg(r)) = loc.get(dst)
+                    && !r.starts_with("%x")
+                {
+                    let _ = writeln!(a, "\tleaq {sym}(%rip), {r}");
+                    continue;
                 }
                 let _ = writeln!(a, "\tleaq {sym}(%rip), %rax\n\tmovq %rax, {}", at(*dst));
             }
@@ -282,19 +282,19 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                 lhs,
                 rhs,
             } => {
-                if let (Loc::Reg(d), true) = (loc[dst], at(*dst) != at(*rhs)) {
-                    if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
-                        if at(*lhs) != at(*dst) {
-                            let _ = writeln!(a, "\tmovq {}, {d}", at(*lhs));
-                        }
-                        let mnem = match op {
-                            BinOp::Add => "addq",
-                            BinOp::Sub => "subq",
-                            _ => "imulq",
-                        };
-                        let _ = writeln!(a, "\t{mnem} {}, {d}", at(*rhs));
-                        continue;
+                if let (Loc::Reg(d), true) = (loc[dst], at(*dst) != at(*rhs))
+                    && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                {
+                    if at(*lhs) != at(*dst) {
+                        let _ = writeln!(a, "\tmovq {}, {d}", at(*lhs));
                     }
+                    let mnem = match op {
+                        BinOp::Add => "addq",
+                        BinOp::Sub => "subq",
+                        _ => "imulq",
+                    };
+                    let _ = writeln!(a, "\t{mnem} {}, {d}", at(*rhs));
+                    continue;
                 }
                 let _ = writeln!(a, "\tmovq {}, %rax", at(*lhs));
                 match op {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::modules::{load_program, Module};
+use crate::modules::{Module, load_program};
 use crate::source::SourceMap;
 use crate::{lexer::lex, parser::parse};
 
@@ -55,9 +55,10 @@ fn duplicate_function_is_an_error() {
 #[test]
 fn unknown_type_is_an_error() {
     let (_, d) = check(&graph_of("fun f(a: Missing): int { return 1; }"));
-    assert!(d
-        .iter()
-        .any(|e| e.message.contains("unknown type 'Missing'")));
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("unknown type 'Missing'"))
+    );
 }
 
 fn diags(src: &str) -> Vec<Diagnostic> {
@@ -399,8 +400,8 @@ fn array_literals_are_checked_against_the_declaration() {
 #[test]
 fn for_loops_type_the_element_and_bind_it_const() {
     let d = diags(
-            "fun sum(xs: int[]): int { var total: int = 0; for x in xs { total = total + x; } return total; }",
-        );
+        "fun sum(xs: int[]): int { var total: int = 0; for x in xs { total = total + x; } return total; }",
+    );
     assert!(d.is_empty(), "unexpected: {d:?}");
     let d = diags("fun f(xs: int[]) { for x in xs { x = 1; } }");
     assert!(
@@ -688,17 +689,17 @@ fn both_branches_returning_satisfies_definite_return() {
 #[test]
 fn imported_functions_and_structs_are_usable() {
     let (_, d) = multi(&[
-            (
-                "main.ys",
-                "import { make, Point } from \"./geo\";\n\
+        (
+            "main.ys",
+            "import { make, Point } from \"./geo\";\n\
                  fun main(): int { const p: Point = make(); const q: Point = Point { x: p.x }; return q.x; }",
-            ),
-            (
-                "geo.ys",
-                "export struct Point { x: int }\n\
+        ),
+        (
+            "geo.ys",
+            "export struct Point { x: int }\n\
                  export fun make(): Point { return Point { x: 7 }; }",
-            ),
-        ]);
+        ),
+    ]);
     assert!(d.is_empty(), "unexpected: {d:?}");
 }
 
@@ -735,12 +736,12 @@ fn unknown_and_unexported_imports_have_distinct_errors() {
 fn import_collisions_within_one_file_are_errors() {
     // Import colliding with a local definition.
     let (_, d) = multi(&[
-            (
-                "main.ys",
-                "import { f } from \"./lib\";\nfun f(): int { return 2; }\nfun main(): int { return f(); }",
-            ),
-            ("lib.ys", "export fun f(): int { return 1; }"),
-        ]);
+        (
+            "main.ys",
+            "import { f } from \"./lib\";\nfun f(): int { return 2; }\nfun main(): int { return f(); }",
+        ),
+        ("lib.ys", "export fun f(): int { return 1; }"),
+    ]);
     assert!(
         d.iter()
             .any(|e| e.message.contains("'f' is already defined in this file")),

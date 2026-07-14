@@ -3,11 +3,11 @@
 //! Anything the backend can't represent yet returns a clean
 //! "not yet compilable" diagnostic — there is no fallback path.
 
-use super::layout::{kind_of, offset_of, ref_shaped, Kind, FUEL};
-use super::{unsupported, FunctionIr, Inst, Lbl, V};
+use super::layout::{FUEL, Kind, kind_of, offset_of, ref_shaped};
+use super::{FunctionIr, Inst, Lbl, V, unsupported};
 use crate::ast::{BinOp, Expr, Function, Stmt, UnOp};
 use crate::check::Resolutions;
-use crate::codegen::{label_of, Strings};
+use crate::codegen::{Strings, label_of};
 use crate::diagnostic::Diagnostic;
 use crate::span::Span;
 use crate::types::Type;
@@ -894,18 +894,19 @@ impl Lowerer<'_> {
                     _ => {}
                 }
             }
-            if let Expr::Int(n, _) = lhs {
-                if matches!(op, BinOp::Add | BinOp::Mul) && i32::try_from(*n).is_ok() {
-                    let r = self.expr(rhs)?;
-                    let v = self.fresh(false);
-                    self.insts.push(Inst::BinImm {
-                        op,
-                        dst: v,
-                        lhs: r,
-                        imm: *n,
-                    });
-                    return Ok(v);
-                }
+            if let Expr::Int(n, _) = lhs
+                && matches!(op, BinOp::Add | BinOp::Mul)
+                && i32::try_from(*n).is_ok()
+            {
+                let r = self.expr(rhs)?;
+                let v = self.fresh(false);
+                self.insts.push(Inst::BinImm {
+                    op,
+                    dst: v,
+                    lhs: r,
+                    imm: *n,
+                });
+                return Ok(v);
             }
         }
         let l = self.expr(lhs)?;

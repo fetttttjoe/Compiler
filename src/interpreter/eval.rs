@@ -163,7 +163,7 @@ impl<'a> Interp<'a> {
                         return Err(Diagnostic::error(
                             format!("can only iterate over arrays, found {}", other.type_name()),
                             *span,
-                        ))
+                        ));
                     }
                 };
                 // Live iteration: the body may push or mutate, so length
@@ -299,7 +299,7 @@ impl<'a> Interp<'a> {
                         return Err(Diagnostic::error(
                             "only named functions can be called",
                             *span,
-                        ))
+                        ));
                     }
                 };
                 let Some((target_module, target_name)) = self.resolutions.functions[self.module]
@@ -364,7 +364,7 @@ impl<'a> Interp<'a> {
                         return Err(Diagnostic::error(
                             format!("undefined function '{name}'"),
                             *span,
-                        ))
+                        ));
                     }
                 };
                 let mut argv = Vec::with_capacity(args.len());
@@ -631,7 +631,7 @@ fn int_op(op: BinOp, a: i64, b: i64, span: Span) -> Result<Value, Diagnostic> {
         // The other idiv trap: i64::MIN / -1 has no i64 result (and would
         // panic Rust's `/` here).
         Div | Rem if a == i64::MIN && b == -1 => {
-            return Err(Diagnostic::error("division overflow", span))
+            return Err(Diagnostic::error("division overflow", span));
         }
         Div => Value::Int(a / b),
         Rem => Value::Int(a % b),

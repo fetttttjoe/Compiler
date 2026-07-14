@@ -560,9 +560,11 @@ mod tests {
         // the string swallow the line break, violating single-line semantics.
         let (tokens, diags) = lex("\"ab\\\ncd\"");
         assert_eq!(diags.len(), 2, "{diags:?}");
-        assert!(diags
-            .iter()
-            .all(|d| d.message.contains("unterminated string")));
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.message.contains("unterminated string"))
+        );
         assert_eq!(
             tokens.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
             vec![TokenKind::Identifier("cd".into()), TokenKind::Eof]

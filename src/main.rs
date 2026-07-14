@@ -168,11 +168,11 @@ fn print_ir(
 
 fn write_stdout(text: &str) {
     let mut stdout = std::io::stdout();
-    if let Err(e) = stdout.write_all(text.as_bytes()) {
-        if e.kind() != std::io::ErrorKind::BrokenPipe {
-            print_error(&format!("cannot write output: {e}"));
-            std::process::exit(1);
-        }
+    if let Err(e) = stdout.write_all(text.as_bytes())
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        print_error(&format!("cannot write output: {e}"));
+        std::process::exit(1);
     }
 }
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::modules::{load_program, Module};
+use crate::modules::{Module, load_program};
 use crate::source::SourceMap;
 use crate::{check::check, lexer::lex, parser::parse};
 
@@ -452,20 +452,20 @@ fun main(): int {
 #[test]
 fn imported_struct_constructs_and_reads_across_modules() {
     assert_eq!(
-            run_multi(&[
-                (
-                    "main.ys",
-                    "import { Pair, make } from \"./lib\";\n\
+        run_multi(&[
+            (
+                "main.ys",
+                "import { Pair, make } from \"./lib\";\n\
                      fun main(): int { const p: Pair = make(); return p.a + Pair { a: 1, b: 2 }.b; }"
-                ),
-                (
-                    "lib.ys",
-                    "export struct Pair { a: int, b: int }\n\
+            ),
+            (
+                "lib.ys",
+                "export struct Pair { a: int, b: int }\n\
                      export fun make(): Pair { return Pair { a: 40, b: 0 }; }"
-                ),
-            ]),
-            Ok(Value::Int(42))
-        );
+            ),
+        ]),
+        Ok(Value::Int(42))
+    );
 }
 
 #[test]
@@ -616,20 +616,20 @@ fun main(): int {
 #[test]
 fn imported_refstruct_mutates_across_modules() {
     assert_eq!(
-            run_multi(&[
-                (
-                    "main.ys",
-                    "import { Counter, bump } from \"./lib\";\n\
+        run_multi(&[
+            (
+                "main.ys",
+                "import { Counter, bump } from \"./lib\";\n\
                      fun main(): int { const c: Counter = Counter { n: 0 }; bump(c); bump(c); return c.n; }"
-                ),
-                (
-                    "lib.ys",
-                    "export refstruct Counter { n: int }\n\
+            ),
+            (
+                "lib.ys",
+                "export refstruct Counter { n: int }\n\
                      export fun bump(c: Counter) { c.n = c.n + 1; }"
-                ),
-            ]),
-            Ok(Value::Int(2))
-        );
+            ),
+        ]),
+        Ok(Value::Int(2))
+    );
 }
 
 #[test]

@@ -3,11 +3,11 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{BinOp, Expr, Function, Item, Stmt, TypeAnn, UnOp};
 use crate::diagnostic::Diagnostic;
 use crate::modules::ModuleGraph;
-use crate::narrow::{body_effects, covers, diverges, null_checks, NarrowFrame};
+use crate::narrow::{NarrowFrame, body_effects, covers, diverges, null_checks};
 use crate::span::Span;
 use crate::syntax;
 use crate::types::{
-    eq_comparable, fits, is_numeric, poisoned, unconstrained, FnSig, StructType, Type,
+    FnSig, StructType, Type, eq_comparable, fits, is_numeric, poisoned, unconstrained,
 };
 
 /// A per-module view: visible name → the (module, name) that defines it.
@@ -91,7 +91,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                     .fns
                     .iter()
                     .chain(target.structs.iter())
-                    .filter(|(_, &exported)| exported)
+                    .filter(|&(_, &exported)| exported)
                     .map(|(n, _)| n.as_str());
                 diags.push(
                     Diagnostic::error(
@@ -213,13 +213,12 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
     if let Some(f) = graph.modules[0].ast.iter().find_map(|item| match item {
         Item::Function(f) if f.name == "main" => Some(f),
         _ => None,
-    }) {
-        if !f.params.is_empty() {
-            diags.push(Diagnostic::error(
-                "'main' takes no parameters".to_string(),
-                f.span,
-            ));
-        }
+    }) && !f.params.is_empty()
+    {
+        diags.push(Diagnostic::error(
+            "'main' takes no parameters".to_string(),
+            f.span,
+        ));
     }
 
     let ref_structs = ty_aliases
