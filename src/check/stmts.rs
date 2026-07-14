@@ -15,9 +15,13 @@ impl Checker<'_> {
             scope.insert(param.name.clone(), VarInfo { ty, mutable: false });
         }
         self.scopes.push(scope);
+        // The base narrowing frame: guard facts at the function's top level
+        // live here, and top-level rebinds shadow into it (ADR 0020).
+        self.nonnull.push(NarrowFrame::new(HashSet::new()));
         for stmt in &f.body {
             self.check_stmt(stmt);
         }
+        self.nonnull.pop();
         self.scopes.pop();
 
         if self.ret != Type::Unit && !poisoned(&self.ret) && !always_returns(&f.body) {
@@ -30,15 +34,40 @@ impl Checker<'_> {
 
     /// Type-checks a nested block in its own scope (bindings made inside die
     /// at the closing brace), with a set of place paths proven non-null for
-    /// its duration.
-    fn check_block_narrowed(&mut self, stmts: &[Stmt], facts: HashSet<String>) {
+    /// its duration. Returns the facts still standing at the block's end —
+    /// the survivors a divergence-aware join may carry past an `if`
+    /// (writes inside the block already subtracted themselves, ADR 0020).
+    fn check_block_narrowed(&mut self, stmts: &[Stmt], facts: HashSet<String>) -> HashSet<String> {
         self.nonnull.push(NarrowFrame::new(facts));
         self.scopes.push(HashMap::new());
         for stmt in stmts {
             self.check_stmt(stmt);
         }
         self.scopes.pop();
-        self.nonnull.pop();
+        self.nonnull.pop().expect("frame pushed above").facts
+    }
+
+    /// Snapshot of the fact stack, taken before a diverging branch: a
+    /// branch that never falls through cannot affect what follows, so its
+    /// narrowing side effects roll back (ADR 0020). `None` when nothing
+    /// could change — branches only remove outer facts, never add.
+    fn checkpoint(&self, diverging: bool) -> Option<Vec<NarrowFrame>> {
+        (diverging && self.has_facts()).then(|| self.nonnull.clone())
+    }
+
+    fn rollback(&mut self, saved: Option<Vec<NarrowFrame>>) {
+        if let Some(saved) = saved {
+            self.nonnull = saved;
+        }
+    }
+
+    /// Grants the code after a divergence-aware join its proven facts;
+    /// they live in the innermost frame and expire with the enclosing
+    /// block. A frame always exists (`check_function` pushes the base).
+    fn add_facts(&mut self, facts: HashSet<String>) {
+        if let Some(frame) = self.nonnull.last_mut() {
+            frame.facts.extend(facts);
+        }
     }
 
     /// Any narrowing facts at all? The cheap gate for the common,
@@ -193,9 +222,29 @@ impl Checker<'_> {
             } => {
                 self.check_condition("if", cond);
                 let (if_true, if_false) = null_checks(cond);
-                self.check_block_narrowed(then_body, if_true);
-                if let Some(else_body) = else_body {
-                    self.check_block_narrowed(else_body, if_false);
+                let then_diverges = diverges(then_body);
+                let saved = self.checkpoint(then_diverges);
+                let then_survivors = self.check_block_narrowed(then_body, if_true);
+                self.rollback(saved);
+                match else_body {
+                    Some(else_body) => {
+                        let else_diverges = diverges(else_body);
+                        let saved = self.checkpoint(else_diverges);
+                        let else_survivors = self.check_block_narrowed(else_body, if_false);
+                        self.rollback(saved);
+                        // The join keeps exactly what the unique
+                        // fall-through path proves (ADR 0020).
+                        match (then_diverges, else_diverges) {
+                            (true, false) => self.add_facts(else_survivors),
+                            (false, true) => self.add_facts(then_survivors),
+                            _ => {}
+                        }
+                    }
+                    // The guard idiom: falling through the if means the
+                    // condition was false, and no else existed to
+                    // invalidate its facts.
+                    None if then_diverges => self.add_facts(if_false),
+                    None => {}
                 }
             }
             Stmt::While { cond, body, .. } => {

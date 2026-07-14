@@ -296,6 +296,74 @@ fn while_loop_accumulates() {
 }
 
 #[test]
+fn diverging_guards_narrow_and_compile_to_unchecked_loads() {
+    // ADR 0020: after `if cur == null {...}` guards, reads lower without
+    // null checks — the compiled path must agree with the oracle.
+    diff(
+        "guards",
+        "refstruct Node { v: int, next: Node? }
+        fun build(n: int): Node? {
+            var head: Node? = null;
+            var i: int = 0;
+            while i < n {
+                i = i + 1;
+                head = Node { v: i, next: head };
+            }
+            return head;
+        }
+        fun sum_skipping_evens(head: Node?): int {
+            var cur: Node? = head;
+            var acc: int = 0;
+            while cur != null {
+                if cur.v % 2 == 0 { cur = cur.next; continue; }
+                acc = acc + cur.v;
+                cur = cur.next;
+            }
+            return acc;
+        }
+        fun find(head: Node?, needle: int): int {
+            var cur: Node? = head;
+            while true {
+                if cur == null { break; }
+                if cur.v == needle { return cur.v * 10; }
+                cur = cur.next;
+            }
+            return -1;
+        }
+        fun first_or_zero(head: Node?): int {
+            if head == null { return 0; }
+            return head.v;
+        }
+        fun main(): int {
+            const list: Node? = build(9);
+            print(sum_skipping_evens(list));
+            print(find(list, 4));
+            print(find(list, 99));
+            print(first_or_zero(list));
+            print(first_or_zero(null));
+            return sum_skipping_evens(list) + first_or_zero(list);
+        }",
+    );
+}
+
+#[test]
+fn else_divergence_carries_the_survivors() {
+    diff(
+        "elsediverge",
+        "refstruct Box { v: int }
+        fun pick(b: Box?): int {
+            if b != null { print(b.v); } else { return -5; }
+            return b.v * 2;
+        }
+        fun main(): int {
+            print(pick(Box { v: 21 }));
+            print(pick(null));
+            return pick(Box { v: 50 });
+        }",
+    );
+}
+
+#[test]
 fn break_and_continue_in_while_loops() {
     diff(
         "bcwhile",

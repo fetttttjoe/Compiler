@@ -1,0 +1,42 @@
+refstruct Node { v: int, next: Node? }
+
+fun push_front(head: Node?, v: int): Node {
+    return Node { v: v, next: head };
+}
+
+fun first_or(head: Node?, fallback: int): int {
+    // Guard-return (ADR 0020): the read after the if is proven non-null.
+    if head == null { return fallback; }
+    return head.v;
+}
+
+fun main(): int {
+    var head: Node? = null;
+    for v in [3, 1, 4, 1, 5, 9, 2, 6] {
+        head = push_front(head, v);
+    }
+
+    // Guard-continue: sum the odd values.
+    var cur: Node? = head;
+    var odds: int = 0;
+    while cur != null {
+        if cur.v % 2 == 0 { cur = cur.next; continue; }
+        odds = odds + cur.v;
+        cur = cur.next;
+    }
+    print(odds);
+
+    // Guard-break: first value greater than 4.
+    cur = head;
+    var found: int = -1;
+    while true {
+        if cur == null { break; }
+        if cur.v > 4 { found = cur.v; break; }
+        cur = cur.next;
+    }
+    print(found);
+
+    print(first_or(head, 0));
+    print(first_or(null, -7));
+    return odds + found;
+}

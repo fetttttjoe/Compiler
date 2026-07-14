@@ -10,6 +10,7 @@ use crate::ast::{BinOp, Expr, Stmt};
 /// One narrowing region: facts proven non-null on entry, plus places whose
 /// facts are hidden for the region's duration because a new binding shadows
 /// the name — hiding ends automatically when the frame pops.
+#[derive(Clone)]
 pub(crate) struct NarrowFrame {
     pub(crate) facts: HashSet<String>,
     pub(crate) shadowed: HashSet<String>,
@@ -55,6 +56,22 @@ pub(crate) fn null_checks(cond: &Expr) -> (HashSet<String>, HashSet<String>) {
         }
     }
     (if_true, if_false)
+}
+
+/// Does this statement list never fall through — every path ends in
+/// `return`, `break`, or `continue`? Loops never count: a contained
+/// `break` targets the loop itself, and `while true` analysis stays out,
+/// consistent with definite return (ADR 0020).
+pub(crate) fn diverges(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Return { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => true,
+        Stmt::If {
+            then_body,
+            else_body: Some(else_body),
+            ..
+        } => diverges(then_body) && diverges(else_body),
+        _ => false,
+    })
 }
 
 /// Does this expression contain a call? Calls can mutate any shared

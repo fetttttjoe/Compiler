@@ -65,6 +65,99 @@ fn diags(src: &str) -> Vec<Diagnostic> {
 }
 
 #[test]
+fn diverging_guards_narrow_the_code_after_the_if() {
+    // ADR 0020: a branch that never falls through leaves the negation
+    // facts (or the fall-through branch's survivors) behind.
+    let d = diags(
+        "refstruct Node { v: int, next: Node? }\n\
+         fun top(p: Node?): int {\n\
+             if p == null { return 0; }\n\
+             return p.v;\n\
+         }\n\
+         fun skip(head: Node?): int {\n\
+             var cur: Node? = head;\n\
+             var acc: int = 0;\n\
+             while cur != null {\n\
+                 if cur.v == 2 { cur = cur.next; continue; }\n\
+                 acc = acc + cur.v;\n\
+                 cur = cur.next;\n\
+             }\n\
+             return acc;\n\
+         }\n\
+         fun find(head: Node?): int {\n\
+             var cur: Node? = head;\n\
+             while true {\n\
+                 if cur == null { break; }\n\
+                 if cur.v == 9 { return cur.v; }\n\
+                 cur = cur.next;\n\
+             }\n\
+             return 0;\n\
+         }\n\
+         fun via_else(p: Node?): int {\n\
+             if p != null { print(p.v); } else { return 0; }\n\
+             return p.v;\n\
+         }",
+    );
+    assert!(d.is_empty(), "unexpected: {d:?}");
+}
+
+#[test]
+fn divergence_narrowing_keeps_the_unsound_cases_rejected() {
+    // Fall-through branch reassigns: its survivors are empty.
+    let d = diags(
+        "refstruct Node { v: int, next: Node? }\n\
+         fun f(p: Node?): int {\n\
+             var q: Node? = p;\n\
+             if q == null { return 0; } else { q = null; }\n\
+             return q.v;\n\
+         }",
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+
+    // A non-diverging guard proves nothing after the if.
+    let d = diags(
+        "refstruct Node { v: int }\n\
+         fun f(p: Node?): int {\n\
+             if p == null { print(0); }\n\
+             return p.v;\n\
+         }",
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+
+    // A break inside a nested loop does not make the branch diverge.
+    let d = diags(
+        "refstruct Node { v: int }\n\
+         fun f(p: Node?): int {\n\
+             if p == null { while true { break; } }\n\
+             return p.v;\n\
+         }",
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+
+    // Guard facts die with their block.
+    let d = diags(
+        "refstruct Node { v: int }\n\
+         fun f(p: Node?, b: bool): int {\n\
+             if b { if p == null { return 0; } print(p.v); }\n\
+             return p.v;\n\
+         }",
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+
+    // A call after a field-path guard still kills the field fact.
+    let d = diags(
+        "refstruct Node { v: int, next: Node? }\n\
+         fun g() {}\n\
+         fun f(n: Node): int {\n\
+             if n.next == null { return 0; }\n\
+             g();\n\
+             return n.next.v;\n\
+         }",
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+}
+
+#[test]
 fn break_and_continue_outside_a_loop_are_errors() {
     let d = diags("fun f() { break; }");
     assert_eq!(d.len(), 1, "{d:?}");
@@ -1109,14 +1202,14 @@ fn or_conditions_do_not_narrow() {
 }
 
 #[test]
-fn early_return_does_not_narrow_after_the_if() {
-    // v1 ceiling: `if p == null { return 0; }` doesn't narrow the
-    // statements after the if — only an else branch is narrowed.
+fn early_return_narrows_after_the_if() {
+    // The v1 ceiling lifted by ADR 0020: a guard that never falls
+    // through leaves its negation facts behind.
     let d = diags(
         "refstruct P { x: int }\n\
              fun f(p: P?): int { if p == null { return 0; } return p.x; }",
     );
-    assert!(d.iter().any(|e| e.message.contains("may be null")), "{d:?}");
+    assert!(d.is_empty(), "unexpected: {d:?}");
 }
 
 #[test]

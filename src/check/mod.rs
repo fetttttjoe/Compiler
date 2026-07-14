@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{BinOp, Expr, Function, Item, Stmt, TypeAnn, UnOp};
 use crate::diagnostic::Diagnostic;
 use crate::modules::ModuleGraph;
-use crate::narrow::{body_effects, covers, null_checks, NarrowFrame};
+use crate::narrow::{body_effects, covers, diverges, null_checks, NarrowFrame};
 use crate::span::Span;
 use crate::syntax;
 use crate::types::{
