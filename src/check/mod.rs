@@ -211,12 +211,12 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
     // interpreter calls `main` with no arguments, and compiled main would
     // read argc/argv as its parameters.
     if let Some(f) = graph.modules[0].ast.iter().find_map(|item| match item {
-        Item::Function(f) if f.name == "main" => Some(f),
+        Item::Function(f) if f.name == syntax::ENTRY_FN => Some(f),
         _ => None,
     }) && !f.params.is_empty()
     {
         diags.push(Diagnostic::error(
-            "'main' takes no parameters".to_string(),
+            format!("'{}' takes no parameters", syntax::ENTRY_FN),
             f.span,
         ));
     }

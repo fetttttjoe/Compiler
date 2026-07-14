@@ -68,6 +68,11 @@ pub const KW_IMPORT: &str = "import";
 pub const KW_EXPORT: &str = "export";
 pub const KW_FROM: &str = "from";
 
+// --- Language conventions ---
+/// The program entry point's function name — the driver, checker, and
+/// backend all resolve the entry through this one spelling.
+pub const ENTRY_FN: &str = "main";
+
 // --- Builtin function names ---
 // Not keywords: a user definition of the same name shadows the builtin,
 // so these resolve last in both the checker and the interpreter.

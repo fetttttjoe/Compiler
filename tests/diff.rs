@@ -364,6 +364,192 @@ fn else_divergence_carries_the_survivors() {
 }
 
 #[test]
+fn value_optionals_wrap_narrow_and_compare() {
+    diff(
+        "valopt",
+        "fun grade(score: int?): int {
+            if score == null { return -1; }
+            return score * 10;
+        }
+        fun main(): int {
+            var x: int? = null;
+            var r: int = 0;
+            if x == null { r = r + 1; }
+            x = 42;
+            if x != null { r = r + x; }
+            r = r + grade(x) / 10 + grade(null);
+            print(x);
+            x = null;
+            print(x);
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn optional_equality_matrix_and_coalesce() {
+    diff(
+        "opteq",
+        "fun main(): int {
+            var a: int? = 5;
+            var b: int? = 5;
+            var c: int? = null;
+            var r: int = 0;
+            if a == b { r = r + 1; }
+            if a == 5 { r = r + 2; }
+            if 5 == a { r = r + 4; }
+            if a == c { r = r + 8; }
+            if c == null { r = r + 16; }
+            if null == c { r = r + 32; }
+            if a != c { r = r + 64; }
+            r = r + (c ?? 7) + (a ?? 100);
+            var d: int? = c ?? a;
+            r = r + (d ?? 1000);
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn float_optionals_use_ieee_payload_equality() {
+    diff(
+        "floatopt",
+        "fun main(): int {
+            var f: float? = 2.5;
+            var g: float? = null;
+            var r: int = 0;
+            if f != null {
+                if f * 2.0 == 5.0 { r = r + 1; }
+            }
+            if f == 2.5 { r = r + 2; }
+            if g == null { r = r + 4; }
+            if f == g { r = r + 8; }
+            if (g ?? 1.5) == 1.5 { r = r + 16; }
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn string_optionals_carry_content() {
+    diff(
+        "stropt",
+        "fun pick(s: string?, d: string): string {
+            return s ?? d;
+        }
+        fun main(): int {
+            var s: string? = \"hi\";
+            var t: string? = null;
+            var r: int = 0;
+            if s == \"hi\" { r = r + 1; }
+            if s != null {
+                if s + \"!\" == \"hi!\" { r = r + 2; }
+            }
+            if t == null { r = r + 4; }
+            if s == t { r = r + 8; }
+            print(pick(s, \"fallback\"));
+            print(pick(t, \"fallback\"));
+            print(s);
+            print(t);
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn value_struct_optionals_wrap_and_compare() {
+    diff(
+        "structopt",
+        "struct P { x: int, y: int }
+        fun shift(p: P?): P {
+            if p == null { return P { x: 0, y: 0 }; }
+            return P { x: p.x + 1, y: p.y };
+        }
+        fun main(): int {
+            var p: P? = P { x: 1, y: 2 };
+            var q: P? = null;
+            var r: int = 0;
+            if p != null { r = r + p.x + p.y; }
+            if p == (P { x: 1, y: 2 }) { r = r + 4; }
+            if q == null { r = r + 8; }
+            if p != q { r = r + 16; }
+            const s: P = shift(p);
+            r = r + s.x * 100;
+            const t: P = shift(null);
+            r = r + t.x + t.y;
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn optional_chaining_builds_value_optionals() {
+    diff(
+        "optchainval",
+        "refstruct Node { v: int, tag: int?, next: Node? }
+        fun main(): int {
+            const n: Node = Node { v: 7, tag: 3, next: null };
+            var m: Node? = null;
+            var r: int = 0;
+            r = r + (n.next?.v ?? 100);
+            var t: int? = m?.v;
+            if t == null { r = r + 1; }
+            t = n.next?.tag;
+            if t == null { r = r + 2; }
+            var u: int? = Node { v: 1, tag: 9, next: null }.tag;
+            r = r + (u ?? 50);
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn optional_fields_inside_structs_stay_canonical() {
+    // Struct equality memcmps the whole layout — sound only because
+    // every null wrap zeroes its payload (ADR 0021 decision 2).
+    diff(
+        "optfield",
+        "struct Slot { id: int, extra: int? }
+        fun main(): int {
+            var a: Slot = Slot { id: 1, extra: null };
+            var b: Slot = Slot { id: 1, extra: null };
+            var r: int = 0;
+            if a == b { r = r + 1; }
+            a.extra = 5;
+            if a != b { r = r + 2; }
+            b.extra = 5;
+            if a == b { r = r + 4; }
+            if a.extra != null { r = r + a.extra; }
+            var e: int? = b.extra;
+            r = r + (e ?? 100) * 10;
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn optional_returns_ride_sret() {
+    diff(
+        "optret",
+        "fun find(xs: int[], needle: int): int? {
+            for x in xs {
+                if x == needle { return x; }
+            }
+            return null;
+        }
+        fun main(): int {
+            const xs: int[] = [3, 9, 27];
+            var r: int = 0;
+            r = r + (find(xs, 9) ?? -1);
+            r = r + (find(xs, 5) ?? -1) * 10;
+            print(find(xs, 27));
+            print(find(xs, 4));
+            return r;
+        }",
+    );
+}
+
+#[test]
 fn break_and_continue_in_while_loops() {
     diff(
         "bcwhile",

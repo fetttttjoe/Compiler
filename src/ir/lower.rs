@@ -7,7 +7,10 @@ use super::layout::{FUEL, Kind, kind_of, offset_of, ref_shaped};
 use super::{FunctionIr, Inst, Lbl, V, unsupported};
 use crate::ast::{BinOp, Expr, Function, Stmt, UnOp};
 use crate::check::Resolutions;
-use crate::codegen::{Strings, label_of};
+use crate::codegen::{
+    FALSE_S, FMT_CSTR, FMT_INT, FMT_STR, NULL_S, RT_MALLOC, RT_MEMCMP, RT_MEMCPY, RT_PRINTF,
+    RT_PUSH, Strings, TRUE_S, label_of,
+};
 use crate::diagnostic::Diagnostic;
 use crate::span::Span;
 use crate::types::Type;
@@ -18,7 +21,7 @@ pub(super) struct Lowerer<'a> {
     pub(super) strings: &'a mut Strings,
     pub(super) module: usize,
     pub(super) insts: Vec<Inst>,
-    pub(super) scopes: Vec<HashMap<String, V>>,
+    pub(super) scopes: Vec<HashMap<String, Binding>>,
     pub(super) vregs: usize,
     /// Parallel to vregs: floats allocate from the XMM pool.
     pub(super) floats: Vec<bool>,
@@ -30,6 +33,16 @@ pub(super) struct Lowerer<'a> {
     /// The hidden destination pointer of a struct-returning function.
     pub(super) sret: Option<V>,
     pub(super) ret_words: usize,
+    pub(super) ret_ty: Type,
+}
+
+/// A lowered binding: its storage vreg plus the payload type when the
+/// storage is a tagged value optional — narrowed reads unwrap through
+/// it (ADR 0021 decision 3).
+#[derive(Clone)]
+pub(super) struct Binding {
+    v: V,
+    opt_inner: Option<Type>,
 }
 
 /// Lowers one checked function into owned virtual-register IR.
@@ -61,6 +74,7 @@ pub(super) fn lower(
         loops: Vec::new(),
         sret: None,
         ret_words: ret_kind.words(),
+        ret_ty: sig.ret.clone(),
     };
     // Hidden sret pointer first, then params — every param is one word
     // (scalars/handles by value, structs/strings by pointer; the caller
@@ -72,7 +86,8 @@ pub(super) fn lower(
     for (p, ty) in f.params.iter().zip(&sig.params) {
         kind_of(ty, res, FUEL).ok_or_else(|| unsupported("parameters of this type", f.span))?;
         let v = lo.fresh(*ty == Type::Float);
-        lo.scopes[0].insert(p.name.clone(), v);
+        let opt_inner = lo.opt_inner_of(ty);
+        lo.scopes[0].insert(p.name.clone(), Binding { v, opt_inner });
     }
     let nparams = lo.vregs;
     for stmt in &f.body {
@@ -111,11 +126,19 @@ impl Lowerer<'_> {
         self.labels - 1
     }
 
-    fn lookup(&self, name: &str) -> Option<V> {
+    fn lookup(&self, name: &str) -> Option<Binding> {
         self.scopes
             .iter()
             .rev()
-            .find_map(|scope| scope.get(name).copied())
+            .find_map(|scope| scope.get(name).cloned())
+    }
+
+    /// The payload type when `ty` lowers to Opt-shaped storage.
+    fn opt_inner_of(&self, ty: &Type) -> Option<Type> {
+        match ty {
+            Type::Optional(inner) if !ref_shaped(inner, self.res) => Some((**inner).clone()),
+            _ => None,
+        }
     }
 
     fn ty(&self, span: &Span) -> Option<&Type> {
@@ -160,6 +183,104 @@ impl Lowerer<'_> {
         t
     }
 
+    /// The canonical null of a value optional: every word zeroed — tag
+    /// and payload alike — so struct equality can memcmp (ADR 0021).
+    fn null_optional(&mut self, words: usize) -> V {
+        let t = self.fresh(false);
+        self.insts.push(Inst::Temp { dst: t, words });
+        let zero = self.const_word(0);
+        for i in 0..words {
+            self.insts.push(Inst::StoreAt {
+                base: t,
+                off: 8 * i as i64,
+                val: zero,
+            });
+        }
+        t
+    }
+
+    /// Wraps a present payload into a fresh `{1, payload}` temp.
+    fn wrap_present(&mut self, payload: V, payload_kind: Kind, words: usize) -> V {
+        let t = self.fresh(false);
+        self.insts.push(Inst::Temp { dst: t, words });
+        let one = self.const_word(1);
+        self.insts.push(Inst::StoreAt {
+            base: t,
+            off: 0,
+            val: one,
+        });
+        if payload_kind == Kind::Word {
+            self.insts.push(Inst::StoreAt {
+                base: t,
+                off: 8,
+                val: payload,
+            });
+        } else {
+            let p = self.fresh(false);
+            self.insts.push(Inst::LeaAt {
+                dst: p,
+                base: t,
+                off: 8,
+            });
+            self.insts.push(Inst::CopyW {
+                dst: p,
+                src: payload,
+                words: payload_kind.words(),
+            });
+        }
+        t
+    }
+
+    /// Lowers `e` as a value for a slot of type `target`, wrapping at
+    /// the fits() points (ADR 0021 decision 4): `null` and payload-typed
+    /// values become tagged optionals; everything else is unchanged.
+    fn expr_into(&mut self, e: &Expr, target: &Type) -> Result<V, Diagnostic> {
+        let Type::Optional(inner) = target else {
+            return self.expr(e);
+        };
+        if ref_shaped(inner, self.res) {
+            return self.expr(e);
+        }
+        let total = kind_of(target, self.res, FUEL)
+            .ok_or_else(|| unsupported("values of this type", e.span()))?
+            .words();
+        match self.ty(&e.span()) {
+            // The null literal itself — nothing to evaluate.
+            None | Some(Type::Null) => Ok(self.null_optional(total)),
+            // Already optional-shaped: pass the pointer through.
+            Some(Type::Optional(_)) => self.expr(e),
+            Some(_) => {
+                let k = kind_of(inner, self.res, FUEL)
+                    .ok_or_else(|| unsupported("values of this type", e.span()))?;
+                let v = self.expr(e)?;
+                Ok(self.wrap_present(v, k, total))
+            }
+        }
+    }
+
+    /// Reads the payload of a proven-present optional (the recorded type
+    /// at the use is the inner type): the word at +8, or an interior
+    /// pointer for multi-word payloads — consumers copy.
+    fn payload_read(&mut self, opt: V, inner: &Type, span: Span) -> Result<V, Diagnostic> {
+        let k = kind_of(inner, self.res, FUEL)
+            .ok_or_else(|| unsupported("values of this type", span))?;
+        let dst = self.fresh(*inner == Type::Float);
+        self.insts.push(if k == Kind::Word {
+            Inst::LoadAt {
+                dst,
+                base: opt,
+                off: 8,
+            }
+        } else {
+            Inst::LeaAt {
+                dst,
+                base: opt,
+                off: 8,
+            }
+        });
+        Ok(dst)
+    }
+
     fn block(&mut self, body: &[Stmt]) -> Result<(), Diagnostic> {
         self.scopes.push(HashMap::new());
         let result = body.iter().try_for_each(|stmt| self.stmt(stmt));
@@ -172,18 +293,22 @@ impl Lowerer<'_> {
             Stmt::Let {
                 name, value, ty, ..
             } => {
-                if ty.is_some() {
-                    // The checker resolved the annotation; gate on that.
-                    let declared = self
-                        .res
+                // The slot's shape follows the declared type (ADR 0021);
+                // the checker resolved the annotation — gate on that.
+                let slot_ty = if ty.is_some() {
+                    self.res
                         .let_types
                         .get(&stmt.span())
-                        .ok_or_else(|| unsupported("bindings of this type", stmt.span()))?;
-                    kind_of(declared, self.res, FUEL)
-                        .ok_or_else(|| unsupported("bindings of this type", stmt.span()))?;
-                }
-                let kind = self.kind(value, stmt.span())?;
-                let v = self.expr(value)?;
+                        .ok_or_else(|| unsupported("bindings of this type", stmt.span()))?
+                        .clone()
+                } else {
+                    self.ty(&value.span())
+                        .cloned()
+                        .ok_or_else(|| unsupported("bindings of this type", stmt.span()))?
+                };
+                let kind = kind_of(&slot_ty, self.res, FUEL)
+                    .ok_or_else(|| unsupported("bindings of this type", stmt.span()))?;
+                let v = self.expr_into(value, &slot_ty)?;
                 let slot = if kind == Kind::Word {
                     let s = self.fresh(self.floats[v]);
                     self.insts.push(Inst::Copy(s, v));
@@ -191,26 +316,41 @@ impl Lowerer<'_> {
                 } else {
                     self.snapshot(v, kind.words())
                 };
+                let opt_inner = self.opt_inner_of(&slot_ty);
                 self.scopes
                     .last_mut()
                     .expect("a scope is always open")
-                    .insert(name.clone(), slot);
+                    .insert(name.clone(), Binding { v: slot, opt_inner });
             }
             Stmt::Assign { target, value, .. } => match target {
                 Expr::Ident(name, span) => {
-                    let dst = self
+                    let b = self
                         .lookup(name)
                         .ok_or_else(|| unsupported("this assignment target", *span))?;
-                    let kind = self.kind(value, *span)?;
-                    let v = self.expr(value)?;
-                    if kind == Kind::Word {
-                        self.insts.push(Inst::Copy(dst, v));
-                    } else {
+                    if let Some(inner) = b.opt_inner {
+                        // Opt-shaped slot: wrap the value in place.
+                        let target = Type::Optional(Box::new(inner));
+                        let words = kind_of(&target, self.res, FUEL)
+                            .ok_or_else(|| unsupported("this assignment target", *span))?
+                            .words();
+                        let v = self.expr_into(value, &target)?;
                         self.insts.push(Inst::CopyW {
-                            dst,
+                            dst: b.v,
                             src: v,
-                            words: kind.words(),
+                            words,
                         });
+                    } else {
+                        let kind = self.kind(value, *span)?;
+                        let v = self.expr(value)?;
+                        if kind == Kind::Word {
+                            self.insts.push(Inst::Copy(b.v, v));
+                        } else {
+                            self.insts.push(Inst::CopyW {
+                                dst: b.v,
+                                src: v,
+                                words: kind.words(),
+                            });
+                        }
                     }
                 }
                 // The oracle evaluates the value before the target.
@@ -231,7 +371,8 @@ impl Lowerer<'_> {
                     let def = &self.res.structs[&slot.base];
                     let off = offset_of(def, slot.index, self.res)
                         .ok_or_else(|| unsupported("this struct layout", *span))?;
-                    let val = self.expr(value)?;
+                    let target = slot.ty.clone();
+                    let val = self.expr_into(value, &target)?;
                     let b = self.expr(base)?;
                     if kind == Kind::Word {
                         self.insts.push(Inst::StoreAt { base: b, off, val });
@@ -253,7 +394,8 @@ impl Lowerer<'_> {
             },
             Stmt::Return { value, .. } => match value {
                 Some(expr) => {
-                    let v = self.expr(expr)?;
+                    let ret_ty = self.ret_ty.clone();
+                    let v = self.expr_into(expr, &ret_ty)?;
                     if let Some(sret) = self.sret {
                         self.insts.push(Inst::CopyW {
                             dst: sret,
@@ -352,9 +494,21 @@ impl Lowerer<'_> {
                 });
                 let cont = self.fresh_label();
                 let mut bindings = HashMap::new();
-                bindings.insert(name.clone(), x);
+                bindings.insert(
+                    name.clone(),
+                    Binding {
+                        v: x,
+                        opt_inner: None,
+                    },
+                );
                 if let Some(ix) = index {
-                    bindings.insert(ix.clone(), i);
+                    bindings.insert(
+                        ix.clone(),
+                        Binding {
+                            v: i,
+                            opt_inner: None,
+                        },
+                    );
                 }
                 self.scopes.push(bindings);
                 self.loops.push((cont, end));
@@ -388,9 +542,8 @@ impl Lowerer<'_> {
                 self.insts.push(Inst::Const(v, f.to_bits() as i64));
                 Ok(v)
             }
-            // `null` is handle 0 — sound because value-typed optionals
-            // never compile (annotation, param, field, and array-literal
-            // gates), so 0 is never a legitimate optional payload.
+            // A bare `null` reaching plain expr() is a ref-optional's
+            // handle 0; value-optional slots wrap it in `expr_into`.
             Expr::Null(_) => Ok(self.const_word(0)),
             // A literal's descriptor and bytes are both static — strings
             // are immutable, so every use shares one rodata object.
@@ -398,9 +551,19 @@ impl Lowerer<'_> {
                 let sym = self.strings.intern(text);
                 Ok(self.lea_sym(sym))
             }
-            Expr::Ident(name, span) => self
-                .lookup(name)
-                .ok_or_else(|| unsupported("this name", *span)),
+            Expr::Ident(name, span) => {
+                let b = self
+                    .lookup(name)
+                    .ok_or_else(|| unsupported("this name", *span))?;
+                // Narrowing proved presence when the recorded type is the
+                // payload type — read through the tag (ADR 0021).
+                if let Some(inner) = &b.opt_inner
+                    && !matches!(self.ty(span), Some(Type::Optional(_)))
+                {
+                    return self.payload_read(b.v, &inner.clone(), *span);
+                }
+                Ok(b.v)
+            }
             Expr::Unary { op, rhs, .. } => {
                 let float = self.is_float(rhs);
                 let r = self.expr(rhs)?;
@@ -440,28 +603,8 @@ impl Lowerer<'_> {
                 op: BinOp::Coalesce,
                 lhs,
                 rhs,
-                ..
-            } => {
-                // Handles only (value optionals never compile): keep the
-                // left side unless it is null (0). The null test composes
-                // from BinImm because handles aren't 0/1 booleans.
-                let v = self.fresh(false);
-                let l = self.expr(lhs)?;
-                self.insts.push(Inst::Copy(v, l));
-                let end = self.fresh_label();
-                let isnull = self.fresh(false);
-                self.insts.push(Inst::BinImm {
-                    op: BinOp::Eq,
-                    dst: isnull,
-                    lhs: v,
-                    imm: 0,
-                });
-                self.insts.push(Inst::BrZero(isnull, end));
-                let r = self.expr(rhs)?;
-                self.insts.push(Inst::Copy(v, r));
-                self.insts.push(Inst::Label(end));
-                Ok(v)
-            }
+                span,
+            } => self.coalesce(lhs, rhs, *span),
             Expr::Binary { op, lhs, rhs, span } => self.binary(*op, lhs, rhs, *span),
             Expr::Call { callee, args, span } => self.call(callee, args, *span),
             Expr::ArrayLit { elements, span } => {
@@ -483,7 +626,7 @@ impl Lowerer<'_> {
                 let hdr = self.fresh(false);
                 self.insts.push(Inst::CallRt {
                     dst: hdr,
-                    sym: "malloc@PLT",
+                    sym: RT_MALLOC,
                     args: vec![c24],
                     varargs: false,
                 });
@@ -491,7 +634,7 @@ impl Lowerer<'_> {
                 let buf = self.fresh(false);
                 self.insts.push(Inst::CallRt {
                     dst: buf,
-                    sym: "malloc@PLT",
+                    sym: RT_MALLOC,
                     args: vec![size],
                     varargs: false,
                 });
@@ -529,31 +672,37 @@ impl Lowerer<'_> {
                 let def = &self.res.structs[&slot.base];
                 let off = offset_of(def, slot.index, self.res)
                     .ok_or_else(|| unsupported("this struct layout", *span))?;
-                // `p?.x` with a value-typed x yields `int?` — a value
-                // optional the word model can't represent. Handle-typed
-                // fields are fine, already-optional ones stay flat.
-                let unwrapped = match &slot.ty {
-                    Type::Optional(inner) => inner.as_ref(),
-                    other => other,
-                };
-                if *optional && !ref_shaped(unwrapped, self.res) {
-                    return Err(unsupported("'?.' on a field of value type", *span));
-                }
-                let float = matches!(slot.ty, Type::Float);
+                let slot_ty = slot.ty.clone();
+                let float = matches!(slot_ty, Type::Float);
                 let b = self.expr(base)?;
                 if *optional {
-                    // Null short-circuits to null (0 stays the result).
-                    let r = self.const_word(0);
-                    let end = self.fresh_label();
-                    self.insts.push(Inst::BrZero(b, end));
-                    self.insts.push(Inst::LoadAt {
-                        dst: r,
-                        base: b,
-                        off,
+                    return self.optional_field(b, base, &slot_ty, off, *span);
+                }
+                // Narrowing proved an optional field present when the
+                // recorded type is the payload type (ADR 0021): read
+                // through the tag.
+                if let Some(inner) = self.opt_inner_of(&slot_ty)
+                    && !matches!(self.ty(span), Some(Type::Optional(_)))
+                {
+                    let k = kind_of(&inner, self.res, FUEL)
+                        .ok_or_else(|| unsupported("fields of this type", *span))?;
+                    let r = self.fresh(inner == Type::Float);
+                    self.insts.push(if k == Kind::Word {
+                        Inst::LoadAt {
+                            dst: r,
+                            base: b,
+                            off: off + 8,
+                        }
+                    } else {
+                        Inst::LeaAt {
+                            dst: r,
+                            base: b,
+                            off: off + 8,
+                        }
                     });
-                    self.insts.push(Inst::Label(end));
-                    Ok(r)
-                } else if kind == Kind::Word {
+                    return Ok(r);
+                }
+                if kind == Kind::Word {
                     // No null check: the checker's narrowing is sound, so
                     // a plain `.` base is proven non-null (ADR 0007).
                     let r = self.fresh(float);
@@ -605,7 +754,7 @@ impl Lowerer<'_> {
                     let hdr = self.fresh(false);
                     self.insts.push(Inst::CallRt {
                         dst: hdr,
-                        sym: "malloc@PLT",
+                        sym: RT_MALLOC,
                         args: vec![size],
                         varargs: false,
                     });
@@ -626,7 +775,8 @@ impl Lowerer<'_> {
                         .iter()
                         .position(|(dn, _)| dn == fname)
                         .expect("checker verified the field exists");
-                    let val = self.expr(value)?;
+                    let ft = def.fields[i].1.clone();
+                    let val = self.expr_into(value, &ft)?;
                     if kinds[i] == Kind::Word {
                         self.insts.push(Inst::StoreAt {
                             base,
@@ -659,10 +809,27 @@ impl Lowerer<'_> {
         if kind == Kind::Str && matches!(op, BinOp::Add) {
             return self.concat(lhs, rhs);
         }
-        if matches!(op, BinOp::Eq | BinOp::Ne) && kind != Kind::Word {
-            return self.aggregate_eq(op, kind, lhs, rhs, span);
+        if matches!(op, BinOp::Eq | BinOp::Ne) {
+            // Either side may be a tagged value optional; the other is
+            // then a payload value or `null` (ADR 0021 decision 5).
+            let l_opt = self.value_opt_inner(lhs);
+            let r_opt = self.value_opt_inner(rhs);
+            if l_opt.is_some() || r_opt.is_some() {
+                return self.optional_eq(op, lhs, rhs, l_opt, r_opt, span);
+            }
+            if kind != Kind::Word {
+                return self.aggregate_eq(op, kind, lhs, rhs, span);
+            }
         }
         self.scalar_binary(op, lhs, rhs)
+    }
+
+    /// The payload type when the expression's recorded type is a value
+    /// optional.
+    fn value_opt_inner(&self, e: &Expr) -> Option<Type> {
+        self.ty(&e.span())
+            .cloned()
+            .and_then(|t| self.opt_inner_of(&t))
     }
 
     /// `a + b` on strings — the one explicitly allocating string
@@ -684,7 +851,7 @@ impl Lowerer<'_> {
         let buf = self.fresh(false);
         self.insts.push(Inst::CallRt {
             dst: buf,
-            sym: "malloc@PLT",
+            sym: RT_MALLOC,
             args: vec![total],
             varargs: false,
         });
@@ -692,7 +859,7 @@ impl Lowerer<'_> {
         let d1 = self.fresh(false);
         self.insts.push(Inst::CallRt {
             dst: d1,
-            sym: "memcpy@PLT",
+            sym: RT_MEMCPY,
             args: vec![buf, pa, la],
             varargs: false,
         });
@@ -708,7 +875,7 @@ impl Lowerer<'_> {
         let d2 = self.fresh(false);
         self.insts.push(Inst::CallRt {
             dst: d2,
-            sym: "memcpy@PLT",
+            sym: RT_MEMCPY,
             args: vec![mid, pb, lb],
             varargs: false,
         });
@@ -749,35 +916,7 @@ impl Lowerer<'_> {
                 let l = self.expr(lhs)?;
                 let snap = self.snapshot(l, 2);
                 let r = self.expr(rhs)?;
-                let la = self.load_at(snap, 8);
-                let lb = self.load_at(r, 8);
-                let result = self.fresh(false);
-                self.insts.push(Inst::Bin {
-                    op: BinOp::Eq,
-                    float: false,
-                    dst: result,
-                    lhs: la,
-                    rhs: lb,
-                });
-                let end = self.fresh_label();
-                self.insts.push(Inst::BrZero(result, end));
-                let pa = self.load_at(snap, 0);
-                let pb = self.load_at(r, 0);
-                let cmp = self.fresh(false);
-                self.insts.push(Inst::CallRt {
-                    dst: cmp,
-                    sym: "memcmp@PLT",
-                    args: vec![pa, pb, la],
-                    varargs: false,
-                });
-                self.insts.push(Inst::BinImm {
-                    op: BinOp::Eq,
-                    dst: result,
-                    lhs: cmp,
-                    imm: 0,
-                });
-                self.insts.push(Inst::Label(end));
-                result
+                self.str_content_eq(snap, r)
             }
             // str fields compare by content and float fields by
             // IEEE — one memcmp decides neither.
@@ -799,7 +938,7 @@ impl Lowerer<'_> {
                 let cmp = self.fresh(false);
                 self.insts.push(Inst::CallRt {
                     dst: cmp,
-                    sym: "memcmp@PLT",
+                    sym: RT_MEMCMP,
                     args: vec![snap, r, n],
                     varargs: false,
                 });
@@ -812,7 +951,8 @@ impl Lowerer<'_> {
                 });
                 result
             }
-            Kind::Word => unreachable!(),
+            // Words compare in scalar_binary; optionals in optional_eq.
+            Kind::Word | Kind::Opt { .. } => unreachable!(),
         };
         if matches!(op, BinOp::Ne) {
             let inv = self.fresh(false);
@@ -820,6 +960,228 @@ impl Lowerer<'_> {
             return Ok(inv);
         }
         Ok(eq)
+    }
+
+    /// `==`/`!=` where at least one side is a tagged value optional:
+    /// presence first, then the payload by its class. The left operand
+    /// snapshots before the right evaluates, like every aggregate.
+    fn optional_eq(
+        &mut self,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        l_opt: Option<Type>,
+        r_opt: Option<Type>,
+        span: Span,
+    ) -> Result<V, Diagnostic> {
+        let inner = l_opt
+            .clone()
+            .or_else(|| r_opt.clone())
+            .expect("routed on an optional side");
+        let ik = kind_of(&inner, self.res, FUEL)
+            .ok_or_else(|| unsupported("values of this type", span))?;
+        if matches!(
+            ik,
+            Kind::Struct {
+                no_memcmp: true,
+                ..
+            }
+        ) {
+            return Err(unsupported(
+                "'==' on structs containing strings or floats",
+                span,
+            ));
+        }
+        let total = 1 + ik.words();
+        let l_null = matches!(self.ty(&lhs.span()), None | Some(Type::Null));
+        let r_null = matches!(self.ty(&rhs.span()), None | Some(Type::Null));
+        let eq = if r_null {
+            // `x == null`: the tag decides.
+            let l = self.expr(lhs)?;
+            let tag = self.load_at(l, 0);
+            let v = self.fresh(false);
+            self.insts.push(Inst::BinImm {
+                op: BinOp::Eq,
+                dst: v,
+                lhs: tag,
+                imm: 0,
+            });
+            v
+        } else if l_null {
+            let r = self.expr(rhs)?;
+            let tag = self.load_at(r, 0);
+            let v = self.fresh(false);
+            self.insts.push(Inst::BinImm {
+                op: BinOp::Eq,
+                dst: v,
+                lhs: tag,
+                imm: 0,
+            });
+            v
+        } else {
+            match (l_opt.is_some(), r_opt.is_some()) {
+                // T? == T?: tags equal, and both null or payloads equal.
+                (true, true) => {
+                    let l = self.expr(lhs)?;
+                    let snap = self.snapshot(l, total);
+                    let r = self.expr(rhs)?;
+                    let ltag = self.load_at(snap, 0);
+                    let rtag = self.load_at(r, 0);
+                    let v = self.fresh(false);
+                    self.insts.push(Inst::Bin {
+                        op: BinOp::Eq,
+                        float: false,
+                        dst: v,
+                        lhs: ltag,
+                        rhs: rtag,
+                    });
+                    let end = self.fresh_label();
+                    self.insts.push(Inst::BrZero(v, end));
+                    self.insts.push(Inst::BrZero(ltag, end));
+                    let pe = self.payload_eq(&inner, ik, snap, 8, r, 8)?;
+                    self.insts.push(Inst::Copy(v, pe));
+                    self.insts.push(Inst::Label(end));
+                    v
+                }
+                // T? == T: present, and the payloads equal.
+                (true, false) => {
+                    let l = self.expr(lhs)?;
+                    let snap = self.snapshot(l, total);
+                    let r = self.expr(rhs)?;
+                    let ltag = self.load_at(snap, 0);
+                    let v = self.fresh(false);
+                    self.insts.push(Inst::BinImm {
+                        op: BinOp::Eq,
+                        dst: v,
+                        lhs: ltag,
+                        imm: 1,
+                    });
+                    let end = self.fresh_label();
+                    self.insts.push(Inst::BrZero(v, end));
+                    let pe = self.payload_eq(&inner, ik, snap, 8, r, 0)?;
+                    self.insts.push(Inst::Copy(v, pe));
+                    self.insts.push(Inst::Label(end));
+                    v
+                }
+                (false, true) => {
+                    let l = self.expr(lhs)?;
+                    let l = if ik == Kind::Word {
+                        l
+                    } else {
+                        self.snapshot(l, ik.words())
+                    };
+                    let r = self.expr(rhs)?;
+                    let rtag = self.load_at(r, 0);
+                    let v = self.fresh(false);
+                    self.insts.push(Inst::BinImm {
+                        op: BinOp::Eq,
+                        dst: v,
+                        lhs: rtag,
+                        imm: 1,
+                    });
+                    let end = self.fresh_label();
+                    self.insts.push(Inst::BrZero(v, end));
+                    let pe = self.payload_eq(&inner, ik, l, 0, r, 8)?;
+                    self.insts.push(Inst::Copy(v, pe));
+                    self.insts.push(Inst::Label(end));
+                    v
+                }
+                (false, false) => unreachable!("routed on an optional side"),
+            }
+        };
+        if matches!(op, BinOp::Ne) {
+            let inv = self.fresh(false);
+            self.insts.push(Inst::Not(inv, eq));
+            return Ok(inv);
+        }
+        Ok(eq)
+    }
+
+    /// Equality of two payloads addressed as (vreg, byte offset); offset
+    /// 0 means the vreg IS the value (or points at it, multi-word).
+    fn payload_eq(
+        &mut self,
+        inner: &Type,
+        ik: Kind,
+        a: V,
+        aoff: i64,
+        b: V,
+        boff: i64,
+    ) -> Result<V, Diagnostic> {
+        match ik {
+            Kind::Word => {
+                let av = if aoff == 0 { a } else { self.load_at(a, aoff) };
+                let bv = if boff == 0 { b } else { self.load_at(b, boff) };
+                let v = self.fresh(false);
+                self.insts.push(Inst::Bin {
+                    op: BinOp::Eq,
+                    float: *inner == Type::Float,
+                    dst: v,
+                    lhs: av,
+                    rhs: bv,
+                });
+                Ok(v)
+            }
+            Kind::Str => {
+                let pa = if aoff == 0 { a } else { self.lea_at(a, aoff) };
+                let pb = if boff == 0 { b } else { self.lea_at(b, boff) };
+                Ok(self.str_content_eq(pa, pb))
+            }
+            Kind::Struct { words, .. } => {
+                let pa = if aoff == 0 { a } else { self.lea_at(a, aoff) };
+                let pb = if boff == 0 { b } else { self.lea_at(b, boff) };
+                let n = self.const_word(8 * words as i64);
+                let cmp = self.fresh(false);
+                self.insts.push(Inst::CallRt {
+                    dst: cmp,
+                    sym: RT_MEMCMP,
+                    args: vec![pa, pb, n],
+                    varargs: false,
+                });
+                let v = self.fresh(false);
+                self.insts.push(Inst::BinImm {
+                    op: BinOp::Eq,
+                    dst: v,
+                    lhs: cmp,
+                    imm: 0,
+                });
+                Ok(v)
+            }
+            Kind::Opt { .. } => unreachable!("optionals never nest"),
+        }
+    }
+
+    /// Content equality of two string descriptors: length, then bytes.
+    fn str_content_eq(&mut self, a: V, b: V) -> V {
+        let la = self.load_at(a, 8);
+        let lb = self.load_at(b, 8);
+        let result = self.fresh(false);
+        self.insts.push(Inst::Bin {
+            op: BinOp::Eq,
+            float: false,
+            dst: result,
+            lhs: la,
+            rhs: lb,
+        });
+        let end = self.fresh_label();
+        self.insts.push(Inst::BrZero(result, end));
+        let pa = self.load_at(a, 0);
+        let pb = self.load_at(b, 0);
+        let cmp = self.fresh(false);
+        self.insts.push(Inst::CallRt {
+            dst: cmp,
+            sym: RT_MEMCMP,
+            args: vec![pa, pb, la],
+            varargs: false,
+        });
+        self.insts.push(Inst::BinImm {
+            op: BinOp::Eq,
+            dst: result,
+            lhs: cmp,
+            imm: 0,
+        });
+        self.insts.push(Inst::Label(end));
+        result
     }
 
     /// Scalar arithmetic and comparisons — IEEE via SSE for floats,
@@ -928,6 +1290,184 @@ impl Lowerer<'_> {
         dst
     }
 
+    fn lea_at(&mut self, base: V, off: i64) -> V {
+        let dst = self.fresh(false);
+        self.insts.push(Inst::LeaAt { dst, base, off });
+        dst
+    }
+
+    /// `a ?? b` — a nullable handle keeps the left unless it is 0; a
+    /// tagged optional selects on the tag (ADR 0021). The right side
+    /// stays lazy. The result unwraps to the payload type when the rhs
+    /// re-fills it, and keeps the optional shape when the rhs is
+    /// optional or `null`.
+    fn coalesce(&mut self, lhs: &Expr, rhs: &Expr, span: Span) -> Result<V, Diagnostic> {
+        let lt = self
+            .ty(&lhs.span())
+            .cloned()
+            .ok_or_else(|| unsupported("this coalesce", span))?;
+        let Some(inner) = self.opt_inner_of(&lt) else {
+            // Handle path: the null test composes from BinImm because
+            // handles aren't 0/1 booleans.
+            let v = self.fresh(false);
+            let l = self.expr(lhs)?;
+            self.insts.push(Inst::Copy(v, l));
+            let end = self.fresh_label();
+            let isnull = self.fresh(false);
+            self.insts.push(Inst::BinImm {
+                op: BinOp::Eq,
+                dst: isnull,
+                lhs: v,
+                imm: 0,
+            });
+            self.insts.push(Inst::BrZero(isnull, end));
+            let r = self.expr(rhs)?;
+            self.insts.push(Inst::Copy(v, r));
+            self.insts.push(Inst::Label(end));
+            return Ok(v);
+        };
+        let ik = kind_of(&inner, self.res, FUEL)
+            .ok_or_else(|| unsupported("values of this type", span))?;
+        let l = self.expr(lhs)?;
+        let tag = self.load_at(l, 0);
+        let miss = self.fresh_label();
+        let end = self.fresh_label();
+        if matches!(self.ty(&span), Some(Type::Optional(_))) {
+            // Optional result: select a pointer; a bare null rhs wraps.
+            let v = self.fresh(false);
+            self.insts.push(Inst::BrZero(tag, miss));
+            self.insts.push(Inst::Copy(v, l));
+            self.insts.push(Inst::Jmp(end));
+            self.insts.push(Inst::Label(miss));
+            let r = self.expr_into(rhs, &lt)?;
+            self.insts.push(Inst::Copy(v, r));
+            self.insts.push(Inst::Label(end));
+            Ok(v)
+        } else if ik == Kind::Word {
+            let v = self.fresh(inner == Type::Float);
+            self.insts.push(Inst::BrZero(tag, miss));
+            self.insts.push(Inst::LoadAt {
+                dst: v,
+                base: l,
+                off: 8,
+            });
+            self.insts.push(Inst::Jmp(end));
+            self.insts.push(Inst::Label(miss));
+            let r = self.expr(rhs)?;
+            self.insts.push(Inst::Copy(v, r));
+            self.insts.push(Inst::Label(end));
+            Ok(v)
+        } else {
+            // Multi-word payload: copy either side into a result temp.
+            let out = self.fresh(false);
+            self.insts.push(Inst::Temp {
+                dst: out,
+                words: ik.words(),
+            });
+            self.insts.push(Inst::BrZero(tag, miss));
+            let p = self.lea_at(l, 8);
+            self.insts.push(Inst::CopyW {
+                dst: out,
+                src: p,
+                words: ik.words(),
+            });
+            self.insts.push(Inst::Jmp(end));
+            self.insts.push(Inst::Label(miss));
+            let r = self.expr(rhs)?;
+            self.insts.push(Inst::CopyW {
+                dst: out,
+                src: r,
+                words: ik.words(),
+            });
+            self.insts.push(Inst::Label(end));
+            Ok(out)
+        }
+    }
+
+    /// `base?.field` — a null base short-circuits. Handle results stay a
+    /// word (0 = null); value-typed and value-optional fields build a
+    /// tagged optional — wrapped or copied whole (flattening, ADR 0021).
+    fn optional_field(
+        &mut self,
+        b: V,
+        base: &Expr,
+        slot_ty: &Type,
+        off: i64,
+        span: Span,
+    ) -> Result<V, Diagnostic> {
+        // The base is a nullable handle (test the word) or a tagged
+        // value optional (test the tag; its payload sits at +8).
+        let (test, field_base, field_off) = match self.ty(&base.span()) {
+            Some(Type::Optional(bi)) if !ref_shaped(bi, self.res) => {
+                let tag = self.load_at(b, 0);
+                (tag, b, off + 8)
+            }
+            _ => (b, b, off),
+        };
+        let result_ty = self
+            .ty(&span)
+            .cloned()
+            .ok_or_else(|| unsupported("this field access", span))?;
+        match self.opt_inner_of(&result_ty) {
+            // Handle-shaped result: 0 stays the null.
+            None => {
+                let r = self.const_word(0);
+                let end = self.fresh_label();
+                self.insts.push(Inst::BrZero(test, end));
+                self.insts.push(Inst::LoadAt {
+                    dst: r,
+                    base: field_base,
+                    off: field_off,
+                });
+                self.insts.push(Inst::Label(end));
+                Ok(r)
+            }
+            Some(inner) => {
+                let ik = kind_of(&inner, self.res, FUEL)
+                    .ok_or_else(|| unsupported("fields of this type", span))?;
+                let total = 1 + ik.words();
+                let out = self.null_optional(total);
+                let end = self.fresh_label();
+                self.insts.push(Inst::BrZero(test, end));
+                if self.opt_inner_of(slot_ty).is_some() {
+                    // Already-optional field: copy whole (flattening).
+                    let src = self.lea_at(field_base, field_off);
+                    self.insts.push(Inst::CopyW {
+                        dst: out,
+                        src,
+                        words: total,
+                    });
+                } else {
+                    // Value field: wrap {1, payload} in place.
+                    let one = self.const_word(1);
+                    self.insts.push(Inst::StoreAt {
+                        base: out,
+                        off: 0,
+                        val: one,
+                    });
+                    if ik == Kind::Word {
+                        let p = self.load_at(field_base, field_off);
+                        self.insts.push(Inst::StoreAt {
+                            base: out,
+                            off: 8,
+                            val: p,
+                        });
+                    } else {
+                        let srcp = self.lea_at(field_base, field_off);
+                        let dstp = self.lea_at(out, 8);
+                        self.insts.push(Inst::CopyW {
+                            dst: dstp,
+                            src: srcp,
+                            words: ik.words(),
+                        });
+                    }
+                }
+                self.insts.push(Inst::Label(end));
+                Ok(out)
+            }
+        }
+    }
+
     fn call(&mut self, callee: &Expr, args: &[Expr], span: Span) -> Result<V, Diagnostic> {
         let Expr::Ident(name, _) = callee else {
             return Err(unsupported("this callee", span));
@@ -950,10 +1490,13 @@ impl Lowerer<'_> {
         // Multi-word arguments copy into private temps AT EVALUATION
         // TIME: the oracle copies as it evaluates, so a later argument
         // mutating the storage through an alias must not be visible.
+        // The parameter type is the slot shape — optionals wrap here.
+        let params = sig.params.clone();
         let mut arg_vregs = Vec::new();
-        for arg in args {
-            let kind = self.kind(arg, span)?;
-            let v = self.expr(arg)?;
+        for (arg, pty) in args.iter().zip(&params) {
+            let kind = kind_of(pty, self.res, FUEL)
+                .ok_or_else(|| unsupported("calls with arguments of this type", span))?;
+            let v = self.expr_into(arg, pty)?;
             arg_vregs.push(if kind == Kind::Word {
                 v
             } else {
@@ -995,7 +1538,7 @@ impl Lowerer<'_> {
                 let dst = self.fresh(false);
                 self.insts.push(Inst::CallRt {
                     dst,
-                    sym: "ys_push",
+                    sym: RT_PUSH,
                     args: vec![arr, val],
                     varargs: false,
                 });
@@ -1006,64 +1549,54 @@ impl Lowerer<'_> {
                     .ty(&value.span())
                     .cloned()
                     .ok_or_else(|| unsupported("printing this value", span))?;
-                match ty {
+                match &ty {
                     Type::Int => {
                         let v = self.expr(value)?;
-                        let fmt = self.lea_sym(".Lfmt_int".into());
-                        let dst = self.fresh(false);
-                        self.insts.push(Inst::CallRt {
-                            dst,
-                            sym: "printf@PLT",
-                            args: vec![fmt, v],
-                            varargs: true,
-                        });
-                        Ok(dst)
+                        Ok(self.print_int(v))
                     }
                     Type::Bool => {
                         let v = self.expr(value)?;
-                        let r = self.lea_sym(".Ltrue_s".into());
-                        // Swap in "false" when v is zero.
-                        let end = self.fresh_label();
-                        let isfalse = self.fresh(false);
-                        self.insts.push(Inst::BinImm {
-                            op: BinOp::Eq,
-                            dst: isfalse,
-                            lhs: v,
-                            imm: 0,
-                        });
-                        self.insts.push(Inst::BrZero(isfalse, end));
-                        let f = self.fresh(false);
-                        self.insts.push(Inst::LeaSym {
-                            dst: f,
-                            sym: ".Lfalse_s".into(),
-                        });
-                        self.insts.push(Inst::Copy(r, f));
-                        self.insts.push(Inst::Label(end));
-                        let fmt = self.lea_sym(".Lfmt_cstr".into());
-                        let dst = self.fresh(false);
-                        self.insts.push(Inst::CallRt {
-                            dst,
-                            sym: "printf@PLT",
-                            args: vec![fmt, r],
-                            varargs: true,
-                        });
-                        Ok(dst)
+                        Ok(self.print_bool(v))
                     }
-                    // Length-carried, so %.*s with (len, ptr).
                     Type::Str => {
                         let v = self.expr(value)?;
-                        let len = self.load_at(v, 8);
-                        let ptr = self.load_at(v, 0);
-                        let fmt = self.lea_sym(".Lfmt_str".into());
-                        let dst = self.fresh(false);
-                        self.insts.push(Inst::CallRt {
-                            dst,
-                            sym: "printf@PLT",
-                            args: vec![fmt, len, ptr],
-                            varargs: true,
-                        });
-                        Ok(dst)
+                        Ok(self.print_str_desc(v))
                     }
+                    // A bare null literal prints its text.
+                    Type::Null => Ok(self.print_null()),
+                    // A tagged optional prints its payload or `null`
+                    // (ADR 0021 decision 6).
+                    Type::Optional(inner) if !ref_shaped(inner, self.res) => match inner.as_ref() {
+                        Type::Float => Err(unsupported("printing floats", span)),
+                        Type::Int | Type::Bool | Type::Str => {
+                            let v = self.expr(value)?;
+                            let tag = self.load_at(v, 0);
+                            let miss = self.fresh_label();
+                            let end = self.fresh_label();
+                            self.insts.push(Inst::BrZero(tag, miss));
+                            match inner.as_ref() {
+                                Type::Int => {
+                                    let p = self.load_at(v, 8);
+                                    self.print_int(p);
+                                }
+                                Type::Bool => {
+                                    let p = self.load_at(v, 8);
+                                    self.print_bool(p);
+                                }
+                                Type::Str => {
+                                    let d = self.lea_at(v, 8);
+                                    self.print_str_desc(d);
+                                }
+                                _ => unreachable!(),
+                            }
+                            self.insts.push(Inst::Jmp(end));
+                            self.insts.push(Inst::Label(miss));
+                            self.print_null();
+                            self.insts.push(Inst::Label(end));
+                            Ok(self.const_word(0))
+                        }
+                        _ => Err(unsupported("printing values of this type", span)),
+                    },
                     // Formatting parity with Rust's f64 Display is its
                     // own project; aggregates need the debug renderer.
                     Type::Float => Err(unsupported("printing floats", span)),
@@ -1072,5 +1605,71 @@ impl Lowerer<'_> {
             }
             _ => Err(unsupported(&format!("builtin '{name}'"), span)),
         }
+    }
+
+    fn print_int(&mut self, v: V) -> V {
+        let fmt = self.lea_sym(FMT_INT.into());
+        let dst = self.fresh(false);
+        self.insts.push(Inst::CallRt {
+            dst,
+            sym: RT_PRINTF,
+            args: vec![fmt, v],
+            varargs: true,
+        });
+        dst
+    }
+
+    fn print_bool(&mut self, v: V) -> V {
+        let r = self.lea_sym(TRUE_S.into());
+        // Swap in "false" when v is zero.
+        let end = self.fresh_label();
+        let isfalse = self.fresh(false);
+        self.insts.push(Inst::BinImm {
+            op: BinOp::Eq,
+            dst: isfalse,
+            lhs: v,
+            imm: 0,
+        });
+        self.insts.push(Inst::BrZero(isfalse, end));
+        let f = self.fresh(false);
+        self.insts.push(Inst::LeaSym {
+            dst: f,
+            sym: FALSE_S.into(),
+        });
+        self.insts.push(Inst::Copy(r, f));
+        self.insts.push(Inst::Label(end));
+        self.print_cstr(r)
+    }
+
+    fn print_null(&mut self) -> V {
+        let s = self.lea_sym(NULL_S.into());
+        self.print_cstr(s)
+    }
+
+    fn print_cstr(&mut self, s: V) -> V {
+        let fmt = self.lea_sym(FMT_CSTR.into());
+        let dst = self.fresh(false);
+        self.insts.push(Inst::CallRt {
+            dst,
+            sym: RT_PRINTF,
+            args: vec![fmt, s],
+            varargs: true,
+        });
+        dst
+    }
+
+    // Length-carried, so %.*s with (len, ptr).
+    fn print_str_desc(&mut self, v: V) -> V {
+        let len = self.load_at(v, 8);
+        let ptr = self.load_at(v, 0);
+        let fmt = self.lea_sym(FMT_STR.into());
+        let dst = self.fresh(false);
+        self.insts.push(Inst::CallRt {
+            dst,
+            sym: RT_PRINTF,
+            args: vec![fmt, len, ptr],
+            varargs: true,
+        });
+        dst
     }
 }

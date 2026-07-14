@@ -10,14 +10,39 @@ use crate::ast::{Function, Item, TypeAnn};
 use crate::check::Resolutions;
 use crate::diagnostic::Diagnostic;
 use crate::modules::ModuleGraph;
+use crate::syntax;
 use std::collections::HashMap;
 use std::fmt::Write;
+
+// ---- Symbol inventory ------------------------------------------------
+// Every runtime symbol and read-only-data label the emitted assembly
+// references, named once: the definitions below and every use in ir/
+// share these constants — never a re-spelled literal (the lexer's
+// syntax.rs discipline, applied to the backend).
+
+/// The in-assembly array-push runtime routine.
+pub(crate) const RT_PUSH: &str = "ys_push";
+pub(crate) const RT_PRINTF: &str = "printf@PLT";
+pub(crate) const RT_MALLOC: &str = "malloc@PLT";
+pub(crate) const RT_REALLOC: &str = "realloc@PLT";
+pub(crate) const RT_MEMCPY: &str = "memcpy@PLT";
+pub(crate) const RT_MEMCMP: &str = "memcmp@PLT";
+pub(crate) const RT_FMOD: &str = "fmod@PLT";
+pub(crate) const RT_ABORT: &str = "abort@PLT";
+
+/// printf formats and fixed strings for `print`.
+pub(crate) const FMT_INT: &str = ".Lfmt_int";
+pub(crate) const FMT_CSTR: &str = ".Lfmt_cstr";
+pub(crate) const FMT_STR: &str = ".Lfmt_str";
+pub(crate) const TRUE_S: &str = ".Ltrue_s";
+pub(crate) const FALSE_S: &str = ".Lfalse_s";
+pub(crate) const NULL_S: &str = ".Lnull_s";
 
 /// The assembly symbol for a function: the entry `main` keeps its name
 /// (the C runtime calls it); everything else is suffixed with its module
 /// index, which decodes uniquely (the suffix after the last underscore).
 pub(crate) fn label_of(module: usize, name: &str) -> String {
-    if module == 0 && name == "main" {
+    if module == 0 && name == syntax::ENTRY_FN {
         name.to_string()
     } else {
         format!("{name}_{module}")
@@ -60,7 +85,7 @@ impl Strings {
 fn validate_main(main_fn: &Function) -> Result<(), Diagnostic> {
     if main_fn.return_type != Some(TypeAnn::Int) {
         return Err(Diagnostic::error(
-            "not yet compilable: main not returning int".to_string(),
+            format!("not yet compilable: {} not returning int", syntax::ENTRY_FN),
             main_fn.span,
         ));
     }
@@ -89,8 +114,8 @@ pub fn compile(
             }
         }
     }
-    asm.push_str(RUNTIME);
-    asm.push_str(RODATA);
+    asm.push_str(&runtime());
+    asm.push_str(&rodata());
     asm.push_str(&strings.bytes);
     if !strings.descriptors.is_empty() {
         asm.push_str("\t.section .data.rel.ro\n");
@@ -129,8 +154,10 @@ pub fn dump_ir(
 /// never freed (the arena/leak story of ADR 0009/0015). `ys_push` grows
 /// by doubling (min 4). The label can't collide with user code — every
 /// user symbol except the entry `main` carries a `_<module>` suffix.
-const RUNTIME: &str = "\
-ys_push:
+fn runtime() -> String {
+    format!(
+        "\
+{RT_PUSH}:
 \tpushq %rbp
 \tmovq %rsp, %rbp
 \tmovq 0(%rdi), %rax
@@ -147,7 +174,7 @@ ys_push:
 \tpushq %rsi
 \tleaq 0(,%rcx,8), %rsi
 \tmovq 16(%rdi), %rdi
-\tcall realloc@PLT
+\tcall {RT_REALLOC}
 \tpopq %rsi
 \tpopq %rdi
 \tmovq %rax, 16(%rdi)
@@ -159,20 +186,28 @@ ys_push:
 \tmovq %rax, 0(%rdi)
 \tpopq %rbp
 \tret
-";
+"
+    )
+}
 
 /// Static formats for `print` (printf needs NUL-terminated formats; ys
 /// strings are length-carried, hence `%.*s`).
-const RODATA: &str = "\
+fn rodata() -> String {
+    format!(
+        "\
 \t.section .rodata
-.Lfmt_int:
+{FMT_INT}:
 \t.string \"%ld\\n\"
-.Lfmt_cstr:
+{FMT_CSTR}:
 \t.string \"%s\\n\"
-.Lfmt_str:
+{FMT_STR}:
 \t.string \"%.*s\\n\"
-.Ltrue_s:
+{TRUE_S}:
 \t.string \"true\"
-.Lfalse_s:
+{FALSE_S}:
 \t.string \"false\"
-";
+{NULL_S}:
+\t.string \"null\"
+"
+    )
+}

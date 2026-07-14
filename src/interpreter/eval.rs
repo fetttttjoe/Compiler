@@ -27,7 +27,7 @@ pub(super) fn run_program(
         depth: 0,
         heap: Heap::default(),
     };
-    let value = match interp.functions.get(&(0, "main")).copied() {
+    let value = match interp.functions.get(&(0, syntax::ENTRY_FN)).copied() {
         Some(main) => interp.call(main, 0, Vec::new(), Span::new(0, 0))?,
         None => Value::Unit,
     };

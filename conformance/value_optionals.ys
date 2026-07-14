@@ -1,0 +1,26 @@
+fun describe(b: bool?): int {
+    print(b);
+    if b == null { return 0; }
+    if b { return 1; }
+    return 2;
+}
+
+fun main(): int {
+    var acc: int = 0;
+    acc = acc + describe(true);
+    acc = acc + describe(false);
+    acc = acc + describe(null);
+
+    var name: string? = null;
+    print(name ?? "anonymous");
+    name = "ys";
+    print(name ?? "anonymous");
+    print(name);
+
+    var score: int? = null;
+    print(score);
+    score = (score ?? 0) + 41;
+    print(score);
+    if score != null { acc = acc + score; }
+    return acc;
+}

@@ -8,7 +8,8 @@
 use super::regalloc::{ARG_REGS, CALLEE_SAVED, Loc, allocate, intervals};
 use super::{FunctionIr, Inst, V, cc};
 use crate::ast::BinOp;
-use crate::codegen::label_of;
+use crate::codegen::{RT_ABORT, RT_FMOD, label_of};
+use crate::syntax;
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -79,8 +80,8 @@ pub(super) fn emit(ir: FunctionIr) -> String {
 
     let mut a = String::new();
     let label = label_of(module, &name);
-    if label == "main" {
-        a.push_str("\t.globl main\n");
+    if label == syntax::ENTRY_FN {
+        let _ = writeln!(a, "\t.globl {label}");
     }
     let _ = writeln!(a, "{label}:\n\tpushq %rbp\n\tmovq %rsp, %rbp");
     // One frame covers saves, spills, and temps, 16-byte aligned; this
@@ -336,22 +337,22 @@ pub(super) fn emit(ir: FunctionIr) -> String {
             } => {
                 let _ = writeln!(a, "\tmovq {}, %xmm0\n\tmovq {}, %xmm1", at(*lhs), at(*rhs));
                 let (code, from) = match op {
-                    BinOp::Add => ("\taddsd %xmm1, %xmm0\n", "%xmm0"),
-                    BinOp::Sub => ("\tsubsd %xmm1, %xmm0\n", "%xmm0"),
-                    BinOp::Mul => ("\tmulsd %xmm1, %xmm0\n", "%xmm0"),
-                    BinOp::Div => ("\tdivsd %xmm1, %xmm0\n", "%xmm0"),
-                    BinOp::Rem => ("\tcall fmod@PLT\n", "%xmm0"),
-                    BinOp::Eq => ("\tcmpeqsd %xmm1, %xmm0\n", "%xmm0"),
-                    BinOp::Ne => ("\tcmpneqsd %xmm1, %xmm0\n", "%xmm0"),
-                    BinOp::Lt => ("\tcmpltsd %xmm1, %xmm0\n", "%xmm0"),
-                    BinOp::Le => ("\tcmplesd %xmm1, %xmm0\n", "%xmm0"),
-                    BinOp::Gt => ("\tcmpltsd %xmm0, %xmm1\n", "%xmm1"),
-                    BinOp::Ge => ("\tcmplesd %xmm0, %xmm1\n", "%xmm1"),
+                    BinOp::Add => ("\taddsd %xmm1, %xmm0\n".to_string(), "%xmm0"),
+                    BinOp::Sub => ("\tsubsd %xmm1, %xmm0\n".to_string(), "%xmm0"),
+                    BinOp::Mul => ("\tmulsd %xmm1, %xmm0\n".to_string(), "%xmm0"),
+                    BinOp::Div => ("\tdivsd %xmm1, %xmm0\n".to_string(), "%xmm0"),
+                    BinOp::Rem => (format!("\tcall {RT_FMOD}\n"), "%xmm0"),
+                    BinOp::Eq => ("\tcmpeqsd %xmm1, %xmm0\n".to_string(), "%xmm0"),
+                    BinOp::Ne => ("\tcmpneqsd %xmm1, %xmm0\n".to_string(), "%xmm0"),
+                    BinOp::Lt => ("\tcmpltsd %xmm1, %xmm0\n".to_string(), "%xmm0"),
+                    BinOp::Le => ("\tcmplesd %xmm1, %xmm0\n".to_string(), "%xmm0"),
+                    BinOp::Gt => ("\tcmpltsd %xmm0, %xmm1\n".to_string(), "%xmm1"),
+                    BinOp::Ge => ("\tcmplesd %xmm0, %xmm1\n".to_string(), "%xmm1"),
                     BinOp::And | BinOp::Or | BinOp::Coalesce => {
                         unreachable!("lowered to control flow")
                     }
                 };
-                a.push_str(code);
+                a.push_str(&code);
                 let cmp = matches!(
                     op,
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
@@ -428,11 +429,12 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                 let _ = writeln!(
                     a,
                     "\tmovq {}, %rax\n\tmovq {}, %rcx\n\tcmpq 0(%rax), %rcx\n\
-                     \tjb .LTB{module}_{name}_{bounds}\n\tcall abort@PLT\n\
+                     \tjb .LTB{module}_{name}_{bounds}\n\tcall {abort}\n\
                      .LTB{module}_{name}_{bounds}:\n\
                      \tmovq 16(%rax), %rax\n\tmovq (%rax,%rcx,8), %rax",
                     at(*arr),
-                    at(*idx)
+                    at(*idx),
+                    abort = RT_ABORT
                 );
                 let _ = writeln!(a, "\tmovq %rax, {}", at(*dst));
             }
@@ -441,12 +443,13 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                 let _ = writeln!(
                     a,
                     "\tmovq {}, %rax\n\tmovq {}, %rcx\n\tcmpq 0(%rax), %rcx\n\
-                     \tjb .LTB{module}_{name}_{bounds}\n\tcall abort@PLT\n\
+                     \tjb .LTB{module}_{name}_{bounds}\n\tcall {abort}\n\
                      .LTB{module}_{name}_{bounds}:\n\
                      \tmovq 16(%rax), %rax\n\tmovq {}, %rdx\n\tmovq %rdx, (%rax,%rcx,8)",
                     at(*arr),
                     at(*idx),
-                    at(*val)
+                    at(*val),
+                    abort = RT_ABORT
                 );
             }
             Inst::Ret(v) => {

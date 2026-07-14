@@ -327,13 +327,23 @@ fn compiled_out_of_bounds_aborts_instead_of_corrupting() {
     assert_eq!(run.status.signal(), Some(6), "SIGABRT, not silent reads");
 }
 
-/// Value-typed optionals can't compile in the word-sized model (0 and
-/// null would share a bit pattern); reference optionals ride free.
+/// The tag-word model (ADR 0021) leaves precise gates: `float?` printing
+/// waits on float printing itself, and equality over optionals of
+/// no-memcmp structs keeps the struct-equality gate.
 #[test]
-fn value_optionals_are_not_yet_compilable() {
+fn value_optional_gates_are_precise() {
     assert_not_yet_compilable(
-        "valopt",
-        "fun main(): int { var x: int? = null; if x == null { return 1; } return 0; }",
+        "printfloatopt",
+        "fun main(): int { var x: float? = 1.5; print(x); return 0; }",
+    );
+    assert_not_yet_compilable(
+        "optfloatstructeq",
+        "struct V { f: float }
+        fun main(): int {
+            var a: V? = V { f: 1.0 };
+            if a == (V { f: 1.0 }) { return 1; }
+            return 0;
+        }",
     );
 }
 

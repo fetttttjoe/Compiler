@@ -84,11 +84,14 @@ fn run() {
     exit_on_errors(&check_diags, &map);
 
     let entry_main = graph.modules[0].ast.iter().find_map(|item| match item {
-        Item::Function(f) if f.name == "main" => Some(f),
+        Item::Function(f) if f.name == syntax::ENTRY_FN => Some(f),
         _ => None,
     });
     let Some(main_fn) = entry_main else {
-        print_error(&format!("entry file '{entry}' does not define 'main'"));
+        print_error(&format!(
+            "entry file '{entry}' does not define '{}'",
+            syntax::ENTRY_FN
+        ));
         std::process::exit(1);
     };
 

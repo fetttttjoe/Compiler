@@ -12,12 +12,14 @@ use crate::types::{StructType, Type};
 pub(crate) const FUEL: usize = 64;
 
 /// The backend's view of a value: one word (scalars, handles), a str
-/// (two-word fat pointer, content equality), or a value struct.
+/// (two-word fat pointer, content equality), a value struct, or a
+/// value optional (`{tag, payload}`, ADR 0021).
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Kind {
     Word,
     Str,
     Struct { words: usize, no_memcmp: bool },
+    Opt { words: usize, no_memcmp: bool },
 }
 
 impl Kind {
@@ -25,7 +27,7 @@ impl Kind {
         match self {
             Kind::Word => 1,
             Kind::Str => 2,
-            Kind::Struct { words, .. } => words,
+            Kind::Struct { words, .. } | Kind::Opt { words, .. } => words,
         }
     }
 }
@@ -47,11 +49,30 @@ pub(crate) fn kind_of(t: &Type, res: &Resolutions, fuel: usize) -> Option<Kind> 
         Type::Int | Type::Bool | Type::Float => Some(Kind::Word),
         // An empty literal's unconstrained element ([]): a handle word.
         Type::Unknown => Some(Kind::Word),
-        // A nullable handle is a word only if the handle itself is a
-        // compilable word (an `int?[]?` must stay as gated as `int?`).
-        Type::Optional(inner) => (ref_shaped(inner, res)
-            && kind_of(inner, res, fuel.checked_sub(1)?)? == Kind::Word)
-            .then_some(Kind::Word),
+        // A nullable handle is a free word; a value payload gets the
+        // tag word (ADR 0021). Canonical zeroed nulls keep int?/bool?
+        // memcmp-comparable; float (IEEE), str (content equality), and
+        // no-memcmp struct payloads are not.
+        Type::Optional(inner) => {
+            let k = kind_of(inner, res, fuel.checked_sub(1)?)?;
+            if ref_shaped(inner, res) {
+                return (k == Kind::Word).then_some(Kind::Word);
+            }
+            let no_memcmp = matches!(inner.as_ref(), Type::Float)
+                || matches!(
+                    k,
+                    Kind::Str
+                        | Kind::Struct {
+                            no_memcmp: true,
+                            ..
+                        }
+                        | Kind::Opt { .. }
+                );
+            Some(Kind::Opt {
+                words: 1 + k.words(),
+                no_memcmp,
+            })
+        }
         // Elements must be single words (ADR 0014's stride seat); a
         // value-optional element would alias 0 with null.
         Type::Array(inner) => {
@@ -75,6 +96,10 @@ pub(crate) fn kind_of(t: &Type, res: &Resolutions, fuel: usize) -> Option<Kind> 
                         no_memcmp = true;
                     }
                     Kind::Struct {
+                        words: w,
+                        no_memcmp: n,
+                    }
+                    | Kind::Opt {
                         words: w,
                         no_memcmp: n,
                     } => {
