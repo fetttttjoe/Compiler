@@ -57,6 +57,16 @@ impl Strings {
     }
 }
 
+fn validate_main(main_fn: &Function) -> Result<(), Diagnostic> {
+    if main_fn.return_type != Some(TypeAnn::Int) {
+        return Err(Diagnostic::error(
+            "not yet compilable: main not returning int".to_string(),
+            main_fn.span,
+        ));
+    }
+    Ok(())
+}
+
 /// Compiles the checked program to assembly text: every function in
 /// every module (like a C translation unit — an unreachable function
 /// must still compile). `main_fn` is the entry module's `main`, already
@@ -66,12 +76,7 @@ pub fn compile(
     graph: &ModuleGraph,
     res: &Resolutions,
 ) -> Result<String, Diagnostic> {
-    if main_fn.return_type != Some(TypeAnn::Int) {
-        return Err(Diagnostic::error(
-            "not yet compilable: main not returning int".to_string(),
-            main_fn.span,
-        ));
-    }
+    validate_main(main_fn)?;
 
     // The GNU-stack note marks the stack non-executable; without it the
     // linker warns and grants an executable stack.
@@ -92,6 +97,30 @@ pub fn compile(
         asm.push_str(&strings.descriptors);
     }
     Ok(asm)
+}
+
+/// Lowers every checked function in deterministic module/item order and
+/// renders pre-register-allocation IR without invoking the assembler.
+pub fn dump_ir(
+    main_fn: &Function,
+    graph: &ModuleGraph,
+    res: &Resolutions,
+) -> Result<String, Diagnostic> {
+    validate_main(main_fn)?;
+    let mut output = String::new();
+    let mut strings = Strings::default();
+    for (mi, module) in graph.modules.iter().enumerate() {
+        for item in &module.ast {
+            if let Item::Function(f) = item {
+                let ir = crate::ir::lower_function(f, mi, res, &mut strings)?;
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                let _ = writeln!(output, "{ir}");
+            }
+        }
+    }
+    Ok(output)
 }
 
 /// The in-assembly runtime, appended to every program. Arrays follow ADR

@@ -84,6 +84,13 @@ fn no_arguments_is_a_usage_error() {
 }
 
 #[test]
+fn ir_without_entry_is_a_usage_error() {
+    let out = compiler(&["ir"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("usage:"));
+}
+
+#[test]
 fn unreadable_file_is_a_clean_error() {
     let out = compiler(&["no/such/file.ys"]);
     assert_eq!(out.status.code(), Some(1));
@@ -190,6 +197,81 @@ fn builds_the_multi_module_fib_example() {
         .output()
         .expect("failed to run built binary");
     assert_eq!(run.status.code(), Some(55));
+}
+
+#[test]
+fn ir_command_is_deterministic_and_writes_no_artifacts() {
+    let dir = tempdir();
+    let src = dir.join("ir_dump.ys");
+    let asm = dir.join("ir_dump.s");
+    let bin = dir.join("ir_dump");
+    let _ = std::fs::remove_file(&asm);
+    let _ = std::fs::remove_file(&bin);
+    std::fs::write(&src, "fun main(): int { return 40 + 2; }").unwrap();
+
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_Compiler"))
+            .current_dir(&dir)
+            .args(["ir", "ir_dump.ys"])
+            .env("PATH", "")
+            .output()
+            .expect("failed to run compiler")
+    };
+    let first = run();
+    let second = run();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(first.stdout, second.stdout);
+    assert_eq!(
+        String::from_utf8_lossy(&first.stdout),
+        "fn main [module 0] (params 0, vregs 3) {\n\
+         \x20\x20v0 = const 40\n\
+         \x20\x20v1 = add.imm v0, 2\n\
+         \x20\x20ret v1\n\
+         \x20\x20v2 = const 0\n\
+         \x20\x20ret v2\n\
+         }\n"
+    );
+    assert!(!asm.exists(), "IR inspection must not write assembly");
+    assert!(!bin.exists(), "IR inspection must not write a binary");
+}
+
+#[test]
+fn tree_showcase_runs_in_both_engines() {
+    const PRINTED: &str = "tree total\n37\ntree minimum\n1\n";
+
+    let interpreted = compiler(&["examples/tree/main.ys"]);
+    assert!(
+        interpreted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&interpreted.stdout),
+        format!("{PRINTED}=> Int(37)\n")
+    );
+
+    let dir = tempdir();
+    let bin = dir.join("tree_showcase");
+    let built = compiler(&[
+        "build",
+        "examples/tree/main.ys",
+        "-o",
+        bin.to_str().unwrap(),
+    ]);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let run = std::process::Command::new(&bin)
+        .output()
+        .expect("failed to run tree showcase");
+    assert_eq!(run.status.code(), Some(37));
+    assert_eq!(String::from_utf8_lossy(&run.stdout), PRINTED);
 }
 
 /// A parameterized main would read argc/argv as its "arguments" once

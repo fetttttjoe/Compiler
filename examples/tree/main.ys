@@ -1,0 +1,21 @@
+import { Tree, insert, sum, minimum } from "./tree";
+
+fun main(): int {
+    const values: int[] = [5, 3, 8, 1, 4, 7, 9];
+    var root: Tree? = null;
+    for value in values {
+        root = insert(root, value);
+    }
+
+    const fallback: Tree = root ?? insert(null, 0);
+    if root != null {
+        const total: int = sum(root);
+        print("tree total");
+        print(total);
+        print("tree minimum");
+        print(minimum(fallback));
+        return total;
+    } else {
+        return 0;
+    }
+}

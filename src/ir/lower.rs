@@ -3,9 +3,8 @@
 //! Anything the backend can't represent yet returns a clean
 //! "not yet compilable" diagnostic — there is no fallback path.
 
-use super::emit::emit;
 use super::layout::{kind_of, offset_of, ref_shaped, Kind, FUEL};
-use super::{unsupported, Inst, Lbl, V};
+use super::{unsupported, FunctionIr, Inst, Lbl, V};
 use crate::ast::{BinOp, Expr, Function, Stmt, UnOp};
 use crate::check::Resolutions;
 use crate::codegen::{label_of, Strings};
@@ -29,13 +28,13 @@ pub(super) struct Lowerer<'a> {
     pub(super) ret_words: usize,
 }
 
-/// Compiles one function to assembly text.
-pub fn function(
+/// Lowers one checked function into owned virtual-register IR.
+pub(super) fn lower(
     f: &Function,
     module: usize,
     res: &Resolutions,
     strings: &mut Strings,
-) -> Result<String, Diagnostic> {
+) -> Result<FunctionIr, Diagnostic> {
     let sig = &res.sigs[&(module, f.name.clone())];
     let ret_kind = match &sig.ret {
         Type::Unit => Kind::Word,
@@ -70,7 +69,7 @@ pub fn function(
         let v = lo.fresh(*ty == Type::Float);
         lo.scopes[0].insert(p.name.clone(), v);
     }
-    let nregs = lo.vregs;
+    let nparams = lo.vregs;
     for stmt in &f.body {
         lo.stmt(stmt)?;
     }
@@ -79,7 +78,20 @@ pub fn function(
     let zero = lo.const_word(0);
     lo.insts.push(Inst::Ret(zero));
 
-    Ok(emit(&f.name, module, nregs, lo))
+    let Lowerer {
+        insts,
+        vregs,
+        floats,
+        ..
+    } = lo;
+    Ok(FunctionIr {
+        name: f.name.clone(),
+        module,
+        nparams,
+        vregs,
+        floats,
+        insts,
+    })
 }
 
 impl Lowerer<'_> {

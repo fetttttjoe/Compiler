@@ -5,9 +5,8 @@
 //! this backend never pushes operands, so %rsp stays aligned at every
 //! call site with no fix-ups.
 
-use super::lower::Lowerer;
 use super::regalloc::{allocate, intervals, Loc, ARG_REGS, CALLEE_SAVED};
-use super::{cc, Inst, V};
+use super::{cc, FunctionIr, Inst, V};
 use crate::ast::BinOp;
 use crate::codegen::label_of;
 use std::collections::HashMap;
@@ -54,15 +53,23 @@ fn operand(loc: Loc) -> String {
     }
 }
 
-pub(super) fn emit(name: &str, module: usize, nparams: usize, lo: Lowerer) -> String {
-    let ivs = intervals(&lo.insts, lo.vregs);
+pub(super) fn emit(ir: FunctionIr) -> String {
+    let FunctionIr {
+        name,
+        module,
+        nparams,
+        vregs,
+        floats,
+        insts,
+    } = ir;
+    let ivs = intervals(&insts, vregs);
     let save_base = -8 * CALLEE_SAVED.len() as i64;
-    let (loc, used_callee, spill_floor) = allocate(&ivs, &lo.floats, save_base);
+    let (loc, used_callee, spill_floor) = allocate(&ivs, &floats, save_base);
     // Frame temps (multi-word storage) sit below the spills; one static
     // slot per Temp site, reused across loop iterations.
     let mut temp_floor = spill_floor;
     let mut temp_off: HashMap<usize, i64> = HashMap::new();
-    for (i, inst) in lo.insts.iter().enumerate() {
+    for (i, inst) in insts.iter().enumerate() {
         if let Inst::Temp { words, .. } = inst {
             temp_floor -= 8 * *words as i64;
             temp_off.insert(i, temp_floor);
@@ -71,7 +78,7 @@ pub(super) fn emit(name: &str, module: usize, nparams: usize, lo: Lowerer) -> St
     let at = |v: V| operand(*loc.get(&v).expect("allocated"));
 
     let mut a = String::new();
-    let label = label_of(module, name);
+    let label = label_of(module, &name);
     if label == "main" {
         a.push_str("\t.globl main\n");
     }
@@ -100,7 +107,7 @@ pub(super) fn emit(name: &str, module: usize, nparams: usize, lo: Lowerer) -> St
     }
 
     let mut bounds = 0usize;
-    for (idx, inst) in lo.insts.iter().enumerate() {
+    for (idx, inst) in insts.iter().enumerate() {
         match inst {
             Inst::Const(d, n) => match loc.get(d) {
                 Some(Loc::Reg(r)) if !r.starts_with("%x") => {

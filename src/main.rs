@@ -48,11 +48,12 @@ fn main() {
     }
 }
 
-/// How to run the checked program: `compiler <entry>` interprets,
-/// `compiler build <entry> [-o <out>]` compiles to a native binary.
+/// How to process the checked program: interpret it, build a native
+/// binary, or print pre-register-allocation IR.
 enum Mode {
     Interpret,
     Build { out: Option<std::path::PathBuf> },
+    Ir,
 }
 
 fn run() {
@@ -62,6 +63,8 @@ fn run() {
             let (entry, out) = parse_build_args(rest);
             (entry, Mode::Build { out })
         }
+        [cmd, entry] if cmd == "ir" => (entry, Mode::Ir),
+        [cmd] if cmd == "ir" => usage(),
         [entry] => (entry, Mode::Interpret),
         _ => usage(),
     };
@@ -89,23 +92,17 @@ fn run() {
         std::process::exit(1);
     };
 
-    if let Mode::Build { out } = mode {
-        let out = out.unwrap_or_else(|| default_out(entry));
-        return build(main_fn, &graph, &resolutions, &out, &map);
+    match mode {
+        Mode::Build { out } => {
+            let out = out.unwrap_or_else(|| default_out(entry));
+            return build(main_fn, &graph, &resolutions, &out, &map);
+        }
+        Mode::Ir => return print_ir(main_fn, &graph, &resolutions, &map),
+        Mode::Interpret => {}
     }
 
     match interpreter::interpret(&graph, &resolutions) {
-        Ok((value, heap)) => {
-            use std::io::Write;
-            if let Err(e) = writeln!(std::io::stdout(), "=> {}", value.render(&heap)) {
-                // A closed pipe is fine (the consumer left); losing the
-                // result any other way must not look like success.
-                if e.kind() != std::io::ErrorKind::BrokenPipe {
-                    print_error(&format!("cannot write output: {e}"));
-                    std::process::exit(1);
-                }
-            }
-        }
+        Ok((value, heap)) => write_stdout(&format!("=> {}\n", value.render(&heap))),
         Err(diag) => exit_on_errors(&[diag], &map),
     }
 }
@@ -142,7 +139,7 @@ fn parse_build_args(rest: &[String]) -> (&String, Option<std::path::PathBuf>) {
 fn usage() -> ! {
     let _ = writeln!(
         std::io::stderr(),
-        "usage: compiler <entry.ys>\n       compiler build <entry.ys> [-o <out>]"
+        "usage: compiler <entry.ys>\n       compiler build <entry.ys> [-o <out>]\n       compiler ir <entry.ys>"
     );
     std::process::exit(2);
 }
@@ -155,6 +152,28 @@ fn default_out(entry: &str) -> std::path::PathBuf {
         .file_stem()
         .map(std::path::PathBuf::from)
         .expect("a readable entry file has a name")
+}
+
+fn print_ir(
+    main_fn: &ast::Function,
+    graph: &modules::ModuleGraph,
+    resolutions: &check::Resolutions,
+    map: &SourceMap,
+) {
+    match codegen::dump_ir(main_fn, graph, resolutions) {
+        Ok(ir) => write_stdout(&ir),
+        Err(diag) => exit_on_errors(&[diag], map),
+    }
+}
+
+fn write_stdout(text: &str) {
+    let mut stdout = std::io::stdout();
+    if let Err(e) = stdout.write_all(text.as_bytes()) {
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            print_error(&format!("cannot write output: {e}"));
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Emits assembly next to `out` (kept on disk — it's the debug artifact)

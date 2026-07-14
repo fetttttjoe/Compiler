@@ -1,0 +1,30 @@
+export refstruct Tree { value: int, left: Tree?, right: Tree? }
+
+export fun insert(tree: Tree?, value: int): Tree {
+    if tree == null {
+        return Tree { value: value, left: null, right: null };
+    } else {
+        if value < tree.value {
+            tree.left = insert(tree.left, value);
+        } else {
+            tree.right = insert(tree.right, value);
+        }
+        return tree;
+    }
+}
+
+export fun sum(tree: Tree?): int {
+    if tree == null {
+        return 0;
+    } else {
+        return sum(tree.left) + tree.value + sum(tree.right);
+    }
+}
+
+export fun minimum(tree: Tree): int {
+    var current: Tree = tree;
+    while current.left != null {
+        current = current.left;
+    }
+    return current.value;
+}
