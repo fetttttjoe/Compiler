@@ -1,6 +1,6 @@
 # CI (ADR 0017/0018 discipline): every push runs the full quality bar —
-# format, lints as errors, the whole test suite (unit + CLI + diff +
-# conformance), a deterministic fuzz sweep, and the benchmark suite.
+# generated grammar, format, lints as errors, the whole test suite (unit +
+# CLI + diff + conformance), a deterministic fuzz sweep, and benchmarks.
 # Benchmark TIMINGS are report-only (shared runners jitter too much to
 # gate on); the runner's ys-vs-C exit-code agreement check DOES gate.
 name: ci
@@ -15,6 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: editor grammar is in sync with src/syntax.rs
+        run: python3 tools/gen-grammar.py --check
 
       - name: format
         run: cargo fmt --check
