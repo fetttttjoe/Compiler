@@ -202,7 +202,9 @@ impl Checker<'_> {
                 self.check_condition("while", cond);
                 let (if_true, _) = null_checks(cond);
                 self.drop_loop_invalidated_facts(body);
+                self.loop_depth += 1;
                 self.check_block_narrowed(body, if_true);
+                self.loop_depth -= 1;
             }
             Stmt::For {
                 index,
@@ -254,14 +256,26 @@ impl Checker<'_> {
                 if let Some(index) = index {
                     self.bind(index, Type::Int, false);
                 }
+                self.loop_depth += 1;
                 for stmt in body {
                     self.check_stmt(stmt);
                 }
+                self.loop_depth -= 1;
                 self.scopes.pop();
                 self.nonnull.pop();
             }
             Stmt::Expr(e) => {
                 self.type_of_expr(e);
+            }
+            Stmt::Break { span } | Stmt::Continue { span } => {
+                if self.loop_depth == 0 {
+                    let kw = if matches!(stmt, Stmt::Break { .. }) {
+                        "break"
+                    } else {
+                        "continue"
+                    };
+                    self.error(format!("'{kw}' outside of a loop"), *span);
+                }
             }
             Stmt::Assign {
                 target,

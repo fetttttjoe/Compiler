@@ -23,6 +23,10 @@ pub(super) struct Lowerer<'a> {
     /// Parallel to vregs: floats allocate from the XMM pool.
     pub(super) floats: Vec<bool>,
     pub(super) labels: usize,
+    /// Enclosing loops, innermost last: (continue target, break target).
+    /// `for`'s continue target is its increment step, not the loop top —
+    /// jumping to the top would re-run the same element (ADR 0019).
+    pub(super) loops: Vec<(Lbl, Lbl)>,
     /// The hidden destination pointer of a struct-returning function.
     pub(super) sret: Option<V>,
     pub(super) ret_words: usize,
@@ -54,6 +58,7 @@ pub(super) fn lower(
         vregs: 0,
         floats: Vec::new(),
         labels: 0,
+        loops: Vec::new(),
         sret: None,
         ret_words: ret_kind.words(),
     };
@@ -265,6 +270,14 @@ impl Lowerer<'_> {
                     self.insts.push(Inst::Ret(zero));
                 }
             },
+            Stmt::Break { .. } => {
+                let (_, brk) = *self.loops.last().expect("checker: loops only");
+                self.insts.push(Inst::Jmp(brk));
+            }
+            Stmt::Continue { .. } => {
+                let (cont, _) = *self.loops.last().expect("checker: loops only");
+                self.insts.push(Inst::Jmp(cont));
+            }
             Stmt::If {
                 cond,
                 then_body,
@@ -295,7 +308,10 @@ impl Lowerer<'_> {
                 self.insts.push(Inst::Label(top));
                 let c = self.expr(cond)?;
                 self.insts.push(Inst::BrZero(c, end));
-                self.block(body)?;
+                self.loops.push((top, end));
+                let result = self.block(body);
+                self.loops.pop();
+                result?;
                 self.insts.push(Inst::Jmp(top));
                 self.insts.push(Inst::Label(end));
             }
@@ -334,15 +350,19 @@ impl Lowerer<'_> {
                     arr,
                     idx: i,
                 });
+                let cont = self.fresh_label();
                 let mut bindings = HashMap::new();
                 bindings.insert(name.clone(), x);
                 if let Some(ix) = index {
                     bindings.insert(ix.clone(), i);
                 }
                 self.scopes.push(bindings);
+                self.loops.push((cont, end));
                 let result = body.iter().try_for_each(|stmt| self.stmt(stmt));
+                self.loops.pop();
                 self.scopes.pop();
                 result?;
+                self.insts.push(Inst::Label(cont));
                 self.insts.push(Inst::BinImm {
                     op: BinOp::Add,
                     dst: i,

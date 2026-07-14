@@ -1,0 +1,40 @@
+fun main(): int {
+    // continue skips even values; break stops at 7 (ADR 0019).
+    var acc: int = 0;
+    var i: int = 0;
+    while true {
+        i = i + 1;
+        if i == 7 { break; }
+        if i % 2 == 0 { continue; }
+        acc = acc + i;
+    }
+    print(acc);
+    print(i);
+
+    // In a for loop, continue advances to the next element; break ends
+    // a live iteration whose body keeps pushing.
+    var xs: int[] = [1, 2, 3];
+    var seen: int = 0;
+    for [ix, x] in xs {
+        push(xs, x + 10);
+        if ix == 4 { break; }
+        if x % 2 == 0 { continue; }
+        seen = seen + 1;
+    }
+    print(seen);
+    print(len(xs));
+
+    // Both bind to the innermost loop.
+    var log: int = 0;
+    for a in [1, 2] {
+        var j: int = 0;
+        while j < 10 {
+            j = j + 1;
+            if j == 2 { continue; }
+            if j == 4 { break; }
+            log = log + a * 10 + j;
+        }
+        print(log);
+    }
+    return acc + seen + log;
+}

@@ -93,6 +93,14 @@ pub enum Stmt {
         value: Option<Expr>,
         span: Span,
     },
+    /// `break;` — exits the innermost enclosing loop (ADR 0019).
+    Break {
+        span: Span,
+    },
+    /// `continue;` — skips to the innermost loop's next iteration.
+    Continue {
+        span: Span,
+    },
     If {
         cond: Expr,
         then_body: Vec<Stmt>,
@@ -227,6 +235,8 @@ impl Stmt {
             Stmt::Let { span, .. }
             | Stmt::Assign { span, .. }
             | Stmt::Return { span, .. }
+            | Stmt::Break { span }
+            | Stmt::Continue { span }
             | Stmt::If { span, .. }
             | Stmt::While { span, .. }
             | Stmt::For { span, .. } => *span,

@@ -472,6 +472,37 @@ fn while_statement() {
 }
 
 #[test]
+fn break_and_continue_parse_as_statements() {
+    assert!(matches!(stmt("break;"), Stmt::Break { .. }));
+    assert!(matches!(stmt("continue;"), Stmt::Continue { .. }));
+    let s = stmt("while true { break; continue; }");
+    let Stmt::While { body, .. } = s else {
+        panic!("expected While");
+    };
+    assert!(matches!(body[0], Stmt::Break { .. }));
+    assert!(matches!(body[1], Stmt::Continue { .. }));
+}
+
+#[test]
+fn recovery_stops_before_break_and_continue() {
+    // A malformed statement synchronizes at the keywords instead of
+    // eating them, so the loop controls survive the recovery.
+    let (tokens, _) = lex("fun f(): int { while true { const = 1 break; } return 7; }");
+    let (ast, pd) = parse(&tokens);
+    assert!(!pd.is_empty());
+    let Item::Function(f) = &ast[0] else {
+        panic!("expected function")
+    };
+    let Some(Stmt::While { body, .. }) = f.body.first() else {
+        panic!("expected while")
+    };
+    assert!(
+        body.iter().any(|s| matches!(s, Stmt::Break { .. })),
+        "break must survive recovery: {body:?}"
+    );
+}
+
+#[test]
 fn condition_is_never_a_struct_literal() {
     // `if x { … }` must read `x` as an identifier condition, not the
     // struct literal `x { }`.

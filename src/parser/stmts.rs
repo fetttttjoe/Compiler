@@ -50,6 +50,8 @@ impl Parser<'_> {
                 | TokenKind::Var
                 | TokenKind::Const
                 | TokenKind::Return
+                | TokenKind::Break
+                | TokenKind::Continue
                 | TokenKind::If
                 | TokenKind::While
                 | TokenKind::For => return,
@@ -206,6 +208,20 @@ impl Parser<'_> {
                         ty,
                         value,
                         span: tok.span.to(end),
+                    },
+                    clean,
+                )
+            }
+            TokenKind::Break | TokenKind::Continue => {
+                let is_break = matches!(tok.kind, TokenKind::Break);
+                self.bump();
+                let (end, clean) = self.expect_or_flag(TokenKind::Semicolon);
+                let span = tok.span.to(end);
+                (
+                    if is_break {
+                        Stmt::Break { span }
+                    } else {
+                        Stmt::Continue { span }
                     },
                     clean,
                 )

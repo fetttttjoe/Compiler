@@ -37,6 +37,10 @@ pub(super) fn run_program(
 enum Flow {
     Normal,
     Return(Value),
+    /// `break` / `continue` unwinding toward the innermost loop, which
+    /// consumes it; the checker proves one exists (ADR 0019).
+    Break,
+    Continue,
 }
 
 struct Interp<'a> {
@@ -83,13 +87,17 @@ impl<'a> Interp<'a> {
         Ok(match result? {
             Flow::Return(v) => v,
             Flow::Normal => Value::Unit,
+            Flow::Break | Flow::Continue => {
+                unreachable!("checker rejects break/continue outside loops")
+            }
         })
     }
 
     fn exec_block(&mut self, body: &'a [Stmt]) -> Result<Flow, Diagnostic> {
         for stmt in body {
-            if let Flow::Return(v) = self.exec_stmt(stmt)? {
-                return Ok(Flow::Return(v));
+            match self.exec_stmt(stmt)? {
+                Flow::Normal => {}
+                other => return Ok(other),
             }
         }
         Ok(Flow::Normal)
@@ -116,6 +124,8 @@ impl<'a> Interp<'a> {
                 };
                 Ok(Flow::Return(v))
             }
+            Stmt::Break { .. } => Ok(Flow::Break),
+            Stmt::Continue { .. } => Ok(Flow::Continue),
             Stmt::If {
                 cond,
                 then_body,
@@ -132,8 +142,10 @@ impl<'a> Interp<'a> {
             }
             Stmt::While { cond, body, .. } => {
                 while self.eval_condition(cond)? {
-                    if let Flow::Return(v) = self.exec_block_scoped(body)? {
-                        return Ok(Flow::Return(v));
+                    match self.exec_block_scoped(body)? {
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Break => break,
+                        Flow::Continue | Flow::Normal => {}
                     }
                 }
                 Ok(Flow::Normal)
@@ -168,8 +180,11 @@ impl<'a> Interp<'a> {
                     self.scopes.push(scope);
                     let flow = self.exec_block(body);
                     self.scopes.pop();
-                    if let Flow::Return(v) = flow? {
-                        return Ok(Flow::Return(v));
+                    match flow? {
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Break => break,
+                        // `continue` still advances — the increment is here.
+                        Flow::Continue | Flow::Normal => {}
                     }
                     i += 1;
                 }

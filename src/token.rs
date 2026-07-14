@@ -9,6 +9,8 @@ pub enum TokenKind {
     Var,
     Const,
     Return,
+    Break,
+    Continue,
     If,
     Else,
     While,

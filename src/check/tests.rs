@@ -65,6 +65,38 @@ fn diags(src: &str) -> Vec<Diagnostic> {
 }
 
 #[test]
+fn break_and_continue_outside_a_loop_are_errors() {
+    let d = diags("fun f() { break; }");
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert!(d[0].message.contains("'break' outside of a loop"), "{d:?}");
+
+    // Inside an `if` is still outside a loop.
+    let d = diags("fun f(b: bool) { if b { continue; } }");
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert!(
+        d[0].message.contains("'continue' outside of a loop"),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn break_and_continue_are_accepted_inside_loops() {
+    let d = diags(
+        "fun f(xs: int[]): int {\n\
+             var n: int = 0;\n\
+             while n < 10 { if n == 5 { break; } n = n + 1; }\n\
+             for x in xs { if x == 0 { continue; } n = n + x; }\n\
+             return n;\n\
+         }",
+    );
+    assert!(d.is_empty(), "unexpected: {d:?}");
+
+    // The loop context ends with the loop: a `break` after one is an error.
+    let d = diags("fun f() { while false { } break; }");
+    assert_eq!(d.len(), 1, "{d:?}");
+}
+
+#[test]
 fn arithmetic_of_same_type_is_ok() {
     let d = diags("fun f(a: int, b: int): int { return a + b * 2; }");
     assert!(d.is_empty(), "unexpected: {d:?}");

@@ -296,6 +296,81 @@ fn while_loop_accumulates() {
 }
 
 #[test]
+fn break_and_continue_in_while_loops() {
+    diff(
+        "bcwhile",
+        "fun main(): int {
+            var acc: int = 0;
+            var i: int = 0;
+            while i < 100 {
+                if i == 7 { break; }
+                i = i + 1;
+                if i % 3 == 0 { continue; }
+                acc = acc + i;
+            }
+            return acc * 10 + i;
+        }",
+    );
+}
+
+#[test]
+fn continue_in_for_still_advances_the_element() {
+    diff(
+        "bcfor",
+        "fun main(): int {
+            const xs: int[] = [5, 6, 7, 8, 9];
+            var total: int = 0;
+            for [i, x] in xs {
+                if x % 2 == 0 { continue; }
+                total = total + i * 100 + x;
+            }
+            return total % 251;
+        }",
+    );
+}
+
+#[test]
+fn break_stops_a_live_for_that_keeps_growing() {
+    // The body pushes every step — only break ends the iteration.
+    diff(
+        "bclive",
+        "fun main(): int {
+            var xs: int[] = [1, 2];
+            var seen: int = 0;
+            for x in xs {
+                seen = seen + 1;
+                push(xs, x + 10);
+                if seen == 5 { break; }
+            }
+            return seen * 20 + len(xs) + xs[6];
+        }",
+    );
+}
+
+#[test]
+fn break_and_continue_bind_to_the_innermost_loop() {
+    diff(
+        "bcnested",
+        "fun main(): int {
+            var log: int = 0;
+            var i: int = 0;
+            while i < 4 {
+                i = i + 1;
+                for x in [1, 2, 3] {
+                    if x == 2 { continue; }
+                    if i == 3 { break; }
+                    log = log + x;
+                }
+                if i == 4 { break; }
+                log = log * 2;
+            }
+            print(log);
+            return log % 251;
+        }",
+    );
+}
+
+#[test]
 fn comparisons_and_logic() {
     diff(
         "cmp",

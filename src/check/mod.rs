@@ -196,6 +196,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                     diagnostics: &mut diags,
                     scopes: Vec::new(),
                     nonnull: Vec::new(),
+                    loop_depth: 0,
                     ret: Type::Unit,
                     field_slots: &mut field_slots,
                     expr_types: &mut expr_types,
@@ -317,6 +318,9 @@ struct Checker<'a> {
     /// it while the shadow's frame lives; field paths are also dropped on
     /// any call or field write, since aliases can reach them.
     nonnull: Vec<NarrowFrame>,
+    /// How many loops enclose the statement being checked — `break`/
+    /// `continue` are rejected at depth 0 (ADR 0019).
+    loop_depth: usize,
     ret: Type,
     /// Codegen resolution tables filled in as expressions type (see
     /// `Resolutions::field_slots` / `struct_lits`).

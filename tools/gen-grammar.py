@@ -25,7 +25,7 @@ GRAMMAR = ROOT / "editors" / "vscode" / "syntaxes" / "ys.tmLanguage.json"
 # must appear in exactly one bucket (checked below).
 CATEGORIES = {
     "storage.type.ys": ["fun", "struct", "refstruct", "var", "const"],
-    "keyword.control.ys": ["return", "if", "else", "while", "for", "in", "import", "export", "from"],
+    "keyword.control.ys": ["return", "break", "continue", "if", "else", "while", "for", "in", "import", "export", "from"],
     "support.type.primitive.ys": ["int", "float", "bool", "string"],
     "constant.language.ys": ["true", "false", "null"],
 }

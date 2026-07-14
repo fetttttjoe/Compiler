@@ -307,6 +307,89 @@ fun main(): int { return abs(-7) + abs(7); }";
 }
 
 #[test]
+fn break_exits_the_loop_early() {
+    let program = "\
+fun main(): int {
+    var i: int = 0;
+    var acc: int = 0;
+    while i < 100 {
+        if i == 5 { break; }
+        acc = acc + i;
+        i = i + 1;
+    }
+    return acc * 1000 + i;
+}";
+    // 0+1+2+3+4 = 10; i stopped at 5.
+    assert_eq!(run(program), Ok(Value::Int(10005)));
+}
+
+#[test]
+fn continue_skips_but_still_advances() {
+    let program = "\
+fun main(): int {
+    var acc: int = 0;
+    var i: int = 0;
+    while i < 10 {
+        i = i + 1;
+        if i % 2 == 0 { continue; }
+        acc = acc + i;
+    }
+    const xs: int[] = [1, 2, 3, 4, 5];
+    var evens: int = 0;
+    for x in xs {
+        if x % 2 == 1 { continue; }
+        evens = evens + x;
+    }
+    return acc * 100 + evens;
+}";
+    // odds 1..10 sum to 25; evens in xs sum to 6. The `for` proves
+    // continue advances to the next element instead of re-running one.
+    assert_eq!(run(program), Ok(Value::Int(2506)));
+}
+
+#[test]
+fn break_and_continue_bind_to_the_innermost_loop() {
+    let program = "\
+fun main(): int {
+    var hits: int = 0;
+    var i: int = 0;
+    while i < 3 {
+        i = i + 1;
+        var j: int = 0;
+        while true {
+            j = j + 1;
+            if j >= 2 { break; }
+            if j == 1 { continue; }
+            hits = hits + 100;
+        }
+        hits = hits + j;
+    }
+    return hits;
+}";
+    // Inner loop always exits at j == 2; outer runs all 3 iterations;
+    // the += 100 line is continue-skipped every time.
+    assert_eq!(run(program), Ok(Value::Int(6)));
+}
+
+#[test]
+fn break_in_a_live_for_stops_the_growth() {
+    let program = "\
+fun main(): int {
+    var xs: int[] = [1, 2];
+    var seen: int = 0;
+    for x in xs {
+        seen = seen + 1;
+        push(xs, x);
+        if seen == 4 { break; }
+    }
+    return seen * 100 + len(xs);
+}";
+    // Live iteration would run forever (the body keeps pushing);
+    // break must be what stops it, after exactly 4 elements.
+    assert_eq!(run(program), Ok(Value::Int(406)));
+}
+
+#[test]
 fn while_loop_accumulates() {
     let program = "\
 fun main(): int {

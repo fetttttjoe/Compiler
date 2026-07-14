@@ -23,6 +23,7 @@ export fun sum(tree: Tree?): int {
 - value-copying `struct` and explicitly aliased `refstruct`
 - optionals — `T?`, `null`, `?.`, `??` — with flow-sensitive narrowing
 - growable arrays with `len`, `push`, and live `for` loops
+- loop control with `break` and `continue`
 - modules with explicit `import` / `export`
 - every binding declares its type; the compiler verifies, it never
   guesses

@@ -320,6 +320,8 @@ impl Lexer<'_> {
             syntax::KW_VAR => TokenKind::Var,
             syntax::KW_CONST => TokenKind::Const,
             syntax::KW_RETURN => TokenKind::Return,
+            syntax::KW_BREAK => TokenKind::Break,
+            syntax::KW_CONTINUE => TokenKind::Continue,
             syntax::KW_IF => TokenKind::If,
             syntax::KW_ELSE => TokenKind::Else,
             syntax::KW_WHILE => TokenKind::While,
@@ -510,13 +512,15 @@ mod tests {
     #[test]
     fn base_type_and_control_flow_keywords() {
         assert_eq!(
-            kinds("true false if else while bool string"),
+            kinds("true false if else while break continue bool string"),
             vec![
                 TokenKind::True,
                 TokenKind::False,
                 TokenKind::If,
                 TokenKind::Else,
                 TokenKind::While,
+                TokenKind::Break,
+                TokenKind::Continue,
                 TokenKind::BoolType,
                 TokenKind::StringType,
                 TokenKind::Eof

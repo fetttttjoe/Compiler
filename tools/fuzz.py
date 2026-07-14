@@ -84,8 +84,15 @@ class Gen:
             elif depth < 2:
                 v = self.name("i")
                 inner = self.body(vars_ + [v], depth + 1)
+                # break only shortens a loop, so termination is safe;
+                # generated `continue` could skip the counter and hang.
+                guard = (
+                    f"if {self.bool_expr(vars_ + [v])} {{ break; }} "
+                    if r.random() < 0.3
+                    else ""
+                )
                 lines.append(
-                    f"var {v}: int = 0; while {v} < {r.randint(1, 4)} {{ {inner} {v} = {v} + 1; }}"
+                    f"var {v}: int = 0; while {v} < {r.randint(1, 4)} {{ {guard}{inner} {v} = {v} + 1; }}"
                 )
         return " ".join(lines)
 
@@ -108,9 +115,10 @@ class Gen:
             for n, arity in names
         )
         arr = self.name("xs")
+        stop = f"if ix == {r.randint(3, 5)} {{ break; }} " if r.random() < 0.5 else ""
         arr_part = (
             f"var {arr}: int[] = [{', '.join(str(r.randint(-5, 5)) for _ in range(r.randint(1, 4)))}];"
-            f" for [ix, x] in {arr} {{ print(ix * 100 + x); if len({arr}) < 6 {{ push({arr}, x + 1); }} }}"
+            f" for [ix, x] in {arr} {{ print(ix * 100 + x); {stop}if len({arr}) < 6 {{ push({arr}, x + 1); }} }}"
         )
         ret = self.int_expr([])
         return "\n".join(

@@ -105,6 +105,8 @@ pub(crate) fn body_effects(
                     *kills_fields = true;
                 }
             }
+            // No expressions, no writes — inert for narrowing (ADR 0019).
+            Stmt::Break { .. } | Stmt::Continue { .. } => {}
             Stmt::If {
                 cond,
                 then_body,

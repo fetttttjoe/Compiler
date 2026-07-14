@@ -262,6 +262,8 @@ pub(super) fn describe(kind: &TokenKind) -> &'static str {
         Var => "'var'",
         Const => "'const'",
         Return => "'return'",
+        Break => "'break'",
+        Continue => "'continue'",
         If => "'if'",
         Else => "'else'",
         While => "'while'",
