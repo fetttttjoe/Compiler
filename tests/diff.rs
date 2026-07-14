@@ -196,6 +196,31 @@ fn string_concat_reassigned_in_a_loop() {
 }
 
 #[test]
+fn runtime_divisors_go_through_the_checked_path() {
+    // ADR 0022 adds zero/MIN÷-1 checks before idiv; clean divisions
+    // must be bit-identical to the oracle across the extremes.
+    diff(
+        "checkeddiv",
+        "fun div(a: int, b: int): int { return a / b + a % b; }
+        fun main(): int {
+            const xs: int[] = [1, -1, 2, -2, 3, 7, 10, 100, 251,
+                9223372036854775807, -9223372036854775807 - 1];
+            var acc: int = 0;
+            for a in xs {
+                for b in xs {
+                    if a == -9223372036854775807 - 1 && b == -1 {
+                        acc = acc + 1;
+                    } else {
+                        acc = acc + div(a, b) % 251;
+                    }
+                }
+            }
+            return acc % 251;
+        }",
+    );
+}
+
+#[test]
 fn division_truncates_toward_zero() {
     diff("div", "fun main(): int { return -7 / 2; }");
 }

@@ -10,6 +10,7 @@ use crate::ast::{Function, Item, TypeAnn};
 use crate::check::Resolutions;
 use crate::diagnostic::Diagnostic;
 use crate::modules::ModuleGraph;
+use crate::source::SourceMap;
 use crate::syntax;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -28,7 +29,14 @@ pub(crate) const RT_REALLOC: &str = "realloc@PLT";
 pub(crate) const RT_MEMCPY: &str = "memcpy@PLT";
 pub(crate) const RT_MEMCMP: &str = "memcmp@PLT";
 pub(crate) const RT_FMOD: &str = "fmod@PLT";
-pub(crate) const RT_ABORT: &str = "abort@PLT";
+pub(crate) const RT_DPRINTF: &str = "dprintf@PLT";
+// abort left the inventory with ADR 0022: traps report and exit 1.
+pub(crate) const RT_EXIT: &str = "exit@PLT";
+
+/// Trap stubs (ADR 0022): print a runtime diagnostic and exit 1.
+pub(crate) const TRAP_DIV0: &str = "ys_trap_div0";
+pub(crate) const TRAP_OVERFLOW: &str = "ys_trap_overflow";
+pub(crate) const TRAP_OOB: &str = "ys_trap_oob";
 
 /// printf formats and fixed strings for `print`.
 pub(crate) const FMT_INT: &str = ".Lfmt_int";
@@ -37,6 +45,10 @@ pub(crate) const FMT_STR: &str = ".Lfmt_str";
 pub(crate) const TRUE_S: &str = ".Ltrue_s";
 pub(crate) const FALSE_S: &str = ".Lfalse_s";
 pub(crate) const NULL_S: &str = ".Lnull_s";
+pub(crate) const FMT_TRAP: &str = ".Lfmt_trap";
+pub(crate) const FMT_TRAP_OOB: &str = ".Lfmt_trap_oob";
+pub(crate) const MSG_DIV0: &str = ".Lmsg_div0";
+pub(crate) const MSG_OVERFLOW: &str = ".Lmsg_overflow";
 
 /// The assembly symbol for a function: the entry `main` keeps its name
 /// (the C runtime calls it); everything else is suffixed with its module
@@ -58,6 +70,7 @@ pub(crate) struct Strings {
     bytes: String,
     descriptors: String,
     ids: HashMap<String, usize>,
+    locs: HashMap<String, usize>,
 }
 
 impl Strings {
@@ -80,6 +93,23 @@ impl Strings {
         self.ids.insert(text.to_string(), id);
         format!(".Lsd{id}")
     }
+
+    /// Interns a NUL-terminated location string for trap diagnostics
+    /// (ADR 0022); returns its label. Deduplicated per program.
+    pub(crate) fn intern_loc(&mut self, text: &str) -> String {
+        if let Some(&id) = self.locs.get(text) {
+            return format!(".Lloc{id}");
+        }
+        let id = self.locs.len();
+        let _ = writeln!(self.bytes, ".Lloc{id}:");
+        for chunk in text.as_bytes().chunks(16) {
+            let bytes: Vec<String> = chunk.iter().map(|b| b.to_string()).collect();
+            let _ = writeln!(self.bytes, "\t.byte {}", bytes.join(","));
+        }
+        let _ = writeln!(self.bytes, "\t.byte 0");
+        self.locs.insert(text.to_string(), id);
+        format!(".Lloc{id}")
+    }
 }
 
 fn validate_main(main_fn: &Function) -> Result<(), Diagnostic> {
@@ -100,6 +130,7 @@ pub fn compile(
     main_fn: &Function,
     graph: &ModuleGraph,
     res: &Resolutions,
+    map: &SourceMap,
 ) -> Result<String, Diagnostic> {
     validate_main(main_fn)?;
 
@@ -110,7 +141,7 @@ pub fn compile(
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             if let Item::Function(f) = item {
-                asm.push_str(&crate::ir::function(f, mi, res, &mut strings)?);
+                asm.push_str(&crate::ir::function(f, mi, res, &mut strings, map)?);
             }
         }
     }
@@ -130,6 +161,7 @@ pub fn dump_ir(
     main_fn: &Function,
     graph: &ModuleGraph,
     res: &Resolutions,
+    map: &SourceMap,
 ) -> Result<String, Diagnostic> {
     validate_main(main_fn)?;
     let mut output = String::new();
@@ -137,7 +169,7 @@ pub fn dump_ir(
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             if let Item::Function(f) = item {
-                let ir = crate::ir::lower_function(f, mi, res, &mut strings)?;
+                let ir = crate::ir::lower_function(f, mi, res, &mut strings, map)?;
                 if !output.is_empty() {
                     output.push('\n');
                 }
@@ -186,6 +218,40 @@ fn runtime() -> String {
 \tmovq %rax, 0(%rdi)
 \tpopq %rbp
 \tret
+{TRAP_DIV0}:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tmovq %rdi, %rcx
+\tleaq {MSG_DIV0}(%rip), %rdx
+\tleaq {FMT_TRAP}(%rip), %rsi
+\tmovl $2, %edi
+\txorl %eax, %eax
+\tcall {RT_DPRINTF}
+\tmovl $1, %edi
+\tcall {RT_EXIT}
+{TRAP_OVERFLOW}:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tmovq %rdi, %rcx
+\tleaq {MSG_OVERFLOW}(%rip), %rdx
+\tleaq {FMT_TRAP}(%rip), %rsi
+\tmovl $2, %edi
+\txorl %eax, %eax
+\tcall {RT_DPRINTF}
+\tmovl $1, %edi
+\tcall {RT_EXIT}
+{TRAP_OOB}:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tmovq %rdx, %r8
+\tmovq %rsi, %rcx
+\tmovq %rdi, %rdx
+\tleaq {FMT_TRAP_OOB}(%rip), %rsi
+\tmovl $2, %edi
+\txorl %eax, %eax
+\tcall {RT_DPRINTF}
+\tmovl $1, %edi
+\tcall {RT_EXIT}
 "
     )
 }
@@ -208,6 +274,14 @@ fn rodata() -> String {
 \t.string \"false\"
 {NULL_S}:
 \t.string \"null\"
+{FMT_TRAP}:
+\t.string \"error: %s\\n --> %s\\n\"
+{FMT_TRAP_OOB}:
+\t.string \"error: index %ld out of bounds (length %ld)\\n --> %s\\n\"
+{MSG_DIV0}:
+\t.string \"division by zero\"
+{MSG_OVERFLOW}:
+\t.string \"division overflow\"
 "
     )
 }

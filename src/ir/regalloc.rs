@@ -46,6 +46,8 @@ pub(super) fn uses_defs(inst: &Inst) -> (Vec<V>, Option<V>) {
         | Inst::RemPow2 { dst, src, .. }
         | Inst::DivMagic { dst, src, .. }
         | Inst::RemMagic { dst, src, .. } => (vec![*src], Some(*dst)),
+        // The trap stubs never return, so this is no call-clobber point.
+        Inst::DivChecked { dst, lhs, rhs, .. } => (vec![*lhs, *rhs], Some(*dst)),
         Inst::Neg(d, s) | Inst::NegF(d, s) | Inst::Not(d, s) => (vec![*s], Some(*d)),
         Inst::Call {
             dst, args, sret, ..
@@ -66,8 +68,8 @@ pub(super) fn uses_defs(inst: &Inst) -> (Vec<V>, Option<V>) {
         Inst::StoreHdr { hdr, buf, .. } => (vec![*hdr, *buf], None),
         Inst::BufSet { buf, val, .. } => (vec![*buf, *val], None),
         Inst::Len(d, arr) => (vec![*arr], Some(*d)),
-        Inst::Index { dst, arr, idx } => (vec![*arr, *idx], Some(*dst)),
-        Inst::IndexSet { arr, idx, val } => (vec![*arr, *idx, *val], None),
+        Inst::Index { dst, arr, idx, .. } => (vec![*arr, *idx], Some(*dst)),
+        Inst::IndexSet { arr, idx, val, .. } => (vec![*arr, *idx, *val], None),
         Inst::Ret(v) => (vec![*v], None),
         Inst::BrZero(v, _) => (vec![*v], None),
         Inst::Jmp(_) | Inst::Label(_) => (vec![], None),

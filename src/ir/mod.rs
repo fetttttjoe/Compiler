@@ -14,10 +14,11 @@
 //! copied exactly where the oracle copies: `let`, assignment, return,
 //! each call argument at evaluation time, and equality's left operand.
 //!
-//! Compiled behavior on the idiv traps — division by zero and
-//! i64::MIN / -1 — and on out-of-bounds (abort) is the deferred-trap
-//! policy: the interpreter diagnoses them, and the differential harness
-//! only diffs programs the interpreter runs cleanly.
+//! Runtime errors — division by zero, i64::MIN / -1, out-of-bounds —
+//! report the oracle's message plus a source location on stderr and
+//! exit 1 (ADR 0022), matching the interpreter's behavior class. The
+//! differential harness still diffs only programs the oracle runs
+//! cleanly; CLI tests pin the error-path parity.
 
 mod emit;
 mod layout;
@@ -28,6 +29,7 @@ use crate::ast::{BinOp, Function};
 use crate::check::Resolutions;
 use crate::codegen::Strings;
 use crate::diagnostic::Diagnostic;
+use crate::source::SourceMap;
 use crate::span::Span;
 use std::fmt;
 
@@ -50,8 +52,9 @@ pub(crate) fn lower_function(
     module: usize,
     res: &Resolutions,
     strings: &mut Strings,
+    map: &SourceMap,
 ) -> Result<FunctionIr, Diagnostic> {
-    lower::lower(f, module, res, strings)
+    lower::lower(f, module, res, strings, map)
 }
 
 pub(crate) fn function(
@@ -59,8 +62,9 @@ pub(crate) fn function(
     module: usize,
     res: &Resolutions,
     strings: &mut Strings,
+    map: &SourceMap,
 ) -> Result<String, Diagnostic> {
-    Ok(emit::emit(lower_function(f, module, res, strings)?))
+    Ok(emit::emit(lower_function(f, module, res, strings, map)?))
 }
 
 fn unsupported(what: &str, span: Span) -> Diagnostic {
@@ -115,6 +119,15 @@ pub(crate) enum Inst {
         dst: V,
         src: V,
         d: i64,
+    },
+    /// Integer division with a runtime divisor: divisor-zero and
+    /// MIN/-1 branch to the trap stubs before idiv (ADR 0022).
+    DivChecked {
+        dst: V,
+        lhs: V,
+        rhs: V,
+        rem: bool,
+        loc: String,
     },
     Neg(V, V),
     NegF(V, V),
@@ -181,16 +194,18 @@ pub(crate) enum Inst {
     },
     Len(V, V),
     /// Bounds-checked element read/write (ADR 0008's runtime check;
-    /// violation aborts — the deferred-trap policy).
+    /// violation reports and exits 1 via the OOB trap stub, ADR 0022).
     Index {
         dst: V,
         arr: V,
         idx: V,
+        loc: String,
     },
     IndexSet {
         arr: V,
         idx: V,
         val: V,
+        loc: String,
     },
     Ret(V),
     Jmp(Lbl),
@@ -258,6 +273,16 @@ impl fmt::Display for Inst {
             Inst::RemMagic { dst, src, d } => {
                 write!(f, "v{dst} = rem.magic v{src}, {d}")
             }
+            Inst::DivChecked {
+                dst,
+                lhs,
+                rhs,
+                rem,
+                loc,
+            } => {
+                let name = if *rem { "rem" } else { "div" };
+                write!(f, "v{dst} = {name}.checked v{lhs}, v{rhs} @ {loc}")
+            }
             Inst::Neg(dst, src) => write!(f, "v{dst} = neg.word v{src}"),
             Inst::NegF(dst, src) => write!(f, "v{dst} = neg.float v{src}"),
             Inst::Not(dst, src) => write!(f, "v{dst} = not v{src}"),
@@ -306,11 +331,11 @@ impl fmt::Display for Inst {
                 write!(f, "store_buffer v{val} -> v{buf}[{slot}]")
             }
             Inst::Len(dst, arr) => write!(f, "v{dst} = len v{arr}"),
-            Inst::Index { dst, arr, idx } => {
-                write!(f, "v{dst} = index v{arr}, v{idx}")
+            Inst::Index { dst, arr, idx, loc } => {
+                write!(f, "v{dst} = index v{arr}, v{idx} @ {loc}")
             }
-            Inst::IndexSet { arr, idx, val } => {
-                write!(f, "index_set v{arr}, v{idx}, v{val}")
+            Inst::IndexSet { arr, idx, val, loc } => {
+                write!(f, "index_set v{arr}, v{idx}, v{val} @ {loc}")
             }
             Inst::Ret(value) => write!(f, "ret v{value}"),
             Inst::Jmp(label) => write!(f, "jump L{label}"),

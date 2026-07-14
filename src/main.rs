@@ -163,7 +163,7 @@ fn print_ir(
     resolutions: &check::Resolutions,
     map: &SourceMap,
 ) {
-    match codegen::dump_ir(main_fn, graph, resolutions) {
+    match codegen::dump_ir(main_fn, graph, resolutions, map) {
         Ok(ir) => write_stdout(&ir),
         Err(diag) => exit_on_errors(&[diag], map),
     }
@@ -188,7 +188,7 @@ fn build(
     out: &std::path::Path,
     map: &SourceMap,
 ) {
-    let asm = match codegen::compile(main_fn, graph, resolutions) {
+    let asm = match codegen::compile(main_fn, graph, resolutions, map) {
         Ok(asm) => asm,
         Err(diag) => return exit_on_errors(&[diag], map),
     };

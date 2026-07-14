@@ -8,7 +8,7 @@
 use super::regalloc::{ARG_REGS, CALLEE_SAVED, Loc, allocate, intervals};
 use super::{FunctionIr, Inst, V, cc};
 use crate::ast::BinOp;
-use crate::codegen::{RT_ABORT, RT_FMOD, label_of};
+use crate::codegen::{RT_FMOD, TRAP_DIV0, TRAP_OOB, TRAP_OVERFLOW, label_of};
 use crate::syntax;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -250,6 +250,36 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                     at(*dst)
                 );
             }
+            Inst::DivChecked {
+                dst,
+                lhs,
+                rhs,
+                rem,
+                loc,
+            } => {
+                bounds += 1;
+                let ok0 = format!(".LTB{module}_{name}_{bounds}");
+                bounds += 1;
+                let ok1 = format!(".LTB{module}_{name}_{bounds}");
+                let _ = writeln!(
+                    a,
+                    "\tmovq {}, %rcx\n\ttestq %rcx, %rcx\n\tjne {ok0}\n\
+                     \tleaq {loc}(%rip), %rdi\n\tcall {TRAP_DIV0}\n{ok0}:",
+                    at(*rhs)
+                );
+                let _ = writeln!(
+                    a,
+                    "\tmovq {}, %rax\n\tcmpq $-1, %rcx\n\tjne {ok1}\n\
+                     \tmovabsq $-9223372036854775808, %rdx\n\tcmpq %rdx, %rax\n\tjne {ok1}\n\
+                     \tleaq {loc}(%rip), %rdi\n\tcall {TRAP_OVERFLOW}\n{ok1}:",
+                    at(*lhs)
+                );
+                a.push_str("\tcqto\n\tidivq %rcx\n");
+                if *rem {
+                    a.push_str("\tmovq %rdx, %rax\n");
+                }
+                let _ = writeln!(a, "\tmovq %rax, {}", at(*dst));
+            }
             Inst::DivMagic { dst, src, d } | Inst::RemMagic { dst, src, d } => {
                 let (m, shift) = magic_i64(*d);
                 let _ = writeln!(
@@ -309,10 +339,7 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                         let _ = writeln!(a, "\timulq {}, %rax", at(*rhs));
                     }
                     BinOp::Div | BinOp::Rem => {
-                        let _ = writeln!(a, "\tmovq {}, %rcx\n\tcqto\n\tidivq %rcx", at(*rhs));
-                        if matches!(op, BinOp::Rem) {
-                            a.push_str("\tmovq %rdx, %rax\n");
-                        }
+                        unreachable!("integer division lowers to DivChecked (ADR 0022)")
                     }
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                         let _ = writeln!(
@@ -424,32 +451,34 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                 let _ = writeln!(a, "\tmovq {}, %rax\n\tmovq 0(%rax), %rax", at(*arr));
                 let _ = writeln!(a, "\tmovq %rax, {}", at(*d));
             }
-            Inst::Index { dst, arr, idx } => {
+            Inst::Index { dst, arr, idx, loc } => {
                 bounds += 1;
                 let _ = writeln!(
                     a,
                     "\tmovq {}, %rax\n\tmovq {}, %rcx\n\tcmpq 0(%rax), %rcx\n\
-                     \tjb .LTB{module}_{name}_{bounds}\n\tcall {abort}\n\
+                     \tjb .LTB{module}_{name}_{bounds}\n\
+                     \tmovq %rcx, %rdi\n\tmovq 0(%rax), %rsi\n\tleaq {loc}(%rip), %rdx\n\
+                     \tcall {TRAP_OOB}\n\
                      .LTB{module}_{name}_{bounds}:\n\
                      \tmovq 16(%rax), %rax\n\tmovq (%rax,%rcx,8), %rax",
                     at(*arr),
-                    at(*idx),
-                    abort = RT_ABORT
+                    at(*idx)
                 );
                 let _ = writeln!(a, "\tmovq %rax, {}", at(*dst));
             }
-            Inst::IndexSet { arr, idx, val } => {
+            Inst::IndexSet { arr, idx, val, loc } => {
                 bounds += 1;
                 let _ = writeln!(
                     a,
                     "\tmovq {}, %rax\n\tmovq {}, %rcx\n\tcmpq 0(%rax), %rcx\n\
-                     \tjb .LTB{module}_{name}_{bounds}\n\tcall {abort}\n\
+                     \tjb .LTB{module}_{name}_{bounds}\n\
+                     \tmovq %rcx, %rdi\n\tmovq 0(%rax), %rsi\n\tleaq {loc}(%rip), %rdx\n\
+                     \tcall {TRAP_OOB}\n\
                      .LTB{module}_{name}_{bounds}:\n\
                      \tmovq 16(%rax), %rax\n\tmovq {}, %rdx\n\tmovq %rdx, (%rax,%rcx,8)",
                     at(*arr),
                     at(*idx),
-                    at(*val),
-                    abort = RT_ABORT
+                    at(*val)
                 );
             }
             Inst::Ret(v) => {

@@ -12,6 +12,7 @@ use crate::codegen::{
     RT_PUSH, Strings, TRUE_S, label_of,
 };
 use crate::diagnostic::Diagnostic;
+use crate::source::SourceMap;
 use crate::span::Span;
 use crate::types::Type;
 use std::collections::HashMap;
@@ -19,6 +20,7 @@ use std::collections::HashMap;
 pub(super) struct Lowerer<'a> {
     pub(super) res: &'a Resolutions,
     pub(super) strings: &'a mut Strings,
+    pub(super) map: &'a SourceMap,
     pub(super) module: usize,
     pub(super) insts: Vec<Inst>,
     pub(super) scopes: Vec<HashMap<String, Binding>>,
@@ -51,6 +53,7 @@ pub(super) fn lower(
     module: usize,
     res: &Resolutions,
     strings: &mut Strings,
+    map: &SourceMap,
 ) -> Result<FunctionIr, Diagnostic> {
     let sig = &res.sigs[&(module, f.name.clone())];
     let ret_kind = match &sig.ret {
@@ -65,6 +68,7 @@ pub(super) fn lower(
     let mut lo = Lowerer {
         res,
         strings,
+        map,
         module,
         insts: Vec::new(),
         scopes: vec![HashMap::new()],
@@ -172,6 +176,13 @@ impl Lowerer<'_> {
         let v = self.fresh(false);
         self.insts.push(Inst::LeaSym { dst: v, sym });
         v
+    }
+
+    /// The interned `file:line:col` label for a trap site (ADR 0022).
+    fn loc_of(&mut self, span: Span) -> String {
+        let r = self.map.resolve(span.start);
+        self.strings
+            .intern_loc(&format!("{}:{}:{}", r.file, r.line, r.col))
     }
 
     /// Copies a value into fresh private storage — the oracle's copy
@@ -354,11 +365,12 @@ impl Lowerer<'_> {
                     }
                 }
                 // The oracle evaluates the value before the target.
-                Expr::Index { base, index, .. } => {
+                Expr::Index { base, index, span } => {
+                    let loc = self.loc_of(*span);
                     let val = self.expr(value)?;
                     let arr = self.expr(base)?;
                     let idx = self.expr(index)?;
-                    self.insts.push(Inst::IndexSet { arr, idx, val });
+                    self.insts.push(Inst::IndexSet { arr, idx, val, loc });
                 }
                 Expr::Field { base, span, .. } => {
                     let slot = self
@@ -487,10 +499,14 @@ impl Lowerer<'_> {
                     rhs: n,
                 });
                 self.insts.push(Inst::BrZero(cond, end));
+                // The loop condition proves the bound; the check's trap
+                // path is unreachable but keeps one Index shape.
+                let loc = self.loc_of(iterable.span());
                 self.insts.push(Inst::Index {
                     dst: x,
                     arr,
                     idx: i,
+                    loc,
                 });
                 let cont = self.fresh_label();
                 let mut bindings = HashMap::new();
@@ -650,10 +666,11 @@ impl Lowerer<'_> {
                 Ok(hdr)
             }
             Expr::Index { base, index, span } => {
+                let loc = self.loc_of(*span);
                 let arr = self.expr(base)?;
                 let idx = self.expr(index)?;
                 let dst = self.fresh(matches!(self.ty(span), Some(Type::Float)));
-                self.insts.push(Inst::Index { dst, arr, idx });
+                self.insts.push(Inst::Index { dst, arr, idx, loc });
                 Ok(dst)
             }
             Expr::Field {
@@ -821,7 +838,7 @@ impl Lowerer<'_> {
                 return self.aggregate_eq(op, kind, lhs, rhs, span);
             }
         }
-        self.scalar_binary(op, lhs, rhs)
+        self.scalar_binary(op, lhs, rhs, span)
     }
 
     /// The payload type when the expression's recorded type is a value
@@ -1187,7 +1204,13 @@ impl Lowerer<'_> {
     /// Scalar arithmetic and comparisons — IEEE via SSE for floats,
     /// wrapping two's complement for ints, with constant right operands
     /// strength-reduced (immediates, shift sequences, magic multiplies).
-    fn scalar_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<V, Diagnostic> {
+    fn scalar_binary(
+        &mut self,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        span: Span,
+    ) -> Result<V, Diagnostic> {
         let float = self.is_float(lhs);
         let arith = !matches!(
             op,
@@ -1273,6 +1296,20 @@ impl Lowerer<'_> {
         }
         let l = self.expr(lhs)?;
         let r = self.expr(rhs)?;
+        // Runtime divisors go through the checked form: divisor zero and
+        // MIN/-1 report and exit instead of trapping (ADR 0022).
+        if !float && matches!(op, BinOp::Div | BinOp::Rem) {
+            let loc = self.loc_of(span);
+            let v = self.fresh(false);
+            self.insts.push(Inst::DivChecked {
+                dst: v,
+                lhs: l,
+                rhs: r,
+                rem: matches!(op, BinOp::Rem),
+                loc,
+            });
+            return Ok(v);
+        }
         let v = self.fresh(float && arith);
         self.insts.push(Inst::Bin {
             op,

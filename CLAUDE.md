@@ -29,8 +29,10 @@ lexer → parser → check (+narrow) → { interpreter | ir → codegen } → cc
 - Spans are file-global byte offsets: unique program-wide, safe as map
   keys across modules.
 - Runtime errors the interpreter diagnoses (div-by-zero, i64::MIN/-1,
-  out-of-bounds) are deferred traps in compiled code (SIGFPE/abort) —
-  documented policy, never silent corruption.
+  out-of-bounds) print the same message plus `file:line:col` on stderr
+  and exit 1 in compiled code too (ADR 0022). Remaining signal cases:
+  allocation exhaustion and native stack overflow — accepted, own ADR
+  when their trigger fires.
 
 ## Non-negotiable invariants
 

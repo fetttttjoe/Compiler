@@ -302,29 +302,61 @@ fn main_with_parameters_is_rejected_by_both_engines() {
     }
 }
 
-/// Compiled out-of-bounds access aborts (SIGABRT) — the deferred-trap
-/// policy, like SIGFPE for the idiv traps: never silent corruption. The
-/// interpreter diagnoses the same program cleanly.
+/// Compiled runtime errors report the oracle's message plus a source
+/// location and exit 1 (ADR 0022) — never a signal, never silent
+/// corruption. Both engines agree on exit code and core message.
 #[test]
-fn compiled_out_of_bounds_aborts_instead_of_corrupting() {
-    use std::os::unix::process::ExitStatusExt;
+fn compiled_runtime_errors_report_and_exit_1() {
     let dir = tempdir();
-    std::fs::write(
-        dir.join("oob.ys"),
-        "fun main(): int { const xs: int[] = [1, 2]; return xs[5]; }",
-    )
-    .unwrap();
-    let src = dir.join("oob.ys");
-    let out = compiler(&[src.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(1), "oracle diagnoses OOB");
+    let cases: [(&str, &str, &str); 3] = [
+        (
+            "rt_oob",
+            "fun main(): int { const xs: int[] = [1, 2]; return xs[5]; }",
+            "index 5 out of bounds (length 2)",
+        ),
+        (
+            "rt_div0",
+            "fun main(): int { var z: int = 0; return 7 / z; }",
+            "division by zero",
+        ),
+        (
+            "rt_ovf",
+            "fun main(): int {\n    var m: int = -9223372036854775807 - 1;\n    var d: int = -1;\n    return m % d;\n}",
+            "division overflow",
+        ),
+    ];
+    for (name, program, message) in cases {
+        let src = dir.join(format!("{name}.ys"));
+        std::fs::write(&src, program).unwrap();
+        let out = compiler(&[src.to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(1), "{name}: oracle exits 1");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(message),
+            "{name}: oracle message"
+        );
 
-    let bin = dir.join("oob");
-    let out = compiler(&["build", src.to_str().unwrap(), "-o", bin.to_str().unwrap()]);
-    assert!(out.status.success());
-    let run = std::process::Command::new(&bin)
-        .output()
-        .expect("failed to run built binary");
-    assert_eq!(run.status.signal(), Some(6), "SIGABRT, not silent reads");
+        let bin = dir.join(name);
+        let out = compiler(&["build", src.to_str().unwrap(), "-o", bin.to_str().unwrap()]);
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let run = std::process::Command::new(&bin)
+            .output()
+            .expect("failed to run built binary");
+        assert_eq!(
+            run.status.code(),
+            Some(1),
+            "{name}: exit code, not a signal"
+        );
+        let err = String::from_utf8_lossy(&run.stderr);
+        assert!(err.contains(message), "{name}: {err}");
+        assert!(
+            err.contains(&format!("{name}.ys:")),
+            "{name}: location: {err}"
+        );
+    }
 }
 
 /// The tag-word model (ADR 0021) leaves precise gates: `float?` printing
