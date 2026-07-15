@@ -116,6 +116,28 @@ pub(crate) fn kind_of(t: &Type, res: &Resolutions, fuel: usize) -> Option<Kind> 
     }
 }
 
+/// Whether a float can appear anywhere in `t`'s rendering — the
+/// aggregate-print gate (ADR 0025). A seen-set, not fuel: cyclic
+/// refstruct types are legal, printable values.
+pub(crate) fn contains_float(t: &Type, res: &Resolutions, seen: &mut Vec<(usize, String)>) -> bool {
+    match t {
+        Type::Float => true,
+        Type::Optional(inner) | Type::Array(inner) => contains_float(inner, res, seen),
+        Type::Struct(m, n) => {
+            let key = (*m, n.clone());
+            if seen.contains(&key) {
+                return false;
+            }
+            seen.push(key);
+            res.structs[&(*m, n.clone())]
+                .fields
+                .iter()
+                .any(|(_, ft)| contains_float(ft, res, seen))
+        }
+        _ => false,
+    }
+}
+
 /// Byte offset of field `index` in `def` — the sum of the sizes before
 /// it (C-style declaration-order layout, ADR 0009).
 pub(crate) fn offset_of(def: &StructType, index: usize, res: &Resolutions) -> Option<i64> {

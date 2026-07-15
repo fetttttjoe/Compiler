@@ -1,0 +1,18 @@
+struct Point { y: int, x: int }
+refstruct Chain { label: string, next: Chain? }
+
+fun main(): int {
+    print(Point { y: 2, x: 1 });
+    print([Point { y: 2, x: 1 }, Point { y: 4, x: 3 }]);
+    print(["ys", "prints"]);
+
+    var tail: Chain = Chain { label: "tail", next: null };
+    var head: Chain = Chain { label: "head", next: tail };
+    print(head);
+    tail.next = head;
+    print(head);
+
+    const nums: int?[] = [7, null];
+    print(nums);
+    return len(nums);
+}

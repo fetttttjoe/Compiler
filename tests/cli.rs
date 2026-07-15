@@ -401,14 +401,23 @@ fn recursive_value_struct_is_a_clean_diagnostic() {
     );
 }
 
-/// Printing aggregates needs the debug renderer the runtime doesn't
-/// have yet; scalars and strings print, the rest diagnoses.
+/// Floats inside aggregates stay gated with float printing itself
+/// (ADR 0025) — through every route, cyclic types included.
 #[test]
-fn printing_structs_is_not_yet_compilable() {
+fn printing_float_aggregates_is_gated() {
     assert_not_yet_compilable(
-        "printstruct",
-        "refstruct P { x: int }
-        fun main(): int { print(P { x: 1 }); return 0; }",
+        "printfloatstruct",
+        "struct V { f: float }
+        fun main(): int { print(V { f: 1.0 }); return 0; }",
+    );
+    assert_not_yet_compilable(
+        "printfloatarr",
+        "fun main(): int { print([1.5]); return 0; }",
+    );
+    assert_not_yet_compilable(
+        "printfloatdeep",
+        "refstruct N { f: float?, next: N? }
+        fun main(): int { print(N { f: null, next: null }); return 0; }",
     );
 }
 

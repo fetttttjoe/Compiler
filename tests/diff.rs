@@ -1677,6 +1677,117 @@ fn eight_param_recursion_stresses_repeated_stack_stores() {
     );
 }
 
+// ---- Aggregate printing (ADR 0025) ---------------------------------------
+
+#[test]
+fn struct_printing_sorts_fields_by_name() {
+    // Declaration order {z, a} — the render order is the oracle's
+    // name-sorted storage order, not the layout order.
+    diff(
+        "printsort",
+        "struct P { z: int, a: int }
+        fun main(): int { print(P { z: 1, a: 2 }); return 0; }",
+    );
+}
+
+#[test]
+fn aggregate_printing_covers_every_shape() {
+    diff(
+        "printshapes",
+        r#"struct P { z: int, a: int }
+        struct Tag { name: string, id: int }
+        refstruct R { p: P, label: string }
+        fun main(): int {
+            print([1, 2, 3]);
+            print(["a", "bb"]);
+            print([P { z: 1, a: 2 }, P { z: 3, a: 4 }]);
+            print(Tag { name: "x", id: 7 });
+            print(R { p: P { z: 5, a: 6 }, label: "boxed" });
+            print([[1], [], [2, 3]]);
+            var empty: int[] = [];
+            print(empty);
+            return 0;
+        }"#,
+    );
+}
+
+#[test]
+fn cyclic_refstructs_print_to_the_depth_budget() {
+    // The hop costs a level (render.rs): parity needs the SAME budget
+    // and the same "..." cutoffs.
+    diff(
+        "printcycle",
+        "refstruct Node { v: int, next: Node? }
+        fun main(): int {
+            var a: Node = Node { v: 1, next: null };
+            var b: Node = Node { v: 2, next: a };
+            a.next = b;
+            print(b);
+            print(a);
+            return 0;
+        }",
+    );
+}
+
+#[test]
+fn deep_array_nesting_hits_the_depth_floor() {
+    diff(
+        "printdeep",
+        "fun main(): int {
+            const xs: int[][][][][][][][][] = [[[[[[[[[7]]]]]]]]];
+            print(xs);
+            return 0;
+        }",
+    );
+}
+
+#[test]
+fn optional_aggregates_print_null_or_the_value() {
+    diff(
+        "printopt",
+        "struct P { z: int, a: int }
+        refstruct R { x: int }
+        fun main(): int {
+            var mp: P? = null;
+            print(mp);
+            mp = P { z: 9, a: 8 };
+            print(mp);
+            var mr: R? = null;
+            print(mr);
+            mr = R { x: 5 };
+            print(mr);
+            print([1, null, 3]);
+            var ss: string?[] = [null];
+            push(ss, \"s\");
+            print(ss);
+            return 0;
+        }",
+    );
+}
+
+#[test]
+fn unit_prints_after_its_side_effects() {
+    diff(
+        "printunit",
+        r#"fun noisy() { print("effect"); }
+        fun main(): int { print(noisy()); return 0; }"#,
+    );
+}
+
+#[test]
+fn printed_structs_embed_optionals_and_strings() {
+    diff(
+        "printembed",
+        r#"struct S { hit: int?, name: string, flag: bool }
+        fun main(): int {
+            print(S { hit: null, name: "n1", flag: true });
+            print(S { hit: 4, name: "n2", flag: false });
+            print([S { hit: 4, name: "n2", flag: false }]);
+            return 0;
+        }"#,
+    );
+}
+
 #[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as

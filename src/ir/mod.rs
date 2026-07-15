@@ -24,6 +24,7 @@ mod emit;
 mod layout;
 mod lower;
 mod regalloc;
+pub(crate) mod show;
 
 use crate::ast::{BinOp, Function};
 use crate::check::Resolutions;
@@ -52,9 +53,10 @@ pub(crate) fn lower_function(
     module: usize,
     res: &Resolutions,
     strings: &mut Strings,
+    printers: &mut show::Printers,
     map: &SourceMap,
 ) -> Result<FunctionIr, Diagnostic> {
-    lower::lower(f, module, res, strings, map)
+    lower::lower(f, module, res, strings, printers, map)
 }
 
 pub(crate) fn function(
@@ -62,9 +64,17 @@ pub(crate) fn function(
     module: usize,
     res: &Resolutions,
     strings: &mut Strings,
+    printers: &mut show::Printers,
     map: &SourceMap,
 ) -> Result<String, Diagnostic> {
-    Ok(emit::emit(lower_function(f, module, res, strings, map)?))
+    Ok(emit::emit(lower_function(
+        f, module, res, strings, printers, map,
+    )?))
+}
+
+/// Emits one already-lowered function (the generated show routines).
+pub(crate) fn emit_function(ir: FunctionIr) -> String {
+    emit::emit(ir)
 }
 
 fn unsupported(what: &str, span: Span) -> Diagnostic {

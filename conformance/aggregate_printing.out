@@ -1,0 +1,7 @@
+Point { x: 1, y: 2 }
+[Point { x: 1, y: 2 }, Point { x: 3, y: 4 }]
+[ys, prints]
+Chain { label: head, next: Chain { label: tail, next: null } }
+Chain { label: head, next: Chain { label: tail, next: Chain { label: head, next: Chain { label: ..., next: ... } } } }
+[7, null]
+=> Int(2)

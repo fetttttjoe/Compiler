@@ -3,7 +3,8 @@
 //! Anything the backend can't represent yet returns a clean
 //! "not yet compilable" diagnostic — there is no fallback path.
 
-use super::layout::{FUEL, Kind, kind_of, offset_of, ref_shaped};
+use super::layout::{FUEL, Kind, contains_float, kind_of, offset_of, ref_shaped};
+use super::show::{DEPTH_BUDGET, Printers};
 use super::{FunctionIr, Inst, Lbl, V, unsupported};
 use crate::ast::{BinOp, Expr, Function, Stmt, UnOp};
 use crate::check::Resolutions;
@@ -20,6 +21,7 @@ use std::collections::HashMap;
 pub(super) struct Lowerer<'a> {
     pub(super) res: &'a Resolutions,
     pub(super) strings: &'a mut Strings,
+    pub(super) printers: &'a mut Printers,
     pub(super) map: &'a SourceMap,
     pub(super) module: usize,
     pub(super) insts: Vec<Inst>,
@@ -53,6 +55,7 @@ pub(super) fn lower(
     module: usize,
     res: &Resolutions,
     strings: &mut Strings,
+    printers: &mut Printers,
     map: &SourceMap,
 ) -> Result<FunctionIr, Diagnostic> {
     let sig = &res.sigs[&(module, f.name.clone())];
@@ -65,6 +68,7 @@ pub(super) fn lower(
     let mut lo = Lowerer {
         res,
         strings,
+        printers,
         map,
         module,
         insts: Vec::new(),
@@ -189,7 +193,7 @@ impl Lowerer<'_> {
     fn loc_of(&mut self, span: Span) -> String {
         let r = self.map.resolve(span.start);
         self.strings
-            .intern_loc(&format!("{}:{}:{}", r.file, r.line, r.col))
+            .intern_cstr(&format!("{}:{}:{}", r.file, r.line, r.col))
     }
 
     /// Copies a value into fresh private storage — the oracle's copy
@@ -1730,16 +1734,57 @@ impl Lowerer<'_> {
                             self.insts.push(Inst::Label(end));
                             Ok(self.const_word(0))
                         }
-                        _ => Err(unsupported("printing values of this type", span)),
+                        // Aggregate payloads (struct?): the show
+                        // routine's tag wrapper handles null.
+                        _ => self.print_aggregate(value, &ty, span),
                     },
                     // Formatting parity with Rust's f64 Display is its
-                    // own project; aggregates need the debug renderer.
+                    // own project.
                     Type::Float => Err(unsupported("printing floats", span)),
-                    _ => Err(unsupported("printing values of this type", span)),
+                    // A unit-typed call: evaluate for effects, print
+                    // the oracle's literal text.
+                    Type::Unit => {
+                        self.expr(value)?;
+                        let sym = self.strings.intern_cstr("unit");
+                        let s = self.lea_sym(sym);
+                        Ok(self.print_cstr(s))
+                    }
+                    _ => self.print_aggregate(value, &ty, span),
                 }
             }
             _ => Err(unsupported(&format!("builtin '{name}'"), span)),
         }
+    }
+
+    /// Aggregates print through their monomorphized show routine
+    /// (ADR 0025); floats stay gated until float formatting exists.
+    fn print_aggregate(&mut self, value: &Expr, ty: &Type, span: Span) -> Result<V, Diagnostic> {
+        if contains_float(ty, self.res, &mut Vec::new()) {
+            return Err(unsupported("printing floats", span));
+        }
+        kind_of(ty, self.res, FUEL)
+            .ok_or_else(|| unsupported("printing values of this type", span))?;
+        let v = self.expr(value)?;
+        let name = self.printers.request(ty, self.res);
+        let depth = self.const_word(DEPTH_BUDGET);
+        let dst = self.fresh(false);
+        self.insts.push(Inst::Call {
+            dst,
+            label: label_of(0, &name),
+            args: vec![v, depth],
+            sret: None,
+        });
+        // print's contract: one trailing newline after the value.
+        let sym = self.strings.intern_cstr("\n");
+        let nl = self.lea_sym(sym);
+        let d = self.fresh(false);
+        self.insts.push(Inst::CallRt {
+            dst: d,
+            sym: RT_PRINTF,
+            args: vec![nl],
+            varargs: true,
+        });
+        Ok(self.const_word(0))
     }
 
     fn print_int(&mut self, v: V) -> V {

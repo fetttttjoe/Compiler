@@ -41,8 +41,11 @@ pub(crate) const TRAP_DIV0: &str = "ys_trap_div0";
 pub(crate) const TRAP_OVERFLOW: &str = "ys_trap_overflow";
 pub(crate) const TRAP_OOB: &str = "ys_trap_oob";
 
-/// printf formats and fixed strings for `print`.
+/// printf formats and fixed strings for `print`. The `_RAW` variants
+/// carry no newline — the show routines print fragments (ADR 0025).
 pub(crate) const FMT_INT: &str = ".Lfmt_int";
+pub(crate) const FMT_INT_RAW: &str = ".Lfmt_int_raw";
+pub(crate) const FMT_STR_RAW: &str = ".Lfmt_str_raw";
 pub(crate) const FMT_CSTR: &str = ".Lfmt_cstr";
 pub(crate) const FMT_STR: &str = ".Lfmt_str";
 pub(crate) const TRUE_S: &str = ".Ltrue_s";
@@ -97,9 +100,10 @@ impl Strings {
         format!(".Lsd{id}")
     }
 
-    /// Interns a NUL-terminated location string for trap diagnostics
-    /// (ADR 0022); returns its label. Deduplicated per program.
-    pub(crate) fn intern_loc(&mut self, text: &str) -> String {
+    /// Interns a NUL-terminated C string — trap locations (ADR 0022)
+    /// and print fragments (ADR 0025); returns its label. Deduplicated
+    /// per program.
+    pub(crate) fn intern_cstr(&mut self, text: &str) -> String {
         if let Some(&id) = self.locs.get(text) {
             return format!(".Lloc{id}");
         }
@@ -141,12 +145,24 @@ pub fn compile(
     // linker warns and grants an executable stack.
     let mut asm = String::from("\t.section .note.GNU-stack,\"\",@progbits\n\t.text\n");
     let mut strings = Strings::default();
+    let mut printers = crate::ir::show::Printers::default();
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             if let Item::Function(f) = item {
-                asm.push_str(&crate::ir::function(f, mi, res, &mut strings, map)?);
+                asm.push_str(&crate::ir::function(
+                    f,
+                    mi,
+                    res,
+                    &mut strings,
+                    &mut printers,
+                    map,
+                )?);
             }
         }
+    }
+    // The show routines requested by print sites (ADR 0025).
+    for ir in printers.build(res, &mut strings) {
+        asm.push_str(&crate::ir::emit_function(ir));
     }
     asm.push_str(&runtime());
     asm.push_str(&rodata());
@@ -169,16 +185,23 @@ pub fn dump_ir(
     validate_main(main_fn)?;
     let mut output = String::new();
     let mut strings = Strings::default();
+    let mut printers = crate::ir::show::Printers::default();
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             if let Item::Function(f) = item {
-                let ir = crate::ir::lower_function(f, mi, res, &mut strings, map)?;
+                let ir = crate::ir::lower_function(f, mi, res, &mut strings, &mut printers, map)?;
                 if !output.is_empty() {
                     output.push('\n');
                 }
                 let _ = writeln!(output, "{ir}");
             }
         }
+    }
+    for ir in printers.build(res, &mut strings) {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        let _ = writeln!(output, "{ir}");
     }
     Ok(output)
 }
@@ -314,6 +337,10 @@ fn rodata() -> String {
 \t.string \"%s\\n\"
 {FMT_STR}:
 \t.string \"%.*s\\n\"
+{FMT_INT_RAW}:
+\t.string \"%ld\"
+{FMT_STR_RAW}:
+\t.string \"%.*s\"
 {TRUE_S}:
 \t.string \"true\"
 {FALSE_S}:
