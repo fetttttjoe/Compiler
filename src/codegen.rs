@@ -44,6 +44,7 @@ pub(crate) const RT_EXIT: &str = "exit@PLT";
 pub(crate) const TRAP_DIV0: &str = "ys_trap_div0";
 pub(crate) const TRAP_OVERFLOW: &str = "ys_trap_overflow";
 pub(crate) const TRAP_OOB: &str = "ys_trap_oob";
+pub(crate) const TRAP_F2I: &str = "ys_trap_f2i";
 
 /// printf formats and fixed strings for `print`. The `_RAW` variants
 /// carry no newline — the show routines print fragments (ADR 0025).
@@ -59,6 +60,7 @@ pub(crate) const FMT_TRAP: &str = ".Lfmt_trap";
 pub(crate) const FMT_TRAP_OOB: &str = ".Lfmt_trap_oob";
 pub(crate) const MSG_DIV0: &str = ".Lmsg_div0";
 pub(crate) const MSG_OVERFLOW: &str = ".Lmsg_overflow";
+pub(crate) const MSG_F2I: &str = ".Lmsg_f2i";
 
 /// The assembly symbol for a function: the entry `main` keeps its name
 /// (the C runtime calls it); everything else is suffixed with its module
@@ -308,6 +310,17 @@ fn runtime() -> String {
 \tmovq %rsp, %rbp
 \tmovq %rdi, %rcx
 \tleaq {MSG_OVERFLOW}(%rip), %rdx
+\tleaq {FMT_TRAP}(%rip), %rsi
+\tmovl $2, %edi
+\txorl %eax, %eax
+\tcall {RT_DPRINTF}
+\tmovl $1, %edi
+\tcall {RT_EXIT}
+{TRAP_F2I}:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tmovq %rdi, %rcx
+\tleaq {MSG_F2I}(%rip), %rdx
 \tleaq {FMT_TRAP}(%rip), %rsi
 \tmovl $2, %edi
 \txorl %eax, %eax
@@ -616,6 +629,8 @@ fn rodata() -> String {
 \t.string \"division by zero\"
 {MSG_OVERFLOW}:
 \t.string \"division overflow\"
+{MSG_F2I}:
+\t.string \"invalid float to int conversion\"
 "
     )
 }

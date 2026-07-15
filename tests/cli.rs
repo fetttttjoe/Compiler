@@ -286,7 +286,12 @@ fn main_with_parameters_is_rejected_by_both_engines() {
 #[test]
 fn compiled_runtime_errors_report_and_exit_1() {
     let dir = tempdir();
-    let cases: [(&str, &str, &str); 3] = [
+    let cases: [(&str, &str, &str); 4] = [
+        (
+            "rt_f2i",
+            "fun main(): int { return int(0.0 / 0.0); }",
+            "invalid float to int conversion",
+        ),
         (
             "rt_oob",
             "fun main(): int { const xs: int[] = [1, 2]; return xs[5]; }",

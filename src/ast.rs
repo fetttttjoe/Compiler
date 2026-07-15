@@ -139,6 +139,13 @@ pub enum Expr {
         rhs: Box<Expr>,
         span: Span,
     },
+    /// `float(x)` / `int(x)` — explicit numeric conversion (ADR 0028).
+    /// The names are type keywords, so the form is unshadowable.
+    Convert {
+        to_float: bool,
+        arg: Box<Expr>,
+        span: Span,
+    },
     Binary {
         op: BinOp,
         lhs: Box<Expr>,
@@ -284,6 +291,7 @@ impl Expr {
             | Expr::Ident(_, s)
             | Expr::Null(s) => *s,
             Expr::Unary { span, .. }
+            | Expr::Convert { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Call { span, .. }
             | Expr::Field { span, .. }
@@ -304,6 +312,10 @@ impl Expr {
             Expr::Ident(name, _) => name.clone(),
             Expr::Null(_) => "null".to_string(),
             Expr::Unary { op, rhs, .. } => format!("({} {})", op.symbol(), rhs.sexpr()),
+            Expr::Convert { to_float, arg, .. } => {
+                let name = if *to_float { "float" } else { "int" };
+                format!("({name} {})", arg.sexpr())
+            }
             Expr::Binary { op, lhs, rhs, .. } => {
                 format!("({} {} {})", op.symbol(), lhs.sexpr(), rhs.sexpr())
             }

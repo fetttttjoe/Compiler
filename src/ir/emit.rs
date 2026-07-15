@@ -8,7 +8,7 @@
 use super::regalloc::{ARG_REGS, CALLEE_SAVED, Loc, allocate, intervals};
 use super::{FunctionIr, Inst, V, cc};
 use crate::ast::BinOp;
-use crate::codegen::{RT_FMOD, TRAP_DIV0, TRAP_OOB, TRAP_OVERFLOW, label_of};
+use crate::codegen::{RT_FMOD, TRAP_DIV0, TRAP_F2I, TRAP_OOB, TRAP_OVERFLOW, label_of};
 use crate::syntax;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -224,6 +224,34 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                     at(*s),
                     at(*d)
                 );
+            }
+            Inst::IntToFloat(d, s) => {
+                let _ = writeln!(
+                    a,
+                    "\tmovq {}, %rax\n\tcvtsi2sdq %rax, %xmm0\n\tmovq %xmm0, {}",
+                    at(*s),
+                    at(*d)
+                );
+            }
+            // cvttsd2si truncates toward zero and yields the sentinel
+            // 0x8000000000000000 exactly for NaN, out-of-range, and
+            // -2^63 — whose bit pattern (0xC3E0000000000000) is the one
+            // legal producer; anything else traps (ADR 0028).
+            Inst::FloatToInt { dst, src, loc } => {
+                bounds += 1;
+                let _ = writeln!(
+                    a,
+                    "\tmovq {}, %xmm0\n\tcvttsd2si %xmm0, %rax\n\
+                     \tmovabsq $0x8000000000000000, %rcx\n\tcmpq %rcx, %rax\n\
+                     \tjne .LTB{module}_{name}_{bounds}\n\
+                     \tmovq {}, %rdx\n\tmovabsq $0xC3E0000000000000, %rcx\n\
+                     \tcmpq %rcx, %rdx\n\tje .LTB{module}_{name}_{bounds}\n\
+                     \tleaq {loc}(%rip), %rdi\n\tcall {TRAP_F2I}\n\
+                     .LTB{module}_{name}_{bounds}:",
+                    at(*src),
+                    at(*src)
+                );
+                let _ = writeln!(a, "\tmovq %rax, {}", at(*dst));
             }
             Inst::Not(d, s) => {
                 let _ = writeln!(

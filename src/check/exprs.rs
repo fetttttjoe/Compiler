@@ -26,6 +26,41 @@ impl Checker<'_> {
             Expr::Str(_, _) => Type::Str,
             Expr::Ident(name, span) => self.lookup(name, *span),
             Expr::Null(_) => Type::Null,
+            // `float(x)` / `int(x)` cross-convert only (ADR 0028):
+            // identity conversions are rejected — a no-op spelled as a
+            // conversion is noise, not explicitness.
+            Expr::Convert {
+                to_float,
+                arg,
+                span,
+            } => {
+                let ty = self.type_of_expr(arg);
+                let (name, want, result) = if *to_float {
+                    ("float", Type::Int, Type::Float)
+                } else {
+                    ("int", Type::Float, Type::Int)
+                };
+                if poisoned(&ty) {
+                    return Type::Error;
+                }
+                if ty != want {
+                    let mut diag = Diagnostic::error(
+                        format!(
+                            "{name}() expects {}, found {}",
+                            self.type_name(&want),
+                            self.type_name(&ty)
+                        ),
+                        *span,
+                    );
+                    if ty == result {
+                        diag =
+                            diag.with_help(format!("the value is already {}", self.type_name(&ty)));
+                    }
+                    self.diagnostics.push(diag);
+                    return Type::Error;
+                }
+                result
+            }
             Expr::Unary { op, rhs, span } => {
                 let ty = self.type_of_expr(rhs);
                 match op {

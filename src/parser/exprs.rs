@@ -88,6 +88,18 @@ impl Parser<'_> {
                     Expr::Ident(name, tok.span)
                 }
             }
+            // `float(x)` / `int(x)` — conversion calls (ADR 0028); the
+            // type keywords cannot be shadowed, so this is unambiguous.
+            kind @ (TokenKind::IntType | TokenKind::FloatType) => {
+                self.expect(TokenKind::LeftParen);
+                let arg = self.parse_expr(0);
+                let end = self.expect(TokenKind::RightParen);
+                Expr::Convert {
+                    to_float: kind == TokenKind::FloatType,
+                    arg: Box::new(arg),
+                    span: tok.span.to(end),
+                }
+            }
             TokenKind::LeftParen => {
                 // Parentheses re-enable struct literals inside a condition.
                 let prev = self.struct_literals_allowed;

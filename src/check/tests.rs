@@ -66,6 +66,19 @@ fn diags(src: &str) -> Vec<Diagnostic> {
 }
 
 #[test]
+fn conversions_are_strictly_cross_typed() {
+    // ADR 0028: float() takes an int, int() takes a float; identity
+    // conversions are rejected with a help note.
+    let d = diags("fun f() { const x: float = float(1.5); }");
+    assert!(d[0].message.contains("float() expects int, found float"));
+    let d = diags("fun f() { const x: int = int(1); }");
+    assert!(d[0].message.contains("int() expects float, found int"));
+    let d = diags("fun f() { const x: int = int(true); }");
+    assert!(d[0].message.contains("int() expects float, found bool"));
+    assert!(diags("fun f(): int { return int(float(41) + 1.0); }").is_empty());
+}
+
+#[test]
 fn diverging_guards_narrow_the_code_after_the_if() {
     // ADR 0020: a branch that never falls through leaves the negation
     // facts (or the fall-through branch's survivors) behind.

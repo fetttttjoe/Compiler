@@ -642,6 +642,25 @@ impl Lowerer<'_> {
                 }
                 Ok(b.v)
             }
+            // float(i) is one convert; int(f) is the checked form —
+            // NaN and out-of-range report and exit 1 (ADR 0028).
+            Expr::Convert {
+                to_float,
+                arg,
+                span,
+            } => {
+                let v = self.expr(arg)?;
+                if *to_float {
+                    let dst = self.fresh(true);
+                    self.insts.push(Inst::IntToFloat(dst, v));
+                    Ok(dst)
+                } else {
+                    let loc = self.loc_of(*span);
+                    let dst = self.fresh(false);
+                    self.insts.push(Inst::FloatToInt { dst, src: v, loc });
+                    Ok(dst)
+                }
+            }
             Expr::Unary { op, rhs, .. } => {
                 let float = self.is_float(rhs);
                 let r = self.expr(rhs)?;

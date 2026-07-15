@@ -142,6 +142,15 @@ pub(crate) enum Inst {
     Neg(V, V),
     NegF(V, V),
     Not(V, V),
+    /// int → float: cvtsi2sd, nearest-even, total (ADR 0028).
+    IntToFloat(V, V),
+    /// float → int, truncating toward zero; NaN and out-of-range
+    /// report and exit 1 via the conversion trap stub (ADR 0028).
+    FloatToInt {
+        dst: V,
+        src: V,
+        loc: String,
+    },
     Call {
         dst: V,
         label: String,
@@ -302,6 +311,10 @@ impl fmt::Display for Inst {
                 write!(f, "v{dst} = {name}.checked v{lhs}, v{rhs} @ {loc}")
             }
             Inst::Neg(dst, src) => write!(f, "v{dst} = neg.word v{src}"),
+            Inst::IntToFloat(dst, src) => write!(f, "v{dst} = int_to_float v{src}"),
+            Inst::FloatToInt { dst, src, loc } => {
+                write!(f, "v{dst} = float_to_int v{src} @ {loc}")
+            }
             Inst::NegF(dst, src) => write!(f, "v{dst} = neg.float v{src}"),
             Inst::Not(dst, src) => write!(f, "v{dst} = not v{src}"),
             Inst::Call {

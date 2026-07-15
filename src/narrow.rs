@@ -80,6 +80,7 @@ pub(crate) fn contains_call(e: &Expr) -> bool {
     match e {
         Expr::Call { .. } => true,
         Expr::Unary { rhs, .. } => contains_call(rhs),
+        Expr::Convert { arg, .. } => contains_call(arg),
         Expr::Binary { lhs, rhs, .. } => contains_call(lhs) || contains_call(rhs),
         Expr::Field { base, .. } => contains_call(base),
         Expr::StructLit { fields, .. } => fields.iter().any(|(_, v)| contains_call(v)),

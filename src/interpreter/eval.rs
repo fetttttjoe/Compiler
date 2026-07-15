@@ -279,6 +279,27 @@ impl<'a> Interp<'a> {
                 let v = self.eval(rhs)?;
                 eval_unary(*op, v, *span)
             }
+            // ADR 0028: float(i) is total (nearest-even); int(f)
+            // truncates toward zero and is checked - valid iff
+            // f in [-2^63, 2^63), which NaN fails by comparing false.
+            Expr::Convert {
+                to_float,
+                arg,
+                span,
+            } => match (self.eval(arg)?, to_float) {
+                (Value::Int(i), true) => Ok(Value::Float(i as f64)),
+                (Value::Float(f), false) => {
+                    if (-9223372036854775808.0..9223372036854775808.0).contains(&f) {
+                        Ok(Value::Int(f as i64))
+                    } else {
+                        Err(Diagnostic::error(
+                            "invalid float to int conversion".to_string(),
+                            *span,
+                        ))
+                    }
+                }
+                _ => unreachable!("checker enforced the operand type"),
+            },
             Expr::Binary { op, lhs, rhs, span } => match op {
                 BinOp::And | BinOp::Or => self.eval_logical(*op, lhs, rhs),
                 // `??` is lazy: the fallback runs only when the left is null.

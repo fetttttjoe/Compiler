@@ -44,6 +44,20 @@ fn function_call() {
 }
 
 #[test]
+fn conversion_calls_parse_as_their_own_node() {
+    // ADR 0028: int/float are keywords, so this is not a Call.
+    assert_eq!(expr("int(x + 1.5)").sexpr(), "(int (+ x 1.5))");
+    assert_eq!(expr("float(3) / 2.0").sexpr(), "(/ (float 3) 2)");
+}
+
+#[test]
+fn conversion_without_parens_is_an_error() {
+    let (tokens, _) = lex("fun main(): int { return int; }");
+    let (_, diags) = parse(&tokens);
+    assert!(!diags.is_empty());
+}
+
+#[test]
 fn field_access_chains_left() {
     assert_eq!(expr("a.b.c").sexpr(), "(. (. a b) c)");
 }

@@ -225,6 +225,14 @@ fn division_by_zero_is_a_runtime_error() {
 }
 
 #[test]
+fn invalid_float_to_int_conversion_is_a_runtime_error() {
+    // ADR 0028: NaN and out-of-range floats have no int value.
+    assert!(run("fun main(): int { return int(0.0 / 0.0); }").is_err());
+    assert!(run("fun main(): int { return int(1.0 / 0.0); }").is_err());
+    assert!(run("fun main(): int { return int(9223372036854775808.0); }").is_err());
+}
+
+#[test]
 fn division_overflow_is_a_runtime_error() {
     // i64::MIN / -1 has no i64 result; like division by zero it must
     // be a diagnostic, not a panic (or SIGFPE once compiled).

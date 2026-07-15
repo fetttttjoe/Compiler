@@ -48,7 +48,11 @@ pub(super) fn uses_defs(inst: &Inst) -> (Vec<V>, Option<V>) {
         | Inst::RemMagic { dst, src, .. } => (vec![*src], Some(*dst)),
         // The trap stubs never return, so this is no call-clobber point.
         Inst::DivChecked { dst, lhs, rhs, .. } => (vec![*lhs, *rhs], Some(*dst)),
-        Inst::Neg(d, s) | Inst::NegF(d, s) | Inst::Not(d, s) => (vec![*s], Some(*d)),
+        Inst::Neg(d, s) | Inst::NegF(d, s) | Inst::Not(d, s) | Inst::IntToFloat(d, s) => {
+            (vec![*s], Some(*d))
+        }
+        // Like DivChecked: the trap never returns, so no call-clobber.
+        Inst::FloatToInt { dst, src, .. } => (vec![*src], Some(*dst)),
         Inst::Call {
             dst, args, sret, ..
         } => {

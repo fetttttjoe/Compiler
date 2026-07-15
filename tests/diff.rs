@@ -1972,6 +1972,49 @@ fn float_display_parity_on_random_bit_patterns() {
     );
 }
 
+// ---- int↔float conversion (ADR 0028) -------------------------------------
+
+#[test]
+fn conversions_round_trip_truncate_and_hit_the_boundaries() {
+    diff(
+        "convert",
+        "fun main(): int {
+            print(float(7));
+            print(int(1.9));
+            print(int(-1.9));
+            print(int(-0.0));
+            print(float(9007199254740993));
+            print(int(-9223372036854775808.0));
+            print(int(9223372036854774784.0));
+            var sum: float = 0.0;
+            var i: int = 1;
+            while i <= 10 {
+                sum = sum + 1.0 / float(i);
+                i = i + 1;
+            }
+            print(sum);
+            return int(sum * 100.0);
+        }",
+    );
+}
+
+#[test]
+fn conversions_flow_through_calls_and_aggregates() {
+    diff(
+        "convflow",
+        "struct Stat { avg: float, count: int }
+        fun mean(total: int, n: int): float { return float(total) / float(n); }
+        fun main(): int {
+            const s: Stat = Stat { avg: mean(7, 2), count: 2 };
+            print(s);
+            const xs: float[] = [0.5, 1.5, 2.5];
+            var acc: int = 0;
+            for x in xs { acc = acc + int(x * 2.0); }
+            return acc + int(s.avg);
+        }",
+    );
+}
+
 #[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as

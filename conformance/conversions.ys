@@ -1,0 +1,18 @@
+fun average(total: int, count: int): float {
+    return float(total) / float(count);
+}
+
+fun main(): int {
+    print(float(3));
+    print(int(2.75));
+    print(int(-2.75));
+    print(average(7, 2));
+
+    const dollars: float = 19.99;
+    const cents: int = int(dollars * 100.0 + 0.5);
+    print(cents);
+
+    print(float(9007199254740993));
+    print(int(-9223372036854775808.0));
+    return int(3.999);
+}
