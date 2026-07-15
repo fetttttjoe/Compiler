@@ -1299,6 +1299,77 @@ fn early_return_narrows_after_the_if() {
 }
 
 #[test]
+fn guard_return_narrows_locals() {
+    // ADR 0033: join facts reach a local bound in the same frame — the
+    // bind-guard-use shape works for params and locals alike.
+    let d = diags(
+        "refstruct P { x: int }\n\
+         fun get(): P? { return null; }\n\
+         fun f(): int {\n\
+             var p: P? = get();\n\
+             if p == null { return 0; }\n\
+             return p.x;\n\
+         }\n\
+         fun g(): int {\n\
+             var n: int? = null;\n\
+             if n == null { return 0; }\n\
+             return n + 1;\n\
+         }",
+    );
+    assert!(d.is_empty(), "unexpected: {d:?}");
+}
+
+#[test]
+fn guard_return_narrows_locals_in_nested_blocks() {
+    let d = diags(
+        "refstruct P { x: int }\n\
+         fun get(): P? { return null; }\n\
+         fun f(b: bool): int {\n\
+             if b {\n\
+                 var p: P? = get();\n\
+                 if p == null { return 1; }\n\
+                 return p.x;\n\
+             }\n\
+             return 0;\n\
+         }",
+    );
+    assert!(d.is_empty(), "unexpected: {d:?}");
+}
+
+#[test]
+fn guarded_local_unnarrows_on_reassignment() {
+    let d = diags(
+        "refstruct P { x: int }\n\
+         fun get(): P? { return null; }\n\
+         fun f(): int {\n\
+             var p: P? = get();\n\
+             if p == null { return 0; }\n\
+             p = get();\n\
+             return p.x;\n\
+         }",
+    );
+    assert!(d.iter().any(|e| e.message.contains("may be null")), "{d:?}");
+}
+
+#[test]
+fn rebinding_after_a_local_guard_unnarrows() {
+    // The outer guard's fact must not leak to a new inner binding; the
+    // outer binding stays narrowed after the inner scope dies.
+    let d = diags(
+        "refstruct P { x: int }\n\
+         fun get(): P? { return null; }\n\
+         fun f(b: bool): int {\n\
+             var p: P? = get();\n\
+             if p == null { return 0; }\n\
+             if b { const p: P? = get(); return p.x; }\n\
+             return p.x;\n\
+         }",
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert!(d[0].message.contains("may be null"), "{d:?}");
+}
+
+#[test]
 fn reassignment_inside_a_narrowed_block_unnarrows() {
     let d = diags(
         "refstruct P { x: int }\n\

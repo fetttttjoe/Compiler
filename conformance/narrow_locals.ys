@@ -1,0 +1,31 @@
+refstruct Node { v: int, next: Node? }
+
+fun head_value(): int {
+    // ADR 0033: guard-return narrows a local — no else-nesting.
+    var n: Node? = Node { v: 7, next: null };
+    if n == null { return -1; }
+    return n.v;
+}
+
+fun narrowed_arithmetic(): int {
+    var a: int? = 20;
+    if a == null { return -1; }
+    var b: int? = null;
+    if b == null { return a + 2; }
+    return a + b;
+}
+
+fun main(): int {
+    print(head_value());
+    print(narrowed_arithmetic());
+
+    // Field-path facts root at a local too.
+    var list: Node? = Node { v: 1, next: Node { v: 2, next: null } };
+    if list == null { return -2; }
+    if list.next == null { return -3; }
+    // Snapshot before any call: calls kill field-path facts (ADR 0007).
+    const second: int = list.next.v;
+    print(second);
+
+    return head_value() + narrowed_arithmetic() + second;
+}

@@ -14,10 +14,13 @@ innermost frame's `shadowed` set so that *outer* facts about a
 same-named *outer* binding stop applying. But `is_nonnull` consults
 `shadowed` before `facts` within each frame, so a fact established
 *after* the binding — necessarily about the new binding itself — is
-hidden by its own shadow. For a top-level `var`/`const` the shadow
-lands in the function's base frame, which lives until the function
-ends: no later guard on that local can ever narrow it. Parameters
-enter scope without `bind`, which is the whole asymmetry.
+hidden by its own shadow. Facts entering *inner* frames were never
+affected — `while cur != null` bodies and use-inside-the-branch
+narrowed locals fine. What failed is exactly the ADR 0020 join:
+`add_facts` lands in the current frame, and for a guard-return on a
+top-level local that is the base frame — the frame holding the
+local's own shadow. Parameters enter scope without `bind`, which is
+the whole asymmetry.
 
 ADR 0031 made bind-guard-use the daily shape (`open`, then guard,
 then use), and ADR 0034's error unions make it the canonical one —

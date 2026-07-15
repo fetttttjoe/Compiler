@@ -2220,6 +2220,55 @@ fn non_utf8_stdin_bytes_pass_through() {
 }
 
 #[test]
+fn guard_return_narrows_locals_in_both_engines() {
+    // ADR 0033: join facts on locals lower to unchecked payload reads —
+    // ref-shaped and value optionals alike.
+    diff(
+        "narrowlocals",
+        r#"refstruct P { v: int }
+        fun pick(flag: bool): P? {
+            if flag { return P { v: 40 }; }
+            return null;
+        }
+        fun main(): int {
+            var p: P? = pick(true);
+            if p == null { return 1; }
+            var n: int? = 2;
+            if n == null { return 2; }
+            return p.v + n;
+        }"#,
+    );
+}
+
+#[test]
+fn guard_return_narrows_a_local_file_handle() {
+    // ADR 0033 × ADR 0031: the bind-guard-use resource idiom without
+    // else-nesting, through file?, bool, and string? locals.
+    let dir = tempdir("ys-narrow-file");
+    let path = dir.join("t.txt");
+    let p = path.to_str().unwrap();
+    diff(
+        "narrowfile",
+        &format!(
+            r#"fun main(): int {{
+                const w: file? = open("{p}", "w");
+                if w == null {{ return 1; }}
+                var ok: int = 0;
+                if write(w, "seven=7\n") {{ ok = ok + 1; }}
+                if close(w) {{ ok = ok + 1; }}
+                const r: file? = open("{p}", "r");
+                if r == null {{ return 2; }}
+                const line: string? = readLine(r);
+                if line == null {{ return 3; }}
+                print(line);
+                print(close(r));
+                return ok;
+            }}"#
+        ),
+    );
+}
+
+#[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as
     // tall as the chain is long; 6000 terms used to overflow the checker's

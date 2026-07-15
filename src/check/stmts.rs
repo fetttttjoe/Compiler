@@ -77,14 +77,17 @@ impl Checker<'_> {
     }
 
     pub(super) fn is_nonnull(&self, path: &str) -> bool {
-        // Innermost first: a shadow hides outer facts for its own region,
-        // but a re-established inner fact wins over an outer shadow.
+        // Innermost first: a shadow hides outer facts for its own region.
+        // Within a frame, facts outrank the shadow — a fact can only enter
+        // after the frame's shadow exists, so it is about the shadowing
+        // binding itself (`bind` killed any stale same-frame fact,
+        // ADR 0033).
         for frame in self.nonnull.iter().rev() {
-            if frame.shadowed.iter().any(|s| covers(s, path)) {
-                return false;
-            }
             if frame.facts.contains(path) {
                 return true;
+            }
+            if frame.shadowed.iter().any(|s| covers(s, path)) {
+                return false;
             }
         }
         false

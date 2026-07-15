@@ -623,13 +623,16 @@ impl Checker<'_> {
 
     /// Declares `name` in the innermost scope and hides any narrowing of
     /// the same name while that scope's region lives — a new binding
-    /// shadows; outer facts return when the frame pops.
+    /// shadows; outer facts return when the frame pops. Same-frame facts
+    /// about the name die here: they were about the previous binding, and
+    /// facts outrank the shadow within a frame (ADR 0033).
     pub(super) fn bind(&mut self, name: &str, ty: Type, mutable: bool) {
         self.scopes
             .last_mut()
             .unwrap()
             .insert(name.to_string(), VarInfo { ty, mutable });
         if let Some(frame) = self.nonnull.last_mut() {
+            frame.facts.retain(|f| !covers(name, f));
             frame.shadowed.insert(name.to_string());
         }
     }
