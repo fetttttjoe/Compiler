@@ -147,7 +147,7 @@ pub(super) fn emit(ir: FunctionIr) -> String {
         }
     }
 
-    let mut bounds = 0usize;
+    let mut traps = 0usize;
     for (idx, inst) in insts.iter().enumerate() {
         match inst {
             Inst::Const(d, n) => match loc.get(d) {
@@ -238,16 +238,16 @@ pub(super) fn emit(ir: FunctionIr) -> String {
             // -2^63 — whose bit pattern (0xC3E0000000000000) is the one
             // legal producer; anything else traps (ADR 0028).
             Inst::FloatToInt { dst, src, loc } => {
-                bounds += 1;
+                traps += 1;
                 let _ = writeln!(
                     a,
                     "\tmovq {}, %xmm0\n\tcvttsd2si %xmm0, %rax\n\
                      \tmovabsq $0x8000000000000000, %rcx\n\tcmpq %rcx, %rax\n\
-                     \tjne .LTB{module}_{name}_{bounds}\n\
+                     \tjne .LTB{module}_{name}_{traps}\n\
                      \tmovq {}, %rdx\n\tmovabsq $0xC3E0000000000000, %rcx\n\
-                     \tcmpq %rcx, %rdx\n\tje .LTB{module}_{name}_{bounds}\n\
+                     \tcmpq %rcx, %rdx\n\tje .LTB{module}_{name}_{traps}\n\
                      \tleaq {loc}(%rip), %rdi\n\tcall {TRAP_F2I}\n\
-                     .LTB{module}_{name}_{bounds}:",
+                     .LTB{module}_{name}_{traps}:",
                     at(*src),
                     at(*src)
                 );
@@ -325,10 +325,10 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                 rem,
                 loc,
             } => {
-                bounds += 1;
-                let ok0 = format!(".LTB{module}_{name}_{bounds}");
-                bounds += 1;
-                let ok1 = format!(".LTB{module}_{name}_{bounds}");
+                traps += 1;
+                let ok0 = format!(".LTB{module}_{name}_{traps}");
+                traps += 1;
+                let ok1 = format!(".LTB{module}_{name}_{traps}");
                 let _ = writeln!(
                     a,
                     "\tmovq {}, %rcx\n\ttestq %rcx, %rcx\n\tjne {ok0}\n\
@@ -537,8 +537,8 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                 loc,
                 agg,
             } => {
-                bounds += 1;
-                let target = format!(".LTB{module}_{name}_{bounds}");
+                traps += 1;
+                let target = format!(".LTB{module}_{name}_{traps}");
                 a.push_str(&bounds_check(&at(*arr), &at(*idx), loc, &target));
                 match agg {
                     None => {
@@ -562,8 +562,8 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                 loc,
                 agg,
             } => {
-                bounds += 1;
-                let target = format!(".LTB{module}_{name}_{bounds}");
+                traps += 1;
+                let target = format!(".LTB{module}_{name}_{traps}");
                 a.push_str(&bounds_check(&at(*arr), &at(*idx), loc, &target));
                 match agg {
                     None => {

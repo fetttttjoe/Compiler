@@ -294,39 +294,6 @@ fn runtime() -> String {
 \tmovq %rax, 0(%rdi)
 \tpopq %rbp
 \tret
-{TRAP_DIV0}:
-\tpushq %rbp
-\tmovq %rsp, %rbp
-\tmovq %rdi, %rcx
-\tleaq {MSG_DIV0}(%rip), %rdx
-\tleaq {FMT_TRAP}(%rip), %rsi
-\tmovl $2, %edi
-\txorl %eax, %eax
-\tcall {RT_DPRINTF}
-\tmovl $1, %edi
-\tcall {RT_EXIT}
-{TRAP_OVERFLOW}:
-\tpushq %rbp
-\tmovq %rsp, %rbp
-\tmovq %rdi, %rcx
-\tleaq {MSG_OVERFLOW}(%rip), %rdx
-\tleaq {FMT_TRAP}(%rip), %rsi
-\tmovl $2, %edi
-\txorl %eax, %eax
-\tcall {RT_DPRINTF}
-\tmovl $1, %edi
-\tcall {RT_EXIT}
-{TRAP_F2I}:
-\tpushq %rbp
-\tmovq %rsp, %rbp
-\tmovq %rdi, %rcx
-\tleaq {MSG_F2I}(%rip), %rdx
-\tleaq {FMT_TRAP}(%rip), %rsi
-\tmovl $2, %edi
-\txorl %eax, %eax
-\tcall {RT_DPRINTF}
-\tmovl $1, %edi
-\tcall {RT_EXIT}
 {TRAP_OOB}:
 \tpushq %rbp
 \tmovq %rsp, %rbp
@@ -340,7 +307,38 @@ fn runtime() -> String {
 \tmovl $1, %edi
 \tcall {RT_EXIT}
 "
-    )
+    ) + &one_message_traps()
+}
+
+/// The one-message trap stubs (ADR 0022/0028): identical shape, the
+/// message register aside — location arrives in %rdi, dprintf reports
+/// on stderr, exit 1. The OOB trap stays bespoke (it also carries the
+/// index and length).
+fn one_message_traps() -> String {
+    [
+        (TRAP_DIV0, MSG_DIV0),
+        (TRAP_OVERFLOW, MSG_OVERFLOW),
+        (TRAP_F2I, MSG_F2I),
+    ]
+    .into_iter()
+    .map(|(stub, msg)| {
+        format!(
+            "\
+{stub}:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tmovq %rdi, %rcx
+\tleaq {msg}(%rip), %rdx
+\tleaq {FMT_TRAP}(%rip), %rsi
+\tmovl $2, %edi
+\txorl %eax, %eax
+\tcall {RT_DPRINTF}
+\tmovl $1, %edi
+\tcall {RT_EXIT}
+"
+        )
+    })
+    .collect()
 }
 
 /// The float formatter (ADR 0027), one self-contained unit: code, its

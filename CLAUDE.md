@@ -7,7 +7,7 @@ hidden machinery. Two engines, one semantics:
 - **Interpreter** (`src/interpreter.rs`) — the *normative spec* (ADR
   0017). Where behavior is in question, its answer is the language's
   answer. Its bugs are spec errata, fixed with an ADR note.
-- **Compiler backend** (`src/ir.rs` + `src/codegen.rs`) — one lowering
+- **Compiler backend** (`src/ir/` + `src/codegen.rs`) — one lowering
   to a vreg IR, linear-scan regalloc, AT&T assembly (ADR 0016/0018).
 
 ## Architecture
@@ -21,7 +21,7 @@ lexer → parser → check (+narrow) → { interpreter | ir → codegen } → cc
   backend reads types; it never derives one. Keep the type table total —
   any expression the checker types without recording breeds fallback
   bugs downstream.
-- `ir.rs` is the only backend. Multi-word values (structs, strings)
+- `src/ir/` is the only backend. Multi-word values (structs, strings)
   travel as pointers; copies happen exactly where the oracle copies
   (let, assign, return, each call arg at evaluation, equality's left
   operand). Evaluation order must match the oracle — side effects are
@@ -29,8 +29,9 @@ lexer → parser → check (+narrow) → { interpreter | ir → codegen } → cc
 - Spans are file-global byte offsets: unique program-wide, safe as map
   keys across modules.
 - Runtime errors the interpreter diagnoses (div-by-zero, i64::MIN/-1,
-  out-of-bounds) print the same message plus `file:line:col` on stderr
-  and exit 1 in compiled code too (ADR 0022). Remaining signal cases:
+  out-of-bounds, invalid float→int conversion) print the same message
+  plus `file:line:col` on stderr and exit 1 in compiled code too
+  (ADR 0022/0028). Remaining signal cases:
   allocation exhaustion and native stack overflow — accepted, own ADR
   when their trigger fires.
 

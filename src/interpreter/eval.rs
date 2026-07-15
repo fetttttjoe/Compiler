@@ -292,10 +292,7 @@ impl<'a> Interp<'a> {
                     if (-9223372036854775808.0..9223372036854775808.0).contains(&f) {
                         Ok(Value::Int(f as i64))
                     } else {
-                        Err(Diagnostic::error(
-                            "invalid float to int conversion".to_string(),
-                            *span,
-                        ))
+                        Err(Diagnostic::error("invalid float to int conversion", *span))
                     }
                 }
                 _ => unreachable!("checker enforced the operand type"),
