@@ -21,8 +21,11 @@ use std::fmt::Write;
 // share these constants — never a re-spelled literal (the lexer's
 // syntax.rs discipline, applied to the backend).
 
-/// The in-assembly array-push runtime routine.
+/// The in-assembly array-push runtime routines: `ys_push` stores one
+/// word from a register; `ys_push_n` memcpys a stride's worth of bytes
+/// from a pointer (multi-word elements, ADR 0023).
 pub(crate) const RT_PUSH: &str = "ys_push";
+pub(crate) const RT_PUSH_N: &str = "ys_push_n";
 pub(crate) const RT_PRINTF: &str = "printf@PLT";
 pub(crate) const RT_MALLOC: &str = "malloc@PLT";
 pub(crate) const RT_REALLOC: &str = "realloc@PLT";
@@ -183,9 +186,11 @@ pub fn dump_ir(
 /// The in-assembly runtime, appended to every program. Arrays follow ADR
 /// 0014: a handle points at a `{len, cap, data*}` header, elements are
 /// inline 8-byte values, buffers come from libc malloc/realloc and are
-/// never freed (the arena/leak story of ADR 0009/0015). `ys_push` grows
-/// by doubling (min 4). The label can't collide with user code — every
-/// user symbol except the entry `main` carries a `_<module>` suffix.
+/// never freed (the arena/leak story of ADR 0009/0015). Both push
+/// routines grow by doubling (min 4); `ys_push_n` takes
+/// `(hdr, src*, stride_bytes)` and memcpys the element in (ADR 0023).
+/// The labels can't collide with user code — every user symbol except
+/// the entry `main` carries a `_<module>` suffix.
 fn runtime() -> String {
     format!(
         "\
@@ -214,6 +219,47 @@ fn runtime() -> String {
 .Lys_push_store:
 \tmovq 16(%rdi), %rcx
 \tmovq %rsi, (%rcx,%rax,8)
+\tincq %rax
+\tmovq %rax, 0(%rdi)
+\tpopq %rbp
+\tret
+{RT_PUSH_N}:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tmovq 0(%rdi), %rax
+\tcmpq 8(%rdi), %rax
+\tjb .Lys_push_n_store
+\tmovq 8(%rdi), %rcx
+\ttestq %rcx, %rcx
+\tjne .Lys_push_n_double
+\tmovq $2, %rcx
+.Lys_push_n_double:
+\taddq %rcx, %rcx
+\tmovq %rcx, 8(%rdi)
+\tpushq %rdi
+\tpushq %rsi
+\tpushq %rdx
+\tpushq %rax
+\tmovq %rcx, %rsi
+\timulq %rdx, %rsi
+\tmovq 16(%rdi), %rdi
+\tcall {RT_REALLOC}
+\tmovq %rax, %rcx
+\tpopq %rax
+\tpopq %rdx
+\tpopq %rsi
+\tpopq %rdi
+\tmovq %rcx, 16(%rdi)
+.Lys_push_n_store:
+\tpushq %rdi
+\tpushq %rax
+\tmovq 16(%rdi), %rcx
+\timulq %rdx, %rax
+\taddq %rax, %rcx
+\tmovq %rcx, %rdi
+\tcall {RT_MEMCPY}
+\tpopq %rax
+\tpopq %rdi
 \tincq %rax
 \tmovq %rax, 0(%rdi)
 \tpopq %rbp

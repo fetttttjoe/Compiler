@@ -73,10 +73,12 @@ pub(crate) fn kind_of(t: &Type, res: &Resolutions, fuel: usize) -> Option<Kind> 
                 no_memcmp,
             })
         }
-        // Elements must be single words (ADR 0014's stride seat); a
-        // value-optional element would alias 0 with null.
+        // The array is always a one-word handle; elements of any
+        // compilable kind store inline at a compile-time stride
+        // (ADR 0023) — the element only needs a kind of its own.
         Type::Array(inner) => {
-            (kind_of(inner, res, fuel.checked_sub(1)?)? == Kind::Word).then_some(Kind::Word)
+            kind_of(inner, res, fuel.checked_sub(1)?)?;
+            Some(Kind::Word)
         }
         Type::Str => Some(Kind::Str),
         Type::Struct(m, n) => {

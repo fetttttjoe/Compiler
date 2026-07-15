@@ -9,7 +9,7 @@ use crate::ast::{BinOp, Expr, Function, Stmt, UnOp};
 use crate::check::Resolutions;
 use crate::codegen::{
     FALSE_S, FMT_CSTR, FMT_INT, FMT_STR, NULL_S, RT_MALLOC, RT_MEMCMP, RT_MEMCPY, RT_PRINTF,
-    RT_PUSH, Strings, TRUE_S, label_of,
+    RT_PUSH, RT_PUSH_N, Strings, TRUE_S, label_of,
 };
 use crate::diagnostic::Diagnostic;
 use crate::source::SourceMap;
@@ -135,6 +135,16 @@ impl Lowerer<'_> {
             .iter()
             .rev()
             .find_map(|scope| scope.get(name).cloned())
+    }
+
+    /// The element type behind an array-typed expression's recorded
+    /// type. Declared positions re-record literals as the slot's type
+    /// (check_literal_against), so strides always match consumers.
+    fn elem_ty(&self, e: &Expr) -> Result<Type, Diagnostic> {
+        match self.ty(&e.span()) {
+            Some(Type::Array(inner)) => Ok((**inner).clone()),
+            _ => Err(unsupported("this array", e.span())),
+        }
     }
 
     /// The payload type when `ty` lowers to Opt-shaped storage.
@@ -367,10 +377,28 @@ impl Lowerer<'_> {
                 // The oracle evaluates the value before the target.
                 Expr::Index { base, index, span } => {
                     let loc = self.loc_of(*span);
-                    let val = self.expr(value)?;
+                    let elem = self.elem_ty(base)?;
+                    let ek = kind_of(&elem, self.res, FUEL)
+                        .ok_or_else(|| unsupported("arrays of this element type", *span))?;
+                    let val = self.expr_into(value, &elem)?;
+                    // Snapshot at evaluation: the target's index
+                    // expression may push and move the buffer this
+                    // pointer aims into.
+                    let val = if ek == Kind::Word {
+                        val
+                    } else {
+                        self.snapshot(val, ek.words())
+                    };
                     let arr = self.expr(base)?;
                     let idx = self.expr(index)?;
-                    self.insts.push(Inst::IndexSet { arr, idx, val, loc });
+                    let agg = (ek != Kind::Word).then(|| ek.words());
+                    self.insts.push(Inst::IndexSet {
+                        arr,
+                        idx,
+                        val,
+                        loc,
+                        agg,
+                    });
                 }
                 Expr::Field { base, span, .. } => {
                     let slot = self
@@ -478,13 +506,18 @@ impl Lowerer<'_> {
             } => {
                 // Live iteration, the oracle's contract: length re-read
                 // every step, element copied out before the body runs.
-                let elem_float = matches!(
-                    self.ty(&iterable.span()),
-                    Some(Type::Array(inner)) if **inner == Type::Float
-                );
+                let elem = self.elem_ty(iterable)?;
+                let ek = kind_of(&elem, self.res, FUEL)
+                    .ok_or_else(|| unsupported("arrays of this element type", iterable.span()))?;
                 let arr = self.expr(iterable)?;
                 let i = self.const_word(0);
-                let x = self.fresh(elem_float);
+                let x = self.fresh(elem == Type::Float);
+                if ek != Kind::Word {
+                    self.insts.push(Inst::Temp {
+                        dst: x,
+                        words: ek.words(),
+                    });
+                }
                 let top = self.fresh_label();
                 let end = self.fresh_label();
                 self.insts.push(Inst::Label(top));
@@ -502,19 +535,37 @@ impl Lowerer<'_> {
                 // The loop condition proves the bound; the check's trap
                 // path is unreachable but keeps one Index shape.
                 let loc = self.loc_of(iterable.span());
-                self.insts.push(Inst::Index {
-                    dst: x,
-                    arr,
-                    idx: i,
-                    loc,
-                });
+                if ek == Kind::Word {
+                    self.insts.push(Inst::Index {
+                        dst: x,
+                        arr,
+                        idx: i,
+                        loc,
+                        agg: None,
+                    });
+                } else {
+                    // Interior pointer, then the per-step copy-out.
+                    let p = self.fresh(false);
+                    self.insts.push(Inst::Index {
+                        dst: p,
+                        arr,
+                        idx: i,
+                        loc,
+                        agg: Some(ek.words()),
+                    });
+                    self.insts.push(Inst::CopyW {
+                        dst: x,
+                        src: p,
+                        words: ek.words(),
+                    });
+                }
                 let cont = self.fresh_label();
                 let mut bindings = HashMap::new();
                 bindings.insert(
                     name.clone(),
                     Binding {
                         v: x,
-                        opt_inner: None,
+                        opt_inner: self.opt_inner_of(&elem),
                     },
                 );
                 if let Some(ix) = index {
@@ -624,20 +675,25 @@ impl Lowerer<'_> {
             Expr::Binary { op, lhs, rhs, span } => self.binary(*op, lhs, rhs, *span),
             Expr::Call { callee, args, span } => self.call(callee, args, *span),
             Expr::ArrayLit { elements, span } => {
-                // A null element could make the literal an `int?[]` — a
-                // value-optional array the word model can't represent.
-                if let Some(null) = elements.iter().find(|e| matches!(e, Expr::Null(_))) {
-                    return Err(unsupported(
-                        "array literals with null elements",
-                        null.span(),
-                    ));
+                // check_literal_against records the DECLARED type; an
+                // optional declaration (T[]?) still builds a plain
+                // array value — unwrap to the element.
+                let mut lit_ty = self
+                    .ty(span)
+                    .cloned()
+                    .ok_or_else(|| unsupported("this array literal", *span))?;
+                while let Type::Optional(inner) = lit_ty {
+                    lit_ty = *inner;
                 }
-                for e in elements {
-                    if self.kind(e, *span)? != Kind::Word {
-                        return Err(unsupported("arrays of multi-word values", e.span()));
-                    }
-                }
-                // Header {len, cap, data*} plus buffer, per ADR 0014.
+                let Type::Array(elem) = lit_ty else {
+                    return Err(unsupported("this array literal", *span));
+                };
+                let elem = *elem;
+                let ek = kind_of(&elem, self.res, FUEL)
+                    .ok_or_else(|| unsupported("arrays of this element type", *span))?;
+                let stride = 8 * ek.words() as i64;
+                // Header {len, cap, data*} plus buffer, per ADR 0014;
+                // elements sit at a compile-time stride (ADR 0023).
                 let c24 = self.const_word(24);
                 let hdr = self.fresh(false);
                 self.insts.push(Inst::CallRt {
@@ -646,7 +702,7 @@ impl Lowerer<'_> {
                     args: vec![c24],
                     varargs: false,
                 });
-                let size = self.const_word(8 * elements.len().max(1) as i64);
+                let size = self.const_word((stride * elements.len() as i64).max(8));
                 let buf = self.fresh(false);
                 self.insts.push(Inst::CallRt {
                     dst: buf,
@@ -659,18 +715,46 @@ impl Lowerer<'_> {
                     buf,
                     len: elements.len(),
                 });
+                // Store as each element evaluates — the oracle's copy
+                // point; optional elements wrap here (the fits rule).
                 for (slot, element) in elements.iter().enumerate() {
-                    let val = self.expr(element)?;
-                    self.insts.push(Inst::BufSet { buf, slot, val });
+                    let val = self.expr_into(element, &elem)?;
+                    if ek == Kind::Word {
+                        self.insts.push(Inst::BufSet { buf, slot, val });
+                    } else {
+                        let p = self.lea_at(buf, stride * slot as i64);
+                        self.insts.push(Inst::CopyW {
+                            dst: p,
+                            src: val,
+                            words: ek.words(),
+                        });
+                    }
                 }
                 Ok(hdr)
             }
             Expr::Index { base, index, span } => {
                 let loc = self.loc_of(*span);
+                // The recorded type IS the element type — index
+                // expressions are never narrowable places. Aggregates
+                // (any width) read as interior pointers; consumers copy.
+                let agg = match self.ty(span) {
+                    None => None,
+                    Some(t) => {
+                        let k = kind_of(t, self.res, FUEL)
+                            .ok_or_else(|| unsupported("arrays of this element type", *span))?;
+                        (k != Kind::Word).then(|| k.words())
+                    }
+                };
                 let arr = self.expr(base)?;
                 let idx = self.expr(index)?;
                 let dst = self.fresh(matches!(self.ty(span), Some(Type::Float)));
-                self.insts.push(Inst::Index { dst, arr, idx, loc });
+                self.insts.push(Inst::Index {
+                    dst,
+                    arr,
+                    idx,
+                    loc,
+                    agg,
+                });
                 Ok(dst)
             }
             Expr::Field {
@@ -1567,16 +1651,30 @@ impl Lowerer<'_> {
                 Ok(dst)
             }
             ("push", [array, value]) => {
-                if self.kind(value, span)? != Kind::Word {
-                    return Err(unsupported("arrays of multi-word values", value.span()));
-                }
+                let elem = self.elem_ty(array)?;
+                let ek = kind_of(&elem, self.res, FUEL)
+                    .ok_or_else(|| unsupported("arrays of this element type", value.span()))?;
                 let arr = self.expr(array)?;
-                let val = self.expr(value)?;
+                let val = self.expr_into(value, &elem)?;
+                if ek == Kind::Word {
+                    let dst = self.fresh(false);
+                    self.insts.push(Inst::CallRt {
+                        dst,
+                        sym: RT_PUSH,
+                        args: vec![arr, val],
+                        varargs: false,
+                    });
+                    return Ok(dst);
+                }
+                // Call-argument discipline: snapshot at evaluation —
+                // also keeps push(xs, xs[0]) safe across the realloc.
+                let snap = self.snapshot(val, ek.words());
+                let stride = self.const_word(8 * ek.words() as i64);
                 let dst = self.fresh(false);
                 self.insts.push(Inst::CallRt {
                     dst,
-                    sym: RT_PUSH,
-                    args: vec![arr, val],
+                    sym: RT_PUSH_N,
+                    args: vec![arr, snap, stride],
                     varargs: false,
                 });
                 Ok(dst)

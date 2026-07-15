@@ -193,19 +193,27 @@ pub(crate) enum Inst {
         val: V,
     },
     Len(V, V),
-    /// Bounds-checked element read/write (ADR 0008's runtime check;
-    /// violation reports and exits 1 via the OOB trap stub, ADR 0022).
+    /// Bounds-checked element read (ADR 0008's runtime check; violation
+    /// reports and exits 1 via the OOB trap stub, ADR 0022). `agg` is
+    /// the pointer-shaped discipline (ADR 0023): `None` loads a word
+    /// element's value; `Some(words)` produces an interior pointer to
+    /// `data + idx*stride` — consumers copy. The kind decides, not the
+    /// width: a one-word value struct is still pointer-shaped.
     Index {
         dst: V,
         arr: V,
         idx: V,
         loc: String,
+        agg: Option<usize>,
     },
+    /// Bounds-checked element write: `None` stores `val`'s value;
+    /// `Some(words)` copies that many words from the `val` pointer.
     IndexSet {
         arr: V,
         idx: V,
         val: V,
         loc: String,
+        agg: Option<usize>,
     },
     Ret(V),
     Jmp(Lbl),
@@ -331,12 +339,26 @@ impl fmt::Display for Inst {
                 write!(f, "store_buffer v{val} -> v{buf}[{slot}]")
             }
             Inst::Len(dst, arr) => write!(f, "v{dst} = len v{arr}"),
-            Inst::Index { dst, arr, idx, loc } => {
-                write!(f, "v{dst} = index v{arr}, v{idx} @ {loc}")
-            }
-            Inst::IndexSet { arr, idx, val, loc } => {
-                write!(f, "index_set v{arr}, v{idx}, v{val} @ {loc}")
-            }
+            Inst::Index {
+                dst,
+                arr,
+                idx,
+                loc,
+                agg,
+            } => match agg {
+                None => write!(f, "v{dst} = index v{arr}, v{idx} @ {loc}"),
+                Some(w) => write!(f, "v{dst} = index.{w}w v{arr}, v{idx} @ {loc}"),
+            },
+            Inst::IndexSet {
+                arr,
+                idx,
+                val,
+                loc,
+                agg,
+            } => match agg {
+                None => write!(f, "index_set v{arr}, v{idx}, v{val} @ {loc}"),
+                Some(w) => write!(f, "index_set.{w}w v{arr}, v{idx}, v{val} @ {loc}"),
+            },
             Inst::Ret(value) => write!(f, "ret v{value}"),
             Inst::Jmp(label) => write!(f, "jump L{label}"),
             Inst::BrZero(value, label) => write!(f, "br_zero v{value}, L{label}"),

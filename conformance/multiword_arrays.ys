@@ -1,0 +1,33 @@
+struct Point { x: int, y: int }
+
+fun total(ps: Point[]): int {
+    var sum: int = 0;
+    for p in ps {
+        sum = sum + p.x * p.y;
+    }
+    return sum;
+}
+
+fun main(): int {
+    var ps: Point[] = [Point { x: 1, y: 2 }, Point { x: 3, y: 4 }];
+    push(ps, ps[0]);
+    ps[0] = Point { x: 5, y: 6 };
+    print(total(ps));
+
+    var names: string[] = ["compile", "the"];
+    push(names, names[0] + "r");
+    names[0] = "ys";
+    for n in names {
+        print(n);
+    }
+    print(names[2] == "compiler");
+
+    var scores: int?[] = [10, null];
+    push(scores, 32);
+    var earned: int = 0;
+    for s in scores {
+        print(s);
+        earned = earned + (s ?? 0);
+    }
+    return earned;
+}

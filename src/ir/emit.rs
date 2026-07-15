@@ -451,7 +451,13 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                 let _ = writeln!(a, "\tmovq {}, %rax\n\tmovq 0(%rax), %rax", at(*arr));
                 let _ = writeln!(a, "\tmovq %rax, {}", at(*d));
             }
-            Inst::Index { dst, arr, idx, loc } => {
+            Inst::Index {
+                dst,
+                arr,
+                idx,
+                loc,
+                agg,
+            } => {
                 bounds += 1;
                 let _ = writeln!(
                     a,
@@ -459,14 +465,32 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                      \tjb .LTB{module}_{name}_{bounds}\n\
                      \tmovq %rcx, %rdi\n\tmovq 0(%rax), %rsi\n\tleaq {loc}(%rip), %rdx\n\
                      \tcall {TRAP_OOB}\n\
-                     .LTB{module}_{name}_{bounds}:\n\
-                     \tmovq 16(%rax), %rax\n\tmovq (%rax,%rcx,8), %rax",
+                     .LTB{module}_{name}_{bounds}:",
                     at(*arr),
                     at(*idx)
                 );
+                match agg {
+                    None => {
+                        a.push_str("\tmovq 16(%rax), %rax\n\tmovq (%rax,%rcx,8), %rax\n");
+                    }
+                    // Interior pointer: data + idx*stride (ADR 0023).
+                    Some(words) => {
+                        let _ = writeln!(
+                            a,
+                            "\tmovq 16(%rax), %rax\n\timulq ${}, %rcx, %rcx\n\taddq %rcx, %rax",
+                            8 * *words
+                        );
+                    }
+                }
                 let _ = writeln!(a, "\tmovq %rax, {}", at(*dst));
             }
-            Inst::IndexSet { arr, idx, val, loc } => {
+            Inst::IndexSet {
+                arr,
+                idx,
+                val,
+                loc,
+                agg,
+            } => {
                 bounds += 1;
                 let _ = writeln!(
                     a,
@@ -474,12 +498,30 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                      \tjb .LTB{module}_{name}_{bounds}\n\
                      \tmovq %rcx, %rdi\n\tmovq 0(%rax), %rsi\n\tleaq {loc}(%rip), %rdx\n\
                      \tcall {TRAP_OOB}\n\
-                     .LTB{module}_{name}_{bounds}:\n\
-                     \tmovq 16(%rax), %rax\n\tmovq {}, %rdx\n\tmovq %rdx, (%rax,%rcx,8)",
+                     .LTB{module}_{name}_{bounds}:",
                     at(*arr),
-                    at(*idx),
-                    at(*val)
+                    at(*idx)
                 );
+                match agg {
+                    None => {
+                        let _ = writeln!(
+                            a,
+                            "\tmovq 16(%rax), %rax\n\tmovq {}, %rdx\n\tmovq %rdx, (%rax,%rcx,8)",
+                            at(*val)
+                        );
+                    }
+                    // rep movsq from the value pointer into the buffer
+                    // slot — %rdi/%rsi/%rcx are reserved scratch (CopyW).
+                    Some(words) => {
+                        let _ = writeln!(
+                            a,
+                            "\tmovq 16(%rax), %rdi\n\timulq ${}, %rcx, %rcx\n\taddq %rcx, %rdi\n\
+                             \tmovq {}, %rsi\n\tmovq ${words}, %rcx\n\trep movsq",
+                            8 * *words,
+                            at(*val)
+                        );
+                    }
+                }
             }
             Inst::Ret(v) => {
                 let _ = writeln!(a, "\tmovq {}, %rax", at(*v));

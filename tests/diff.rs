@@ -1339,6 +1339,202 @@ fn floats_through_calls_arrays_and_fields() {
     );
 }
 
+// ---- Multi-word array elements (ADR 0023) -------------------------------
+
+#[test]
+fn value_struct_arrays_literal_index_assign_push_and_for() {
+    diff(
+        "vsarr",
+        "struct P { x: int, y: int }
+        fun main(): int {
+            var ps: P[] = [P { x: 1, y: 2 }, P { x: 3, y: 4 }];
+            print(ps[0].x + ps[1].y * 10);
+            push(ps, P { x: 5, y: 6 });
+            ps[0] = ps[2];
+            var sum: int = 0;
+            for p in ps { sum = sum + p.x * 10 + p.y; }
+            print(sum);
+            return len(ps);
+        }",
+    );
+}
+
+#[test]
+fn push_of_own_element_survives_every_realloc() {
+    // push(xs, xs[0]) snapshots at evaluation — the realloc push itself
+    // triggers must not invalidate the source pointer.
+    diff(
+        "pushself",
+        "struct P { x: int, y: int }
+        fun main(): int {
+            var ps: P[] = [P { x: 7, y: 8 }];
+            push(ps, ps[0]);
+            push(ps, ps[1]);
+            push(ps, ps[2]);
+            push(ps, ps[3]);
+            return ps[4].x * 10 + ps[4].y;
+        }",
+    );
+}
+
+#[test]
+fn index_assign_value_snapshots_before_the_target_pushes() {
+    // The value evaluates (and copies) before the target's index
+    // expression pushes and moves the buffer.
+    diff(
+        "idxsnap",
+        "struct P { x: int }
+        fun grow(ps: P[]): int {
+            push(ps, P { x: 99 });
+            return 0;
+        }
+        fun main(): int {
+            var ps: P[] = [P { x: 1 }, P { x: 2 }];
+            ps[grow(ps)] = ps[1];
+            return ps[0].x + len(ps);
+        }",
+    );
+}
+
+#[test]
+fn element_equality_snapshots_before_rhs_mutation() {
+    // xs[0] == f(xs) where f rewrites xs[0]: the left value compares as
+    // it was BEFORE the call, the oracle's order.
+    diff(
+        "eqsnap",
+        "struct P { x: int }
+        fun clobber(ps: P[]): P {
+            ps[0] = P { x: 99 };
+            return P { x: 1 };
+        }
+        fun main(): int {
+            var ps: P[] = [P { x: 1 }];
+            if ps[0] == clobber(ps) { return 1; }
+            return 0;
+        }",
+    );
+}
+
+#[test]
+fn for_over_struct_elements_reads_length_live() {
+    diff(
+        "vslive",
+        "struct P { x: int }
+        fun main(): int {
+            var ps: P[] = [P { x: 1 }, P { x: 2 }];
+            var n: int = 0;
+            for p in ps {
+                if len(ps) < 4 { push(ps, P { x: p.x * 10 }); }
+                n = n + p.x;
+            }
+            return n;
+        }",
+    );
+}
+
+#[test]
+fn string_arrays_literal_push_assign_compare_and_print() {
+    diff(
+        "strarr",
+        r#"fun main(): int {
+            var ss: string[] = ["a", "bb"];
+            push(ss, ss[0] + ss[1]);
+            ss[0] = "z";
+            for s in ss { print(s); }
+            print(ss[2] == "abb");
+            print(ss[0] == ss[1]);
+            return len(ss);
+        }"#,
+    );
+}
+
+#[test]
+fn struct_with_string_field_array_elements() {
+    diff(
+        "strfarr",
+        r#"struct Tag { name: string, id: int }
+        fun main(): int {
+            var ts: Tag[] = [Tag { name: "a", id: 1 }];
+            push(ts, Tag { name: "b" + "c", id: 2 });
+            for t in ts { print(t.name); }
+            print(ts[1].name == "bc");
+            return ts[0].id + ts[1].id;
+        }"#,
+    );
+}
+
+#[test]
+fn nested_value_struct_elements_and_field_writes_through_them() {
+    diff(
+        "nestarr",
+        "struct In { a: int, b: int }
+        struct Out { p: In, q: int }
+        fun main(): int {
+            var os: Out[] = [Out { p: In { a: 1, b: 2 }, q: 3 }];
+            push(os, os[0]);
+            os[1].q = 9;
+            os[0].p.b = 8;
+            const x: In = os[1].p;
+            return x.a * 1000 + x.b * 100 + os[0].p.b * 10 + os[1].q;
+        }",
+    );
+}
+
+#[test]
+fn pushing_a_struct_returning_call() {
+    diff(
+        "pushsret",
+        "struct P { x: int, y: int }
+        fun mk(a: int): P { return P { x: a, y: a + 1 }; }
+        fun main(): int {
+            var ps: P[] = [mk(1)];
+            push(ps, mk(3));
+            return ps[1].y * 10 + ps[0].x;
+        }",
+    );
+}
+
+#[test]
+fn optional_int_arrays_wrap_narrow_compare_and_coalesce() {
+    diff(
+        "optarr",
+        "fun main(): int {
+            var xs: int?[] = [1, null, 3];
+            push(xs, null);
+            push(xs, 5);
+            var sum: int = 0;
+            for x in xs {
+                if x != null { sum = sum + x; }
+                sum = sum + (x ?? 100);
+            }
+            print(xs[1] == null);
+            print(xs[0] == xs[2]);
+            print(xs[2] == 3);
+            xs[0] = null;
+            print(xs[0] == null);
+            return sum;
+        }",
+    );
+}
+
+#[test]
+fn optional_element_arrays_through_outer_optionals_and_fields() {
+    // The old gate's every-route cases (ADR 0021), now positive.
+    diff(
+        "optroutes",
+        "refstruct S { xs: int?[] }
+        fun main(): int {
+            var xs: int?[]? = [];
+            const s: S = S { xs: [7, null] };
+            push(s.xs, 9);
+            var n: int = 0;
+            for x in s.xs { n = n + (x ?? 1000); }
+            if xs != null { n = n + len(xs); }
+            return n;
+        }",
+    );
+}
+
 #[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as

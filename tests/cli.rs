@@ -401,33 +401,6 @@ fn recursive_value_struct_is_a_clean_diagnostic() {
     );
 }
 
-/// Arrays of multi-word values need stride machinery ys_push and the
-/// indexers don't have yet.
-#[test]
-fn arrays_of_value_structs_are_not_yet_compilable() {
-    assert_not_yet_compilable(
-        "valarr",
-        "struct P { x: int, y: int }
-        fun main(): int { const ps: P[] = [P { x: 1, y: 2 }]; return ps[0].x; }",
-    );
-}
-
-/// Value-optional elements must stay gated through EVERY route to an
-/// array type: outer optionals and struct fields included (a pushed 0
-/// would be bit-identical to null).
-#[test]
-fn value_optional_arrays_are_gated_through_every_route() {
-    assert_not_yet_compilable(
-        "outeropt",
-        "fun main(): int { var xs: int?[]? = []; return 0; }",
-    );
-    assert_not_yet_compilable(
-        "fieldroute",
-        "refstruct S { xs: int?[] }
-         fun main(): int { const s: S = S { xs: [] }; return 0; }",
-    );
-}
-
 /// Printing aggregates needs the debug renderer the runtime doesn't
 /// have yet; scalars and strings print, the rest diagnoses.
 #[test]
