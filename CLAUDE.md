@@ -48,9 +48,10 @@ lexer → parser → check (+narrow) → { interpreter | ir → codegen } → cc
 4. **The differential contract**: for any program the interpreter runs
    cleanly, the compiled binary produces identical stdout and exit code
    (result & 0xFF). tests/diff.rs and tests/conformance.rs enforce it.
-5. **Goldens never move silently**: a change that alters any
-   `conformance/*.out` updates the corpus in the same commit and says so
-   in an ADR.
+5. **The corpus is frozen additive-only** (ADR 0032): new programs and
+   goldens may land; existing `conformance/*.out` are immutable. The
+   sole escape hatch is spec errata — an interpreter bug fixed with its
+   own ADR naming the golden it moves.
 
 ## Workflow
 

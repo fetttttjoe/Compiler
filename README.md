@@ -24,6 +24,8 @@ export fun sum(tree: Tree?): int {
 - optionals — `T?`, `null`, `?.`, `??` — with flow-sensitive narrowing
 - growable arrays with `len`, `push`, and live `for` loops
 - loop control with `break` and `continue`
+- template literals and explicit `string(x)` conversion
+- a world interface — `main(args: string[])`, stdin, and file handles
 - modules with explicit `import` / `export`
 - every binding declares its type; the compiler verifies, it never
   guesses
@@ -69,10 +71,12 @@ are recorded in `docs/adr/`.
 
 ## Status
 
-Pre-1.0. Anything the checker accepts but the backend cannot compile
-yet fails with a clean `not yet compilable` diagnostic — there is no
-fallback path and no silent corruption. Allocations currently live
-until process exit; region memory is the planned direction.
+1.0 (ADR 0032). The conformance corpus is frozen additive-only:
+existing goldens are immutable, and every future engine must reproduce
+them byte-for-byte. Anything the checker accepts but the backend cannot
+compile yet fails with a clean `not yet compilable` diagnostic — there
+is no fallback path and no silent corruption. Allocations currently
+live until process exit; region memory is the planned direction.
 
 ## Development
 
