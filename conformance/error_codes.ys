@@ -1,0 +1,16 @@
+error NotFound, Timeout;
+
+fun describe(e: error): string {
+    if e == error.NotFound { return "missing"; }
+    return string(e);
+}
+
+fun main(): int {
+    print(error.NotFound);
+    print(describe(error.NotFound));
+    print(describe(error.Timeout));
+    const s: string = `<${error.Timeout}>`;
+    print(s);
+    print(error.NotFound == error.NotFound);
+    return 7;
+}

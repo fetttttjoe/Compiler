@@ -403,6 +403,49 @@ fn parses_an_import_declaration() {
 }
 
 #[test]
+fn parses_error_declarations() {
+    let (tokens, ld) = lex("error NotFound; export error Timeout, Busy;");
+    assert!(ld.is_empty(), "{ld:?}");
+    let (ast, pd) = parse(&tokens);
+    assert!(pd.is_empty(), "parse errors: {pd:?}");
+    let Item::Error(e) = &ast[0] else {
+        panic!("expected error decl")
+    };
+    assert!(!e.exported);
+    assert_eq!(e.names.len(), 1);
+    assert_eq!(e.names[0].0, "NotFound");
+    let Item::Error(e) = &ast[1] else {
+        panic!("expected error decl")
+    };
+    assert!(e.exported);
+    let names: Vec<&str> = e.names.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["Timeout", "Busy"]);
+}
+
+#[test]
+fn parses_error_literals_and_the_error_type() {
+    assert_eq!(expr("error.NotFound").sexpr(), "error.NotFound");
+    assert_eq!(expr("e == error.Timeout").sexpr(), "(== e error.Timeout)");
+    let (tokens, _) = lex("fun f(e: error): error { return e; }");
+    let (ast, pd) = parse(&tokens);
+    assert!(pd.is_empty(), "parse errors: {pd:?}");
+    let Item::Function(f) = &ast[0] else { panic!() };
+    assert_eq!(f.params[0].ty, TypeAnn::ErrCode);
+    assert_eq!(f.return_type, Some(TypeAnn::ErrCode));
+}
+
+#[test]
+fn bare_error_in_expression_position_is_reported() {
+    let (tokens, _) = lex("fun f(): int { const x: int = error; return x; }");
+    let (_, pd) = parse(&tokens);
+    assert!(
+        pd.iter()
+            .any(|d| d.message.contains("expected '.' and an error name")),
+        "{pd:?}"
+    );
+}
+
+#[test]
 fn export_marks_functions_and_structs() {
     let (tokens, _) =
         lex("export fun f(): int { return 1; } export struct P { x: int } fun g() { }");

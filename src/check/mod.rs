@@ -39,6 +39,13 @@ pub struct Resolutions {
     /// Each annotated `let`'s resolved declared type, keyed by the
     /// statement span — so codegen never resolves an annotation itself.
     pub let_types: HashMap<Span, Type>,
+    /// Declared error names in code order — code = index + 2 (tag 0 =
+    /// value, 1 = reserved, ADR 0034). Both engines render names
+    /// through this table; codes are never observable.
+    pub error_names: Vec<String>,
+    /// Each `error.Name` literal's interned code, keyed by its span —
+    /// the engines never resolve an error name themselves.
+    pub error_lits: HashMap<Span, u32>,
 }
 
 /// A resolved field access (see `Resolutions::field_slots`).
@@ -52,6 +59,7 @@ pub struct FieldSlot {
 struct ModuleNames {
     fns: HashMap<String, bool>,
     structs: HashMap<String, bool>,
+    errs: HashMap<String, bool>,
 }
 
 /// Static type checking over the whole module graph. Empty diagnostics =
@@ -70,6 +78,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
     // (unknown item, not exported, collision within this file).
     let mut fn_aliases: Vec<Alias> = Vec::new();
     let mut ty_aliases: Vec<Alias> = Vec::new();
+    let mut err_aliases: Vec<Alias> = Vec::new();
     for (mi, module) in graph.modules.iter().enumerate() {
         let mut fn_alias: Alias = names[mi]
             .fns
@@ -81,16 +90,23 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
             .keys()
             .map(|n| (n.clone(), (mi, n.clone())))
             .collect();
+        let mut err_alias: Alias = names[mi]
+            .errs
+            .keys()
+            .map(|n| (n.clone(), (mi, n.clone())))
+            .collect();
         for binding in &module.imports {
             let target = &names[binding.target];
             let target_path = &graph.modules[binding.target].path;
             let fn_export = target.fns.get(&binding.name).copied();
             let ty_export = target.structs.get(&binding.name).copied();
-            if fn_export.is_none() && ty_export.is_none() {
+            let err_export = target.errs.get(&binding.name).copied();
+            if fn_export.is_none() && ty_export.is_none() && err_export.is_none() {
                 let exported_names = target
                     .fns
                     .iter()
                     .chain(target.structs.iter())
+                    .chain(target.errs.iter())
                     .filter(|&(_, &exported)| exported)
                     .map(|(n, _)| n.as_str());
                 diags.push(
@@ -102,7 +118,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                 );
                 continue;
             }
-            if fn_export != Some(true) && ty_export != Some(true) {
+            if fn_export != Some(true) && ty_export != Some(true) && err_export != Some(true) {
                 diags.push(
                     Diagnostic::error(
                         format!(
@@ -118,7 +134,10 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                 );
                 continue;
             }
-            if fn_alias.contains_key(&binding.name) || ty_alias.contains_key(&binding.name) {
+            if fn_alias.contains_key(&binding.name)
+                || ty_alias.contains_key(&binding.name)
+                || err_alias.contains_key(&binding.name)
+            {
                 diags.push(Diagnostic::error(
                     format!("'{}' is already defined in this file", binding.name),
                     binding.span,
@@ -131,14 +150,22 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
             if ty_export == Some(true) {
                 ty_alias.insert(binding.name.clone(), (binding.target, binding.name.clone()));
             }
+            if err_export == Some(true) {
+                err_alias.insert(binding.name.clone(), (binding.target, binding.name.clone()));
+            }
         }
         fn_aliases.push(fn_alias);
         ty_aliases.push(ty_alias);
+        err_aliases.push(err_alias);
     }
 
-    // Pass C: resolve signatures and struct layouts through the alias maps.
+    // Pass C: resolve signatures and struct layouts through the alias maps;
+    // intern error codes deterministically (module index, then declaration
+    // order) — codes start at 2 (ADR 0034 tag space).
     let mut sigs: HashMap<(usize, String), FnSig> = HashMap::new();
     let mut structs: HashMap<(usize, String), StructType> = HashMap::new();
+    let mut error_codes: HashMap<(usize, String), u32> = HashMap::new();
+    let mut error_names: Vec<String> = Vec::new();
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             match item {
@@ -174,6 +201,18 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                     sigs.insert((mi, f.name.clone()), FnSig { params, ret });
                 }
                 Item::Import(_) => {}
+                Item::Error(e) => {
+                    for (name, _) in &e.names {
+                        // Duplicates were diagnosed in collect_names; the
+                        // entry guard keeps their codes stable anyway.
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            error_codes.entry((mi, name.clone()))
+                        {
+                            slot.insert((error_names.len() + 2) as u32);
+                            error_names.push(name.clone());
+                        }
+                    }
+                }
             }
         }
     }
@@ -183,6 +222,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
     let mut field_slots = HashMap::new();
     let mut expr_types = HashMap::new();
     let mut let_types = HashMap::new();
+    let mut error_lits = HashMap::new();
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             if let Item::Function(f) = item {
@@ -191,6 +231,8 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                     paths: &paths,
                     fn_alias: &fn_aliases[mi],
                     ty_alias: &ty_aliases[mi],
+                    err_alias: &err_aliases[mi],
+                    error_codes: &error_codes,
                     sigs: &sigs,
                     structs: &structs,
                     diagnostics: &mut diags,
@@ -201,6 +243,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                     field_slots: &mut field_slots,
                     expr_types: &mut expr_types,
                     let_types: &mut let_types,
+                    error_lits: &mut error_lits,
                 };
                 checker.check_function(f);
             }
@@ -250,6 +293,8 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
             sigs,
             expr_types,
             let_types,
+            error_names,
+            error_lits,
         },
         diags,
     )
@@ -259,6 +304,7 @@ fn collect_names(ast: &[Item], diags: &mut Vec<Diagnostic>) -> ModuleNames {
     let mut names = ModuleNames {
         fns: HashMap::new(),
         structs: HashMap::new(),
+        errs: HashMap::new(),
     };
     for item in ast {
         match item {
@@ -279,6 +325,16 @@ fn collect_names(ast: &[Item], diags: &mut Vec<Diagnostic>) -> ModuleNames {
                 }
             }
             Item::Import(_) => {}
+            Item::Error(e) => {
+                for (name, span) in &e.names {
+                    if names.errs.insert(name.clone(), e.exported).is_some() {
+                        diags.push(Diagnostic::error(
+                            format!("error '{name}' is already declared"),
+                            *span,
+                        ));
+                    }
+                }
+            }
         }
     }
     names
@@ -291,6 +347,7 @@ fn resolve_type(ann: &TypeAnn, ty_alias: &Alias, span: Span, diags: &mut Vec<Dia
         TypeAnn::Bool => Type::Bool,
         TypeAnn::Str => Type::Str,
         TypeAnn::File => Type::File,
+        TypeAnn::ErrCode => Type::ErrCode,
         TypeAnn::Optional(inner) => {
             Type::Optional(Box::new(resolve_type(inner, ty_alias, span, diags)))
         }
@@ -317,6 +374,8 @@ struct Checker<'a> {
     paths: &'a [&'a str],
     fn_alias: &'a Alias,
     ty_alias: &'a Alias,
+    err_alias: &'a Alias,
+    error_codes: &'a HashMap<(usize, String), u32>,
     sigs: &'a HashMap<(usize, String), FnSig>,
     structs: &'a HashMap<(usize, String), StructType>,
     diagnostics: &'a mut Vec<Diagnostic>,
@@ -336,6 +395,7 @@ struct Checker<'a> {
     field_slots: &'a mut HashMap<Span, FieldSlot>,
     expr_types: &'a mut HashMap<Span, Type>,
     let_types: &'a mut HashMap<Span, Type>,
+    error_lits: &'a mut HashMap<Span, u32>,
 }
 
 mod exprs;

@@ -2269,6 +2269,34 @@ fn guard_return_narrows_a_local_file_handle() {
 }
 
 #[test]
+fn error_codes_agree_across_engines() {
+    // ADR 0034 slice A: literals, identity equality, rendering through
+    // print/string/templates, struct fields, and error? optionals —
+    // including narrowing a guarded error? local (ADR 0033).
+    diff(
+        "errcodes",
+        r#"error NotFound, Timeout, Busy;
+        struct Req { id: int, fail: error }
+        fun main(): int {
+            const e: error = error.Timeout;
+            print(e);
+            print(e == error.Timeout);
+            print(e == error.NotFound);
+            print(`got ${e}!`);
+            const r: Req = Req { id: 7, fail: error.Busy };
+            print(r);
+            var maybe: error? = null;
+            print(maybe);
+            maybe = error.NotFound;
+            print(maybe);
+            if maybe == null { return 0; }
+            print(maybe == error.NotFound);
+            return 42;
+        }"#,
+    );
+}
+
+#[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as
     // tall as the chain is long; 6000 terms used to overflow the checker's

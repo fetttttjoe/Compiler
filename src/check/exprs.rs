@@ -26,6 +26,22 @@ impl Checker<'_> {
             Expr::Str(_, _) => Type::Str,
             Expr::Ident(name, span) => self.lookup(name, *span),
             Expr::Null(_) => Type::Null,
+            // `error.Name` resolves through the module's error view; the
+            // interned code lands span-keyed so the engines never resolve
+            // a name themselves (ADR 0034).
+            Expr::ErrorLit(name, span) => match self.err_alias.get(name) {
+                Some(key) => {
+                    self.error_lits.insert(*span, self.error_codes[key]);
+                    Type::ErrCode
+                }
+                None => {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!("unknown error '{name}'"), *span)
+                            .suggest(name, self.err_alias.keys().map(String::as_str)),
+                    );
+                    Type::Error
+                }
+            },
             // Conversions cross-convert only (ADR 0028): identity
             // conversions are rejected — a no-op spelled as a conversion
             // is noise, not explicitness. `string(x)` (ADR 0029) renders

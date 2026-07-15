@@ -445,6 +445,8 @@ impl Lexer<'_> {
             syntax::KW_BOOL => TokenKind::BoolType,
             syntax::KW_STRING => TokenKind::StringType,
             syntax::KW_FILE => TokenKind::FileType,
+            syntax::KW_ERROR => TokenKind::ErrorKw,
+            syntax::KW_TRY => TokenKind::Try,
             other => TokenKind::Identifier(other.to_string()),
         }
     }

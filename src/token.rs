@@ -22,6 +22,11 @@ pub enum TokenKind {
     True,
     False,
     Null,
+    /// `error` — error declarations, `error.Name` literals, and the
+    /// one-word error-code type (ADR 0034).
+    ErrorKw,
+    /// Reserved for `try` propagation (ADR 0034).
+    Try,
     // Type keywords
     IntType,
     FloatType,

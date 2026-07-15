@@ -247,6 +247,28 @@ fn routine(
         // Opaque handle (ADR 0031): constant text — an address could
         // never match the oracle.
         Type::File => b.piece("file"),
+        // A declared error code (ADR 0034): `error.Name` selected by
+        // code — codes start at 2, in declaration order.
+        // ponytail: linear compare chain; a code-indexed .rodata table
+        // if programs ever declare enough errors to feel it.
+        Type::ErrCode => {
+            let end = b.label();
+            for (i, ename) in res.error_names.iter().enumerate() {
+                let c = b.fresh();
+                b.insts.push(Inst::BinImm {
+                    op: BinOp::Eq,
+                    dst: c,
+                    lhs: X,
+                    imm: (i + 2) as i64,
+                });
+                let next = b.label();
+                b.insts.push(Inst::BrZero(c, next));
+                b.piece(&format!("error.{ename}"));
+                b.insts.push(Inst::Jmp(end));
+                b.insts.push(Inst::Label(next));
+            }
+            b.insts.push(Inst::Label(end));
+        }
         // Value-shaped optional (request normalized the ref-shaped
         // ones away): the tag decides. The interpreter stores payloads
         // unwrapped, so the payload renders at the SAME depth.

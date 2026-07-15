@@ -772,6 +772,72 @@ fn both_branches_returning_satisfies_definite_return() {
 }
 
 #[test]
+fn error_declarations_resolve_and_compare() {
+    let d = diags(
+        "error NotFound, Timeout;\n\
+         fun code_of(e: error): int {\n\
+             if e == error.NotFound { return 1; }\n\
+             return 0;\n\
+         }\n\
+         fun f(): int { return code_of(error.Timeout); }",
+    );
+    assert!(d.is_empty(), "unexpected: {d:?}");
+}
+
+#[test]
+fn unknown_and_duplicate_errors_are_reported() {
+    let d = diags("error E;\nfun f(): error { return error.Nope; }");
+    assert!(
+        d.iter().any(|e| e.message.contains("unknown error 'Nope'")),
+        "{d:?}"
+    );
+    let d = diags("error E;\nerror E;\nfun f(): int { return 0; }");
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("error 'E' is already declared")),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn errors_do_not_compare_with_other_types() {
+    let d = diags("error E;\nfun f(): bool { return error.E == 1; }");
+    assert_eq!(d.len(), 1, "{d:?}");
+}
+
+#[test]
+fn errors_export_and_import_with_distinct_codes() {
+    // Imported errors are the SAME code; same-named locals are distinct.
+    let (res, d) = multi(&[
+        (
+            "main.ys",
+            "import { NotFound } from \"./lib\";\n\
+             error Local;\n\
+             fun main(): int {\n\
+                 if error.NotFound == error.NotFound { return 1; }\n\
+                 return 0;\n\
+             }",
+        ),
+        ("lib.ys", "export error NotFound;"),
+    ]);
+    assert!(d.is_empty(), "unexpected: {d:?}");
+    assert_eq!(res.error_names.len(), 2);
+    let d = multi(&[
+        (
+            "main.ys",
+            "import { Hidden } from \"./lib\";\n\
+             fun main(): int { return 0; }",
+        ),
+        ("lib.ys", "error Hidden;"),
+    ])
+    .1;
+    assert!(
+        d.iter().any(|e| e.message.contains("not exported")),
+        "{d:?}"
+    );
+}
+
+#[test]
 fn imported_functions_and_structs_are_usable() {
     let (_, d) = multi(&[
         (

@@ -648,6 +648,8 @@ impl Lowerer<'_> {
             // A bare `null` reaching plain expr() is a ref-optional's
             // handle 0; value-optional slots wrap it in `expr_into`.
             Expr::Null(_) => Ok(self.const_word(0)),
+            // The checker interned the code (ADR 0034): a constant word.
+            Expr::ErrorLit(_, span) => Ok(self.const_word(self.res.error_lits[span] as i64)),
             // A literal's descriptor and bytes are both static — strings
             // are immutable, so every use shares one rodata object.
             Expr::Str(text, _) => {

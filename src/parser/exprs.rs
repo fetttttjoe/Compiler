@@ -147,6 +147,21 @@ impl Parser<'_> {
             TokenKind::True => Expr::Bool(true, tok.span),
             TokenKind::False => Expr::Bool(false, tok.span),
             TokenKind::Null => Expr::Null(tok.span),
+            // `error.Name` — an error-code literal (ADR 0034). Bare
+            // `error` in expression position arrives with `T!` tests.
+            TokenKind::ErrorKw => {
+                if self.eat(&TokenKind::Dot) {
+                    let name_span = self.peek().span;
+                    let name = self.expect_identifier();
+                    Expr::ErrorLit(name, tok.span.to(name_span))
+                } else {
+                    self.error(
+                        "expected '.' and an error name after 'error'".to_string(),
+                        tok.span,
+                    );
+                    Expr::Null(tok.span) // recovery: already reported
+                }
+            }
             TokenKind::StringLiteral(s) => Expr::Str(s, tok.span),
             TokenKind::Identifier(name) => {
                 if self.struct_literals_allowed && self.check(&TokenKind::LeftBrace) {

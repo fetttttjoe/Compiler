@@ -33,6 +33,10 @@ impl Value {
             // Opaque handle (ADR 0031): constant text — an address or
             // table index could never match across engines.
             Value::File(_) => b"file".to_vec(),
+            // Codes are never observable — only names render (ADR 0034).
+            Value::Err(code) => {
+                format!("error.{}", heap.error_names[(*code - 2) as usize]).into_bytes()
+            }
             // The hop consumes a level, the object's children another.
             Value::Ref(id) if depth == 1 => {
                 let _ = id;
@@ -80,6 +84,10 @@ impl Value {
                 render_struct(name, fields, |v| v.render_depth(heap, depth - 1))
             }
             Value::Str(s) => format!("Str({:?})", String::from_utf8_lossy(s)),
+            // The code stays unobservable in the result line too.
+            Value::Err(code) => {
+                format!("Err(error.{})", heap.error_names[(*code - 2) as usize])
+            }
             other => format!("{other:?}"),
         }
     }
@@ -93,6 +101,7 @@ impl Value {
             Value::Ref(_) => "refstruct",
             Value::Array(_) => "array",
             Value::File(_) => "file",
+            Value::Err(_) => "error",
             Value::Null => "null",
             Value::Unit => "unit",
         }

@@ -20,6 +20,9 @@ pub enum Type {
     /// `T[]` — growable array, reference semantics (aliased, identity
     /// equality), like refstruct.
     Array(Box<Type>),
+    /// `error` — a declared error code (ADR 0034): one word, identity
+    /// equality, module-scoped names.
+    ErrCode,
     /// The type of the `null` literal; fits only into `T?` slots.
     Null,
     Unit,
@@ -66,6 +69,7 @@ impl Type {
             Type::Optional(inner) => format!("{}?", inner.name()),
             Type::Array(inner) if unconstrained(inner) => "[]".to_string(),
             Type::Array(inner) => format!("{}[]", inner.name()),
+            Type::ErrCode => "error".to_string(),
             Type::Null => "null".to_string(),
             Type::Unit => "unit".to_string(),
             Type::Error => "<error>".to_string(),

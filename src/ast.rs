@@ -13,6 +13,17 @@ pub enum Item {
     Function(Function),
     Struct(Struct),
     Import(ImportDecl),
+    Error(ErrorDecl),
+}
+
+/// `error NotFound, Timeout;` — module-scoped error codes (ADR 0034).
+/// Each name keeps its span so duplicate/resolution diagnostics can
+/// point at the exact identifier.
+#[derive(Debug, PartialEq)]
+pub struct ErrorDecl {
+    pub exported: bool,
+    pub names: Vec<(String, Span)>,
+    pub span: Span,
 }
 
 /// `import { a, b } from "./path";` — each name keeps its own span so
@@ -66,6 +77,8 @@ pub enum TypeAnn {
     Str,
     File,
     Named(String),
+    /// `error` — the one-word error-code type (ADR 0034).
+    ErrCode,
     /// `T?` — T or null.
     Optional(Box<TypeAnn>),
     /// `T[]` — a growable array of T, reference semantics like refstruct.
@@ -155,6 +168,8 @@ pub enum Expr {
     Str(String, Span),
     Ident(String, Span),
     Null(Span),
+    /// `error.Name` — an error-code literal (ADR 0034).
+    ErrorLit(String, Span),
     Unary {
         op: UnOp,
         rhs: Box<Expr>,
@@ -314,7 +329,8 @@ impl Expr {
             | Expr::Bool(_, s)
             | Expr::Str(_, s)
             | Expr::Ident(_, s)
-            | Expr::Null(s) => *s,
+            | Expr::Null(s)
+            | Expr::ErrorLit(_, s) => *s,
             Expr::Unary { span, .. }
             | Expr::Convert { span, .. }
             | Expr::Binary { span, .. }
@@ -336,6 +352,7 @@ impl Expr {
             Expr::Str(s, _) => format!("{s:?}"),
             Expr::Ident(name, _) => name.clone(),
             Expr::Null(_) => "null".to_string(),
+            Expr::ErrorLit(n, _) => format!("error.{n}"),
             Expr::Unary { op, rhs, .. } => format!("({} {})", op.symbol(), rhs.sexpr()),
             Expr::Convert { to, arg, .. } => {
                 format!("({} {})", to.keyword(), arg.sexpr())

@@ -1,5 +1,6 @@
 use crate::ast::{
-    Ast, BinOp, Conv, Expr, Field, Function, ImportDecl, Item, Param, Stmt, Struct, TypeAnn, UnOp,
+    Ast, BinOp, Conv, ErrorDecl, Expr, Field, Function, ImportDecl, Item, Param, Stmt, Struct,
+    TypeAnn, UnOp,
 };
 use crate::diagnostic::Diagnostic;
 use crate::span::Span;
@@ -280,6 +281,8 @@ pub(super) fn describe(kind: &TokenKind) -> &'static str {
         BoolType => "'bool'",
         StringType => "'string'",
         FileType => "'file'",
+        ErrorKw => "'error'",
+        Try => "'try'",
         Identifier(_) => "an identifier",
         IntLiteral(_) => "an integer",
         FloatLiteral(_) => "a float",
@@ -332,6 +335,7 @@ pub fn parse(tokens: &[Token]) -> (Ast, Vec<Diagnostic>) {
                 items.push(Item::Struct(parser.parse_struct(false)))
             }
             TokenKind::Import => items.push(Item::Import(parser.parse_import())),
+            TokenKind::ErrorKw => items.push(Item::Error(parser.parse_error_decl(false))),
             TokenKind::Export => {
                 parser.bump();
                 match parser.peek().kind {
@@ -339,11 +343,12 @@ pub fn parse(tokens: &[Token]) -> (Ast, Vec<Diagnostic>) {
                     TokenKind::Struct | TokenKind::RefStruct => {
                         items.push(Item::Struct(parser.parse_struct(true)))
                     }
+                    TokenKind::ErrorKw => items.push(Item::Error(parser.parse_error_decl(true))),
                     _ => {
                         let tok = parser.peek().clone();
                         parser.error(
                             format!(
-                                "expected 'fun' or 'struct' after 'export', found {}",
+                                "expected 'fun', 'struct', or 'error' after 'export', found {}",
                                 describe(&tok.kind)
                             ),
                             tok.span,
@@ -355,7 +360,10 @@ pub fn parse(tokens: &[Token]) -> (Ast, Vec<Diagnostic>) {
             _ => {
                 let tok = parser.peek().clone();
                 parser.error(
-                    format!("expected 'fun' or 'struct', found {}", describe(&tok.kind)),
+                    format!(
+                        "expected 'fun', 'struct', or 'error', found {}",
+                        describe(&tok.kind)
+                    ),
                     tok.span,
                 );
                 parser.synchronize();

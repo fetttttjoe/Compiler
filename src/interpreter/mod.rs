@@ -28,6 +28,9 @@ pub struct Heap {
     structs: Vec<StructObj>,
     arrays: Vec<Vec<Value>>,
     files: Vec<FileEntry>,
+    /// Declared error names, code = index + 2 (ADR 0034) — rendering
+    /// context for `Value::Err`, copied from Resolutions at startup.
+    error_names: Vec<String>,
 }
 
 /// An open file's engine state (ADR 0031): the mode decides which
@@ -87,6 +90,9 @@ pub enum Value {
     /// An open file (ADR 0031): a handle into the files table, identity
     /// equality like every handle.
     File(usize),
+    /// A declared error code (ADR 0034) — identity equality by code;
+    /// the name renders through `Heap::error_names`.
+    Err(u32),
     /// The `null` literal — the empty state of a `T?` slot.
     Null,
     Unit,

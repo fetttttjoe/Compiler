@@ -91,7 +91,8 @@ pub(crate) fn contains_call(e: &Expr) -> bool {
         | Expr::Bool(..)
         | Expr::Str(..)
         | Expr::Ident(..)
-        | Expr::Null(_) => false,
+        | Expr::Null(_)
+        | Expr::ErrorLit(..) => false,
     }
 }
 

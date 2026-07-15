@@ -28,6 +28,7 @@ pub(super) fn run_program(
         depth: 0,
         heap: Heap::default(),
     };
+    interp.heap.error_names = resolutions.error_names.clone();
     let value = match interp.functions.get(&(0, syntax::ENTRY_FN)).copied() {
         // `main(args: string[])` (ADR 0031): materialize argv once.
         Some(main) => {
@@ -312,6 +313,8 @@ impl<'a> Interp<'a> {
             Expr::Str(s, _) => Ok(Value::Str(s.as_bytes().to_vec())),
             Expr::Ident(name, span) => self.lookup(name, *span),
             Expr::Null(_) => Ok(Value::Null),
+            // The checker interned the code (or rejected the program).
+            Expr::ErrorLit(_, span) => Ok(Value::Err(self.resolutions.error_lits[span])),
             Expr::Unary { op, rhs, span } => {
                 let v = self.eval(rhs)?;
                 eval_unary(*op, v, *span)

@@ -70,6 +70,10 @@ impl Parser<'_> {
                 self.bump();
                 TypeAnn::File
             }
+            TokenKind::ErrorKw => {
+                self.bump();
+                TypeAnn::ErrCode
+            }
             TokenKind::Identifier(n) => {
                 self.bump();
                 TypeAnn::Named(n)
@@ -121,6 +125,27 @@ impl Parser<'_> {
         }
     }
 
+    /// Parses `error Name[, Name]*;` — module-scoped error codes
+    /// (ADR 0034). The caller dispatched on the `error` keyword.
+    pub(super) fn parse_error_decl(&mut self, exported: bool) -> ErrorDecl {
+        let start = self.expect(TokenKind::ErrorKw);
+        let mut names = Vec::new();
+        loop {
+            let span = self.peek().span;
+            let name = self.expect_identifier();
+            names.push((name, span));
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self.expect(TokenKind::Semicolon);
+        ErrorDecl {
+            exported,
+            names,
+            span: start.to(end),
+        }
+    }
+
     pub(super) fn parse_struct(&mut self, exported: bool) -> Struct {
         // The caller dispatched on the keyword — `struct` or `refstruct`.
         let kw = self.advance();
@@ -167,7 +192,8 @@ impl Parser<'_> {
                 | TokenKind::Struct
                 | TokenKind::RefStruct
                 | TokenKind::Import
-                | TokenKind::Export => return,
+                | TokenKind::Export
+                | TokenKind::ErrorKw => return,
                 _ => {
                     self.bump();
                 }
