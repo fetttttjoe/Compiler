@@ -207,18 +207,27 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
         }
     }
 
-    // Entry rule, owned by the checker so every entry path agrees: the
-    // interpreter calls `main` with no arguments, and compiled main would
-    // read argc/argv as its parameters.
+    // Entry rule, owned by the checker so every entry path agrees:
+    // `main()` or `main(args: string[])` (ADR 0031) — the interpreter
+    // passes the program arguments, compiled main materializes argv.
     if let Some(f) = graph.modules[0].ast.iter().find_map(|item| match item {
         Item::Function(f) if f.name == syntax::ENTRY_FN => Some(f),
         _ => None,
-    }) && !f.params.is_empty()
-    {
-        diags.push(Diagnostic::error(
-            format!("'{}' takes no parameters", syntax::ENTRY_FN),
-            f.span,
-        ));
+    }) {
+        let ok = match f.params.as_slice() {
+            [] => true,
+            [p] => p.ty == TypeAnn::Array(Box::new(TypeAnn::Str)),
+            _ => false,
+        };
+        if !ok {
+            diags.push(Diagnostic::error(
+                format!(
+                    "'{}' takes no parameters or exactly (args: string[])",
+                    syntax::ENTRY_FN
+                ),
+                f.span,
+            ));
+        }
     }
 
     let ref_structs = ty_aliases
@@ -281,6 +290,7 @@ fn resolve_type(ann: &TypeAnn, ty_alias: &Alias, span: Span, diags: &mut Vec<Dia
         TypeAnn::Float => Type::Float,
         TypeAnn::Bool => Type::Bool,
         TypeAnn::Str => Type::Str,
+        TypeAnn::File => Type::File,
         TypeAnn::Optional(inner) => {
             Type::Optional(Box::new(resolve_type(inner, ty_alias, span, diags)))
         }

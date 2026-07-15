@@ -244,6 +244,9 @@ fn routine(
             let len = b.load(X, 8);
             b.append(ptr, len);
         }
+        // Opaque handle (ADR 0031): constant text — an address could
+        // never match the oracle.
+        Type::File => b.piece("file"),
         // Value-shaped optional (request normalized the ref-shaped
         // ones away): the tag decides. The interpreter stores payloads
         // unwrapped, so the payload renders at the SAME depth.

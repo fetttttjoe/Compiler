@@ -1,0 +1,27 @@
+fun main(args: string[]): int {
+    print(`args=${len(args)}`);
+    print(readLine() ?? "no stdin");
+
+    const w: file? = open("notes.txt", "w");
+    if w != null {
+        write(w, `first\n`);
+        write(w, `second\n`);
+        print(close(w));
+    }
+
+    const r: file? = open("notes.txt", "r");
+    var count: int = 0;
+    if r != null {
+        var line: string? = readLine(r);
+        while line != null {
+            count = count + 1;
+            print(`${count}: ${line}`);
+            line = readLine(r);
+        }
+        print(close(r));
+    }
+
+    print(open("notes.txt", "x") == null);
+    print(open("missing-dir/f", "r") == null);
+    return count;
+}

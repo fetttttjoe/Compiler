@@ -66,6 +66,10 @@ impl Parser<'_> {
                 self.bump();
                 TypeAnn::Str
             }
+            TokenKind::FileType => {
+                self.bump();
+                TypeAnn::File
+            }
             TokenKind::Identifier(n) => {
                 self.bump();
                 TypeAnn::Named(n)

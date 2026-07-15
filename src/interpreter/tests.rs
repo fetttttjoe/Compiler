@@ -22,7 +22,7 @@ fn run_full(src: &str) -> Result<(Value, Heap), Diagnostic> {
     };
     let (res, cd) = check(&graph);
     assert!(cd.is_empty(), "check: {cd:?}");
-    interpret(&graph, &res)
+    interpret(&graph, &res, &[])
 }
 
 /// Full pipeline over in-memory files; the first file is the entry.
@@ -42,7 +42,7 @@ fn run_multi(files: &[(&str, &str)]) -> Result<Value, Diagnostic> {
     assert!(fd.is_empty(), "front-end: {fd:?}");
     let (res, cd) = check(&graph);
     assert!(cd.is_empty(), "check: {cd:?}");
-    interpret(&graph, &res).map(|(value, _)| value)
+    interpret(&graph, &res, &[]).map(|(value, _)| value)
 }
 
 #[test]
@@ -248,6 +248,50 @@ fn string_conversion_renders_prints_text() {
         run("fun main(): string { var o: int? = null; return string(o) + string([1, 2]); }"),
         Ok(Value::Str(b"null[1, 2]".to_vec()))
     );
+}
+
+#[test]
+fn files_round_trip_through_the_interpreter() {
+    // ADR 0031: write → close → reopen → readLine/read, plus the
+    // pinned mode set and use-after-close diagnostics.
+    let dir = std::env::temp_dir().join(format!("ys-interp-io-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("t.txt");
+    let p = p.to_str().unwrap();
+    let program = format!(
+        "fun main(): string {{
+            var out: string = \"\";
+            const w: file? = open(\"{p}\", \"w\");
+            if w != null {{
+                write(w, `a\\nbc`);
+                close(w);
+            }}
+            const r: file? = open(\"{p}\", \"r\");
+            if r != null {{
+                out = (readLine(r) ?? \"?\") + \"|\" + (read(r, 9) ?? \"?\");
+                close(r);
+            }}
+            if open(\"{p}\", \"rb\") == null {{ out = out + \"|badmode\"; }}
+            return out;
+        }}"
+    );
+    assert_eq!(run(&program), Ok(Value::Str(b"a|bc|badmode".to_vec())));
+}
+
+#[test]
+fn closed_file_operations_are_runtime_errors() {
+    let dir = std::env::temp_dir().join(format!("ys-interp-io-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("closed.txt");
+    let p = p.to_str().unwrap();
+    let program = format!(
+        "fun main(): int {{
+            const f: file? = open(\"{p}\", \"w\");
+            if f != null {{ close(f); write(f, \"x\"); }}
+            return 0;
+        }}"
+    );
+    assert!(run(&program).is_err());
 }
 
 #[test]

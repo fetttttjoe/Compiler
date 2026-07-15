@@ -27,6 +27,7 @@ pub enum TokenKind {
     FloatType,
     BoolType,
     StringType,
+    FileType,
     // Literals & identifiers
     Identifier(String),
     IntLiteral(i64),

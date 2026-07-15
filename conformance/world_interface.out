@@ -1,0 +1,9 @@
+args=0
+no stdin
+true
+1: first
+2: second
+true
+true
+true
+=> Int(2)

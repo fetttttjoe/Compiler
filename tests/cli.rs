@@ -38,10 +38,30 @@ fn runs_a_program_from_its_entry_file() {
 }
 
 #[test]
-fn more_than_one_argument_is_a_usage_error() {
-    let out = compiler(&["examples/main.ys", "examples/math.ys"]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("usage:"));
+fn trailing_cli_arguments_reach_the_program() {
+    // ADR 0031: everything after the entry file belongs to the program
+    // (the old "more than one argument" usage error is gone).
+    let dir = tempdir();
+    std::fs::write(
+        dir.join("args.ys"),
+        "fun main(args: string[]): int {
+            for a in args { print(a); }
+            return len(args);
+        }",
+    )
+    .unwrap();
+    let src = dir.join("args.ys");
+    let out = compiler(&[src.to_str().unwrap(), "alpha", "beta"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "alpha\nbeta\n=> Int(2)\n"
+    );
 }
 
 #[test]
@@ -286,25 +306,50 @@ fn main_with_parameters_is_rejected_by_both_engines() {
 #[test]
 fn compiled_runtime_errors_report_and_exit_1() {
     let dir = tempdir();
-    let cases: [(&str, &str, &str); 4] = [
+    let scratch = dir.join("rt_io.txt");
+    let p = scratch.to_str().unwrap();
+    let cases: [(&str, String, &str); 7] = [
         (
             "rt_f2i",
-            "fun main(): int { return int(0.0 / 0.0); }",
+            "fun main(): int { return int(0.0 / 0.0); }".to_string(),
             "invalid float to int conversion",
         ),
         (
+            "rt_closed",
+            format!(
+                "fun main(): int {{\n    const f: file? = open(\"{p}\", \"w\");\n    if f != null {{ close(f); write(f, \"x\"); }}\n    return 0;\n}}"
+            ),
+            "operation on closed file",
+        ),
+        (
+            "rt_readsize",
+            format!(
+                "fun main(): int {{\n    const f: file? = open(\"{p}\", \"w\");\n    if f != null {{ read(f, 0); }}\n    return 0;\n}}"
+            ),
+            "read size must be positive",
+        ),
+        (
+            "rt_closed_read",
+            // Closed outranks the size check — both engines agree.
+            format!(
+                "fun main(): int {{\n    const f: file? = open(\"{p}\", \"w\");\n    if f != null {{ close(f); read(f, 0); }}\n    return 0;\n}}"
+            ),
+            "operation on closed file",
+        ),
+        (
             "rt_oob",
-            "fun main(): int { const xs: int[] = [1, 2]; return xs[5]; }",
+            "fun main(): int { const xs: int[] = [1, 2]; return xs[5]; }".to_string(),
             "index 5 out of bounds (length 2)",
         ),
         (
             "rt_div0",
-            "fun main(): int { var z: int = 0; return 7 / z; }",
+            "fun main(): int { var z: int = 0; return 7 / z; }".to_string(),
             "division by zero",
         ),
         (
             "rt_ovf",
-            "fun main(): int {\n    var m: int = -9223372036854775807 - 1;\n    var d: int = -1;\n    return m % d;\n}",
+            "fun main(): int {\n    var m: int = -9223372036854775807 - 1;\n    var d: int = -1;\n    return m % d;\n}"
+                .to_string(),
             "division overflow",
         ),
     ];

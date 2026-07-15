@@ -279,6 +279,7 @@ pub(super) fn describe(kind: &TokenKind) -> &'static str {
         FloatType => "'float'",
         BoolType => "'bool'",
         StringType => "'string'",
+        FileType => "'file'",
         Identifier(_) => "an identifier",
         IntLiteral(_) => "an integer",
         FloatLiteral(_) => "a float",

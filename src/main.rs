@@ -51,7 +51,7 @@ fn main() {
 /// How to process the checked program: interpret it, build a native
 /// binary, or print pre-register-allocation IR.
 enum Mode {
-    Interpret,
+    Interpret { args: Vec<Vec<u8>> },
     Build { out: Option<std::path::PathBuf> },
     Ir,
 }
@@ -64,8 +64,15 @@ fn run() {
             (entry, Mode::Build { out })
         }
         [cmd, entry] if cmd == "ir" => (entry, Mode::Ir),
-        [cmd] if cmd == "ir" => usage(),
-        [entry] => (entry, Mode::Interpret),
+        [cmd, ..] if cmd == "ir" => usage(),
+        // Everything after the entry file belongs to the program
+        // (ADR 0031); compiled binaries receive argv natively.
+        [entry, prog @ ..] => (
+            entry,
+            Mode::Interpret {
+                args: prog.iter().map(|a| a.clone().into_bytes()).collect(),
+            },
+        ),
         _ => usage(),
     };
 
@@ -98,15 +105,13 @@ fn run() {
     match mode {
         Mode::Build { out } => {
             let out = out.unwrap_or_else(|| default_out(entry));
-            return build(main_fn, &graph, &resolutions, &out, &map);
+            build(main_fn, &graph, &resolutions, &out, &map)
         }
-        Mode::Ir => return print_ir(main_fn, &graph, &resolutions, &map),
-        Mode::Interpret => {}
-    }
-
-    match interpreter::interpret(&graph, &resolutions) {
-        Ok((value, heap)) => write_stdout(&format!("=> {}\n", value.render(&heap))),
-        Err(diag) => exit_on_errors(&[diag], &map),
+        Mode::Ir => print_ir(main_fn, &graph, &resolutions, &map),
+        Mode::Interpret { args } => match interpreter::interpret(&graph, &resolutions, &args) {
+            Ok((value, heap)) => write_stdout(&format!("=> {}\n", value.render(&heap))),
+            Err(diag) => exit_on_errors(&[diag], &map),
+        },
     }
 }
 

@@ -10,11 +10,35 @@ use std::process::Command;
 /// build, then asserts the binary's exit code equals the interpreted
 /// value masked to 8 bits (Unix truncates exit codes to one byte).
 fn diff(name: &str, program: &str) {
+    diff_io(name, program, &[], b"");
+}
+
+/// Spawns with piped stdio and feeds `stdin` — both engines must see
+/// the same world (ADR 0031); an empty pipe is a deterministic EOF.
+fn run_with(cmd: &mut Command, stdin: &[u8]) -> std::process::Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    child.wait_with_output().expect("wait")
+}
+
+/// `diff` with program arguments and stdin. Output comparison is on
+/// RAW BYTES — strings are bytes (ADR 0013), and lossy re-decoding
+/// would hide exactly the divergences the harness exists to catch.
+fn diff_io(name: &str, program: &str, args: &[&str], stdin: &[u8]) {
     let dir = tempdir("ys-diff-test");
     let src = dir.join(format!("{name}.ys"));
     std::fs::write(&src, program).unwrap();
 
-    let out = compiler(&[src.to_str().unwrap()]);
+    let mut oracle = Command::new(env!("CARGO_BIN_EXE_Compiler"));
+    oracle.arg(src.to_str().unwrap()).args(args);
+    let out = run_with(&mut oracle, stdin);
     assert!(
         out.status.success(),
         "oracle failed: {}",
@@ -23,16 +47,18 @@ fn diff(name: &str, program: &str) {
     // The oracle's stdout is the program's print output plus a final
     // "=> value" result line; the compiled binary must reproduce the
     // print output exactly and the value as its exit code.
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let trimmed = stdout.trim_end_matches('\n');
-    let (prints, result) = match trimmed.rsplit_once('\n') {
-        Some((prints, result)) => (format!("{prints}\n"), result),
-        None => (String::new(), trimmed),
+    let stdout = out.stdout;
+    assert_eq!(stdout.last(), Some(&b'\n'), "oracle output unterminated");
+    let cut = stdout[..stdout.len() - 1].iter().rposition(|&b| b == b'\n');
+    let (prints, result) = match cut {
+        Some(i) => (&stdout[..i + 1], &stdout[i + 1..stdout.len() - 1]),
+        None => (&stdout[..0], &stdout[..stdout.len() - 1]),
     };
-    let value: i64 = result
-        .strip_prefix("=> Int(")
+    let value: i64 = std::str::from_utf8(result)
+        .ok()
+        .and_then(|r| r.strip_prefix("=> Int("))
         .and_then(|s| s.strip_suffix(')'))
-        .unwrap_or_else(|| panic!("oracle printed a non-int: {stdout}"))
+        .unwrap_or_else(|| panic!("oracle printed a non-int result"))
         .parse()
         .unwrap();
 
@@ -43,17 +69,16 @@ fn diff(name: &str, program: &str) {
         "build failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let run = Command::new(&bin)
-        .output()
-        .expect("failed to run built binary");
+    let mut native = Command::new(&bin);
+    native.args(args);
+    let run = run_with(&mut native, stdin);
     assert_eq!(
         run.status.code(),
         Some((value & 0xff) as i32),
         "'{name}' diverged from oracle value {value}"
     );
     assert_eq!(
-        String::from_utf8_lossy(&run.stdout),
-        prints,
+        run.stdout, prints,
         "'{name}' print output diverged from the oracle"
     );
 }
@@ -2113,6 +2138,84 @@ fn template_literals_agree_with_manual_concat() {
             print(acc);
             return 0;
         }"#,
+    );
+}
+
+// ---- world interface (ADR 0031) -------------------------------------------
+
+#[test]
+fn args_and_stdin_flow_through_both_engines() {
+    diff_io(
+        "worldargs",
+        r#"fun main(args: string[]): int {
+            print(`argc=${len(args)}`);
+            for a in args { print(`arg=[${a}]`); }
+            var n: int = 0;
+            var line: string? = readLine();
+            while line != null {
+                n = n + 1;
+                print(`${n}: ${line}`);
+                line = readLine();
+            }
+            return len(args) + n;
+        }"#,
+        &["alpha", "beta gamma", ""],
+        b"first\nsecond\n\nlast without newline",
+    );
+}
+
+#[test]
+fn file_handles_round_trip_bytes() {
+    // Both engines run the same program against the same path in
+    // sequence; "w" truncates, so each run is deterministic.
+    let dir = tempdir("ys-diff-io");
+    let path = dir.join("data.txt");
+    let p = path.to_str().unwrap();
+    diff(
+        "worldfile",
+        &format!(
+            r#"fun main(): int {{
+                const w: file? = open("{p}", "w");
+                var ok: int = 0;
+                if w != null {{
+                    if write(w, `x=${{7}}\n`) {{ ok = ok + 1; }}
+                    if write(w, "tail") {{ ok = ok + 1; }}
+                    if close(w) {{ ok = ok + 1; }}
+                }}
+                const r: file? = open("{p}", "r");
+                if r != null {{
+                    print(readLine(r));
+                    print(read(r, 2));
+                    print(read(r, 99));
+                    print(read(r, 99));
+                    print(close(r));
+                }}
+                print(open("{p}/nope", "r") == null);
+                print(open("{p}", "rw") == null);
+                return ok;
+            }}"#
+        ),
+    );
+}
+
+#[test]
+fn non_utf8_stdin_bytes_pass_through() {
+    // Strings are raw bytes (ADR 0013): invalid UTF-8 must survive the
+    // readLine → concat → print pipeline in both engines untouched.
+    diff_io(
+        "worldbytes",
+        r#"fun main(): int {
+            var n: int = 0;
+            var line: string? = readLine();
+            while line != null {
+                print("got: " + line);
+                n = n + 1;
+                line = readLine();
+            }
+            return n;
+        }"#,
+        &[],
+        b"\xff\xfe raw \x80 bytes\n\xc3(bad continuation\n",
     );
 }
 

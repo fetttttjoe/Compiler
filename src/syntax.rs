@@ -59,6 +59,7 @@ pub const KW_INT: &str = "int";
 pub const KW_FLOAT: &str = "float";
 pub const KW_BOOL: &str = "bool";
 pub const KW_STRING: &str = "string";
+pub const KW_FILE: &str = "file";
 pub const KW_TRUE: &str = "true";
 pub const KW_FALSE: &str = "false";
 pub const KW_NULL: &str = "null";
@@ -82,6 +83,12 @@ pub const ENTRY_FN: &str = "main";
 pub const BUILTIN_PRINT: &str = "print";
 pub const BUILTIN_LEN: &str = "len";
 pub const BUILTIN_PUSH: &str = "push";
+/// The world interface (ADR 0031): files and stdin.
+pub const BUILTIN_OPEN: &str = "open";
+pub const BUILTIN_READ: &str = "read";
+pub const BUILTIN_READLINE: &str = "readLine";
+pub const BUILTIN_WRITE: &str = "write";
+pub const BUILTIN_CLOSE: &str = "close";
 
 /// True for a source line break (`\n` or `\r`). CRLF is handled by the caller
 /// consuming the trailing `\n`.

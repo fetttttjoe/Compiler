@@ -64,6 +64,7 @@ pub enum TypeAnn {
     Float,
     Bool,
     Str,
+    File,
     Named(String),
     /// `T?` — T or null.
     Optional(Box<TypeAnn>),

@@ -30,6 +30,14 @@ pub(crate) const RT_PUSH_N: &str = "ys_push_n";
 /// byte buffer and copies bytes in; `ys_sb_int` renders one i64 into it.
 pub(crate) const RT_SB_APPEND: &str = "ys_sb_append";
 pub(crate) const RT_SB_INT: &str = "ys_sb_int";
+/// The world interface (ADR 0031): argv materialization, file handles
+/// (heap boxes `{FILE*, closed}`), and line input.
+pub(crate) const RT_ARGS: &str = "ys_args";
+pub(crate) const RT_OPEN: &str = "ys_open";
+pub(crate) const RT_READ: &str = "ys_read";
+pub(crate) const RT_READLINE: &str = "ys_readline";
+pub(crate) const RT_WRITE: &str = "ys_write";
+pub(crate) const RT_CLOSE: &str = "ys_close";
 /// The builder's `{len, cap, ptr}` header: lowered code stores len = 0
 /// to reset and reads `{len, ptr}` to consume the bytes.
 pub(crate) const SB_HDR: &str = ".Lys_sb";
@@ -43,6 +51,14 @@ pub(crate) const RT_DPRINTF: &str = "dprintf@PLT";
 /// The float formatter (ADR 0027) and the libc pieces only it uses.
 pub(crate) const RT_FMT_F64: &str = "ys_fmt_f64";
 pub(crate) const RT_SNPRINTF: &str = "snprintf@PLT";
+// libc pieces of the world interface (ADR 0031).
+pub(crate) const RT_FOPEN: &str = "fopen@PLT";
+pub(crate) const RT_FCLOSE: &str = "fclose@PLT";
+pub(crate) const RT_FREAD: &str = "fread@PLT";
+pub(crate) const RT_FWRITE: &str = "fwrite@PLT";
+pub(crate) const RT_FFLUSH: &str = "fflush@PLT";
+pub(crate) const RT_GETLINE: &str = "getline@PLT";
+pub(crate) const RT_STRLEN: &str = "strlen@PLT";
 pub(crate) const RT_STRTOD: &str = "strtod@PLT";
 // abort left the inventory with ADR 0022: traps report and exit 1.
 pub(crate) const RT_EXIT: &str = "exit@PLT";
@@ -52,6 +68,8 @@ pub(crate) const TRAP_DIV0: &str = "ys_trap_div0";
 pub(crate) const TRAP_OVERFLOW: &str = "ys_trap_overflow";
 pub(crate) const TRAP_OOB: &str = "ys_trap_oob";
 pub(crate) const TRAP_F2I: &str = "ys_trap_f2i";
+pub(crate) const TRAP_CLOSED: &str = "ys_trap_closed";
+pub(crate) const TRAP_READSIZE: &str = "ys_trap_readsize";
 
 /// printf formats and fixed strings for `print`. `FMT_INT_RAW` carries
 /// no newline — it is `ys_sb_int`'s snprintf format (ADR 0029).
@@ -67,6 +85,8 @@ pub(crate) const FMT_TRAP_OOB: &str = ".Lfmt_trap_oob";
 pub(crate) const MSG_DIV0: &str = ".Lmsg_div0";
 pub(crate) const MSG_OVERFLOW: &str = ".Lmsg_overflow";
 pub(crate) const MSG_F2I: &str = ".Lmsg_f2i";
+pub(crate) const MSG_CLOSED: &str = ".Lmsg_closed";
+pub(crate) const MSG_READSIZE: &str = ".Lmsg_readsize";
 
 /// The assembly symbol for a function: the entry `main` keeps its name
 /// (the C runtime calls it); everything else is suffixed with its module
@@ -325,6 +345,8 @@ fn one_message_traps() -> String {
         (TRAP_DIV0, MSG_DIV0),
         (TRAP_OVERFLOW, MSG_OVERFLOW),
         (TRAP_F2I, MSG_F2I),
+        (TRAP_CLOSED, MSG_CLOSED),
+        (TRAP_READSIZE, MSG_READSIZE),
     ]
     .into_iter()
     .map(|(stub, msg)| {
@@ -346,6 +368,300 @@ fn one_message_traps() -> String {
     })
     .collect::<String>()
         + &sb_runtime()
+        + &io_runtime()
+}
+
+/// The world interface (ADR 0031). A file handle is a heap box
+/// `{FILE*, closed}` — the closed flag is what turns use-after-close
+/// into the diagnosed trap the interpreter also reports, instead of
+/// libc UB. Environmental failure returns null/false; `read`/`readLine`
+/// fill a caller-provided `{tag, ptr, len}` value optional (ADR 0021).
+/// Writes fflush every time: the oracle's writes are unbuffered, and
+/// write-then-reopen-then-read must agree across engines.
+fn io_runtime() -> String {
+    format!(
+        "\
+{RT_ARGS}:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tpushq %rbx
+\tpushq %r12
+\tpushq %r13
+\tpushq %r14
+\tpushq %r15
+\tsubq $8, %rsp
+\tmovq %rdi, %r12            # argc (>= 1 under any real crt)
+\tmovq %rsi, %r13            # argv
+\tcmpq $1, %r12
+\tjge .Lys_args_hdr
+\tmovq $1, %r12
+.Lys_args_hdr:
+\tmovq $24, %rdi             # array header {{len, cap, data*}}
+\tcall {RT_MALLOC}
+\tmovq %rax, %r14
+\tleaq -1(%r12), %rax        # n = argc - 1: argv[0] is not an arg
+\tmovq %rax, 0(%r14)
+\tmovq %rax, 8(%r14)
+\tshlq $4, %rax              # string descriptors are 16 bytes
+\tmovq %rax, %rdi
+\tcall {RT_MALLOC}
+\tmovq %rax, 16(%r14)
+\tmovq %rax, %r15
+.Lys_args_loop:
+\tcmpq $1, %r12
+\tjle .Lys_args_done
+\tmovq 8(%r13), %rbx         # the next argument's bytes
+\taddq $8, %r13
+\tdecq %r12
+\tmovq %rbx, %rdi
+\tcall {RT_STRLEN}
+\tmovq %rbx, 0(%r15)         # descriptor {{ptr, len}}
+\tmovq %rax, 8(%r15)
+\taddq $16, %r15
+\tjmp .Lys_args_loop
+.Lys_args_done:
+\tmovq %r14, %rax
+\taddq $8, %rsp
+\tpopq %r15
+\tpopq %r14
+\tpopq %r13
+\tpopq %r12
+\tpopq %rbx
+\tpopq %rbp
+\tret
+{RT_OPEN}:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tpushq %rbx                 # path descriptor
+\tpushq %r12                 # mode cstr
+\tpushq %r13                 # NUL-terminated path copy
+\tpushq %r14                 # FILE*
+\tmovq %rdi, %rbx
+# -- the mode set is pinned to r/w/a (ADR 0031): both engines validate
+#    it themselves, so fopen's extended modes can't diverge
+\tcmpq $1, 8(%rsi)
+\tjne .Lys_open_fail
+\tmovq 0(%rsi), %rax
+\tmovzbl (%rax), %eax
+\tleaq .Lys_mode_r(%rip), %r12
+\tcmpb $114, %al             # 'r'
+\tje .Lys_open_path
+\tleaq .Lys_mode_w(%rip), %r12
+\tcmpb $119, %al             # 'w'
+\tje .Lys_open_path
+\tleaq .Lys_mode_a(%rip), %r12
+\tcmpb $97, %al              # 'a'
+\tjne .Lys_open_fail
+.Lys_open_path:
+\tmovq 8(%rbx), %rdi         # fopen needs NUL termination; a path
+\tincq %rdi                  # with an embedded NUL can't name a file
+\tcall {RT_MALLOC}
+\tmovq %rax, %r13
+\tmovq %rax, %rdi
+\tmovq 0(%rbx), %rsi
+\tmovq 8(%rbx), %rdx
+\tcall {RT_MEMCPY}
+\tmovq 8(%rbx), %rax
+\tmovb $0, 0(%r13,%rax)
+\tmovq %r13, %rdi
+\tcall {RT_STRLEN}
+\tcmpq 8(%rbx), %rax         # embedded NUL: strlen comes up short
+\tjne .Lys_open_fail
+\tmovq %r13, %rdi
+\tmovq %r12, %rsi
+\tcall {RT_FOPEN}
+\ttestq %rax, %rax
+\tje .Lys_open_fail
+\tmovq %rax, %r14
+\tmovq $16, %rdi             # the handle box {{FILE*, closed}}
+\tcall {RT_MALLOC}
+\tmovq %r14, 0(%rax)
+\tmovq $0, 8(%rax)
+\tjmp .Lys_open_ret
+.Lys_open_fail:
+\txorl %eax, %eax
+.Lys_open_ret:
+\tpopq %r14
+\tpopq %r13
+\tpopq %r12
+\tpopq %rbx
+\tpopq %rbp
+\tret
+{RT_READ}:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tpushq %rbx                 # box
+\tpushq %r12                 # max
+\tpushq %r13                 # dst optional {{tag, ptr, len}}
+\tpushq %r14                 # buffer
+\tmovq %rdi, %rbx
+\tmovq %rsi, %r12
+\tmovq %rdx, %r13
+\tcmpq $0, 8(%rdi)
+\tje .Lys_read_open
+\tmovq %rcx, %rdi
+\tcall {TRAP_CLOSED}
+.Lys_read_open:
+\ttestq %r12, %r12
+\tjg .Lys_read_sized
+\tmovq %rcx, %rdi
+\tcall {TRAP_READSIZE}
+.Lys_read_sized:
+\tmovq %r12, %rdi
+\tcall {RT_MALLOC}
+\tmovq %rax, %r14
+\tmovq %rax, %rdi            # fread(buf, 1, max, f): loops short
+\tmovl $1, %esi              # reads internally — the oracle mirrors
+\tmovq %r12, %rdx
+\tmovq 0(%rbx), %rcx
+\tcall {RT_FREAD}
+\ttestq %rax, %rax
+\tjne .Lys_read_some
+\tmovq $0, 0(%r13)           # EOF/error: null (zeroed payload)
+\tmovq $0, 8(%r13)
+\tmovq $0, 16(%r13)
+\tjmp .Lys_read_ret
+.Lys_read_some:
+\tmovq $1, 0(%r13)
+\tmovq %r14, 8(%r13)
+\tmovq %rax, 16(%r13)
+.Lys_read_ret:
+\tpopq %r14
+\tpopq %r13
+\tpopq %r12
+\tpopq %rbx
+\tpopq %rbp
+\tret
+{RT_READLINE}:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tpushq %rbx                 # FILE*
+\tpushq %r12                 # dst optional {{tag, ptr, len}}
+\tpushq %r13                 # line length
+\tpushq %r14                 # copied-out bytes
+\tmovq %rsi, %r12
+\ttestq %rdi, %rdi           # box 0 is the stdin form (arity 0):
+\tje .Lys_rl_stdin           # only the lowering emits it
+\tcmpq $0, 8(%rdi)
+\tje .Lys_rl_file
+\tmovq %rdx, %rdi
+\tcall {TRAP_CLOSED}
+.Lys_rl_file:
+\tmovq 0(%rdi), %rbx
+\tjmp .Lys_rl_go
+.Lys_rl_stdin:
+\tmovq stdin@GOTPCREL(%rip), %rax
+\tmovq (%rax), %rbx
+.Lys_rl_go:
+\tleaq .Lys_rl_buf(%rip), %rdi     # getline reuses one static buffer
+\tleaq .Lys_rl_cap(%rip), %rsi
+\tmovq %rbx, %rdx
+\tcall {RT_GETLINE}
+\tcmpq $0, %rax
+\tjg .Lys_rl_some
+\tmovq $0, 0(%r12)           # EOF/error: null (zeroed payload)
+\tmovq $0, 8(%r12)
+\tmovq $0, 16(%r12)
+\tjmp .Lys_rl_ret
+.Lys_rl_some:
+\tmovq %rax, %r13
+\tleaq .Lys_rl_buf(%rip), %rax
+\tmovq (%rax), %rax
+\tcmpb $10, -1(%rax,%r13)    # strip one trailing newline
+\tjne .Lys_rl_copy
+\tdecq %r13                  # an empty line is a 0-length string
+.Lys_rl_copy:
+\tmovq %r13, %rdi
+\tcall {RT_MALLOC}
+\tmovq %rax, %r14
+\tmovq %rax, %rdi
+\tleaq .Lys_rl_buf(%rip), %rax
+\tmovq (%rax), %rsi
+\tmovq %r13, %rdx
+\tcall {RT_MEMCPY}
+\tmovq $1, 0(%r12)
+\tmovq %r14, 8(%r12)
+\tmovq %r13, 16(%r12)
+.Lys_rl_ret:
+\tpopq %r14
+\tpopq %r13
+\tpopq %r12
+\tpopq %rbx
+\tpopq %rbp
+\tret
+{RT_WRITE}:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tpushq %rbx                 # box
+\tpushq %r12                 # string descriptor
+\tpushq %r13                 # length
+\tsubq $8, %rsp
+\tmovq %rdi, %rbx
+\tmovq %rsi, %r12
+\tcmpq $0, 8(%rdi)
+\tje .Lys_write_open
+\tmovq %rdx, %rdi
+\tcall {TRAP_CLOSED}
+.Lys_write_open:
+\tmovq 0(%r12), %rdi         # fwrite(ptr, 1, len, f)
+\tmovl $1, %esi
+\tmovq 8(%r12), %rdx
+\tmovq %rdx, %r13
+\tmovq 0(%rbx), %rcx
+\tcall {RT_FWRITE}
+\tcmpq %r13, %rax
+\tjne .Lys_write_fail
+\tmovq 0(%rbx), %rdi         # fflush per write: oracle writes are
+\tcall {RT_FFLUSH}           # unbuffered, reopen-and-read must agree
+\ttestl %eax, %eax
+\tjne .Lys_write_fail
+\tmovl $1, %eax
+\tjmp .Lys_write_ret
+.Lys_write_fail:
+\txorl %eax, %eax
+.Lys_write_ret:
+\taddq $8, %rsp
+\tpopq %r13
+\tpopq %r12
+\tpopq %rbx
+\tpopq %rbp
+\tret
+{RT_CLOSE}:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tpushq %rbx
+\tsubq $8, %rsp
+\tmovq %rdi, %rbx
+\tcmpq $0, 8(%rdi)
+\tje .Lys_close_open
+\tmovq %rsi, %rdi
+\tcall {TRAP_CLOSED}
+.Lys_close_open:
+\tmovq $1, 8(%rbx)           # closed before fclose: the box outlives it
+\tmovq 0(%rbx), %rdi
+\tcall {RT_FCLOSE}
+\ttestl %eax, %eax
+\tsete %al
+\tmovzbl %al, %eax
+\taddq $8, %rsp
+\tpopq %rbx
+\tpopq %rbp
+\tret
+\t.section .rodata
+.Lys_mode_r:
+\t.string \"r\"
+.Lys_mode_w:
+\t.string \"w\"
+.Lys_mode_a:
+\t.string \"a\"
+\t.section .bss
+.Lys_rl_buf:
+\t.skip 8                    # getline's buffer pointer (grows, reused)
+.Lys_rl_cap:
+\t.skip 8
+\t.text
+"
+    )
 }
 
 /// The shared text builder (ADR 0029): one static `{len, cap, ptr}`
@@ -695,6 +1011,10 @@ fn rodata() -> String {
 \t.string \"division overflow\"
 {MSG_F2I}:
 \t.string \"invalid float to int conversion\"
+{MSG_CLOSED}:
+\t.string \"operation on closed file\"
+{MSG_READSIZE}:
+\t.string \"read size must be positive\"
 "
     )
 }

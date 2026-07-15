@@ -30,6 +30,9 @@ impl Value {
             Value::Str(s) => s.clone(),
             Value::Null => b"null".to_vec(),
             Value::Unit => b"unit".to_vec(),
+            // Opaque handle (ADR 0031): constant text — an address or
+            // table index could never match across engines.
+            Value::File(_) => b"file".to_vec(),
             // The hop consumes a level, the object's children another.
             Value::Ref(id) if depth == 1 => {
                 let _ = id;
@@ -89,6 +92,7 @@ impl Value {
             Value::Struct { .. } => "struct",
             Value::Ref(_) => "refstruct",
             Value::Array(_) => "array",
+            Value::File(_) => "file",
             Value::Null => "null",
             Value::Unit => "unit",
         }

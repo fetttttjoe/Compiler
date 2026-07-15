@@ -9,6 +9,9 @@ pub enum Type {
     Float,
     Bool,
     Str,
+    /// An open file handle (ADR 0031) — opaque, identity equality,
+    /// ref-shaped like refstruct handles so `file?` is a free word.
+    File,
     /// A struct type identified by (defining module, name) — same-named
     /// structs in different modules are distinct types.
     Struct(usize, String),
@@ -58,6 +61,7 @@ impl Type {
             Type::Float => "float".to_string(),
             Type::Bool => "bool".to_string(),
             Type::Str => "string".to_string(),
+            Type::File => "file".to_string(),
             Type::Struct(_, n) => n.clone(),
             Type::Optional(inner) => format!("{}?", inner.name()),
             Type::Array(inner) if unconstrained(inner) => "[]".to_string(),

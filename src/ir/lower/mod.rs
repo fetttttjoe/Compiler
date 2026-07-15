@@ -9,8 +9,9 @@ use super::{FunctionIr, Inst, Lbl, V, unsupported};
 use crate::ast::{BinOp, Conv, Expr, Function, Stmt, UnOp};
 use crate::check::Resolutions;
 use crate::codegen::{
-    FALSE_S, FMT_CSTR, FMT_INT, FMT_STR, NULL_S, RT_FMT_F64, RT_MALLOC, RT_MEMCPY, RT_PRINTF,
-    RT_PUSH, RT_PUSH_N, RT_SB_INT, SB_HDR, Strings, TRUE_S, label_of,
+    FALSE_S, FMT_CSTR, FMT_INT, FMT_STR, NULL_S, RT_ARGS, RT_CLOSE, RT_FMT_F64, RT_MALLOC,
+    RT_MEMCPY, RT_OPEN, RT_PRINTF, RT_PUSH, RT_PUSH_N, RT_READ, RT_READLINE, RT_SB_INT, RT_WRITE,
+    SB_HDR, Strings, TRUE_S, label_of,
 };
 use crate::diagnostic::Diagnostic;
 use crate::source::SourceMap;
@@ -91,13 +92,36 @@ pub(super) fn lower(
         let v = lo.fresh(false);
         lo.sret = Some(v);
     }
-    for (p, ty) in f.params.iter().zip(&sig.params) {
-        kind_of(ty, res, FUEL).ok_or_else(|| unsupported("parameters of this type", f.span))?;
-        let v = lo.fresh(*ty == Type::Float);
-        let opt_inner = lo.opt_inner_of(ty);
-        lo.scopes[0].insert(p.name.clone(), Binding { v, opt_inner });
+    // The entry `main(args: string[])` (ADR 0031): the C runtime calls
+    // main(argc, argv), so the IR takes those two words and binds the
+    // ys parameter to the materialized argv array instead.
+    let entry_args = module == 0 && f.name == crate::syntax::ENTRY_FN && !f.params.is_empty();
+    if entry_args {
+        let argc = lo.fresh(false);
+        let argv = lo.fresh(false);
+        let handle = lo.fresh(false);
+        lo.insts.push(Inst::CallRt {
+            dst: handle,
+            sym: RT_ARGS,
+            args: vec![argc, argv],
+            varargs: false,
+        });
+        lo.scopes[0].insert(
+            f.params[0].name.clone(),
+            Binding {
+                v: handle,
+                opt_inner: None,
+            },
+        );
+    } else {
+        for (p, ty) in f.params.iter().zip(&sig.params) {
+            kind_of(ty, res, FUEL).ok_or_else(|| unsupported("parameters of this type", f.span))?;
+            let v = lo.fresh(*ty == Type::Float);
+            let opt_inner = lo.opt_inner_of(ty);
+            lo.scopes[0].insert(p.name.clone(), Binding { v, opt_inner });
+        }
     }
-    let nparams = lo.vregs;
+    let nparams = if entry_args { 2 } else { lo.vregs };
     for stmt in &f.body {
         lo.stmt(stmt)?;
     }
@@ -1365,6 +1389,81 @@ impl Lowerer<'_> {
 
     fn builtin(&mut self, name: &str, args: &[Expr], span: Span) -> Result<V, Diagnostic> {
         match (name, args) {
+            // The world interface (ADR 0031): open/write/close return
+            // words; read/readLine fill a 3-word tagged string optional.
+            ("open", [path, mode]) => {
+                let p = self.expr(path)?;
+                let m = self.expr(mode)?;
+                let dst = self.fresh(false);
+                self.insts.push(Inst::CallRt {
+                    dst,
+                    sym: RT_OPEN,
+                    args: vec![p, m],
+                    varargs: false,
+                });
+                Ok(dst)
+            }
+            ("read", [file, max]) => {
+                let f = self.expr(file)?;
+                let n = self.expr(max)?;
+                let loc_lbl = self.loc_of(span);
+                let loc = self.lea_sym(loc_lbl);
+                let out = self.fresh(false);
+                self.insts.push(Inst::Temp { dst: out, words: 3 });
+                let d = self.fresh(false);
+                self.insts.push(Inst::CallRt {
+                    dst: d,
+                    sym: RT_READ,
+                    args: vec![f, n, out, loc],
+                    varargs: false,
+                });
+                Ok(out)
+            }
+            ("readLine", []) | ("readLine", [_]) => {
+                let f = match args {
+                    [file] => self.expr(file)?,
+                    _ => self.const_word(0), // the stdin form
+                };
+                let loc_lbl = self.loc_of(span);
+                let loc = self.lea_sym(loc_lbl);
+                let out = self.fresh(false);
+                self.insts.push(Inst::Temp { dst: out, words: 3 });
+                let d = self.fresh(false);
+                self.insts.push(Inst::CallRt {
+                    dst: d,
+                    sym: RT_READLINE,
+                    args: vec![f, out, loc],
+                    varargs: false,
+                });
+                Ok(out)
+            }
+            ("write", [file, s]) => {
+                let f = self.expr(file)?;
+                let sv = self.expr(s)?;
+                let loc_lbl = self.loc_of(span);
+                let loc = self.lea_sym(loc_lbl);
+                let dst = self.fresh(false);
+                self.insts.push(Inst::CallRt {
+                    dst,
+                    sym: RT_WRITE,
+                    args: vec![f, sv, loc],
+                    varargs: false,
+                });
+                Ok(dst)
+            }
+            ("close", [file]) => {
+                let f = self.expr(file)?;
+                let loc_lbl = self.loc_of(span);
+                let loc = self.lea_sym(loc_lbl);
+                let dst = self.fresh(false);
+                self.insts.push(Inst::CallRt {
+                    dst,
+                    sym: RT_CLOSE,
+                    args: vec![f, loc],
+                    varargs: false,
+                });
+                Ok(dst)
+            }
             ("len", [array]) => {
                 let arr = self.expr(array)?;
                 let dst = self.fresh(false);

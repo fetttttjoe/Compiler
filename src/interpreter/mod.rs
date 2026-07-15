@@ -27,6 +27,19 @@ const INTERP_STACK_BYTES: usize = 1 << 30;
 pub struct Heap {
     structs: Vec<StructObj>,
     arrays: Vec<Vec<Value>>,
+    files: Vec<FileEntry>,
+}
+
+/// An open file's engine state (ADR 0031): the mode decides which
+/// operations can succeed, and `Closed` makes use-after-close a
+/// diagnosable bug instead of UB. Reads buffer (getline parity needs
+/// lookahead); writes go straight to the fd — the compiled runtime
+/// fflushes per write to match.
+#[derive(Debug)]
+enum FileEntry {
+    Read(std::io::BufReader<std::fs::File>),
+    Write(std::fs::File),
+    Closed,
 }
 
 /// A refstruct object; fields sorted by name like inline structs.
@@ -71,6 +84,9 @@ pub enum Value {
     Ref(usize),
     /// An array: a handle to one shared, growable heap buffer.
     Array(usize),
+    /// An open file (ADR 0031): a handle into the files table, identity
+    /// equality like every handle.
+    File(usize),
     /// The `null` literal — the empty state of a `T?` slot.
     Null,
     Unit,
@@ -89,12 +105,13 @@ mod tests;
 pub fn interpret(
     graph: &ModuleGraph,
     resolutions: &Resolutions,
+    args: &[Vec<u8>],
 ) -> Result<(Value, Heap), Diagnostic> {
     std::thread::scope(|scope| {
         let worker = std::thread::Builder::new()
             .name("interpreter".to_string())
             .stack_size(INTERP_STACK_BYTES)
-            .spawn_scoped(scope, || eval::run_program(graph, resolutions));
+            .spawn_scoped(scope, || eval::run_program(graph, resolutions, args));
         match worker {
             Ok(handle) => handle
                 .join()

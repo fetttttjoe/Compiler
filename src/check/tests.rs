@@ -98,6 +98,42 @@ fn string_conversion_accepts_values_and_rejects_no_ops() {
 }
 
 #[test]
+fn world_interface_builtins_are_typed() {
+    // ADR 0031: open/read/readLine/write/close signatures, both
+    // readLine arities, and the widened entry rule.
+    assert!(
+        diags(
+            "fun main(args: string[]): int {
+            const f: file? = open(\"x\", \"r\");
+            if f != null {
+                const s: string? = readLine(f);
+                const c: string? = read(f, 4);
+                const ok: bool = write(f, \"data\");
+                const done: bool = close(f);
+            }
+            const l: string? = readLine();
+            return len(args);
+        }"
+        )
+        .is_empty()
+    );
+    let d = diags("fun f() { const x: file? = open(1, \"r\"); }");
+    assert!(d[0].message.contains("'open' expects string, found int"));
+    let d = diags("fun f(g: file) { read(g, \"x\"); }");
+    assert!(d[0].message.contains("'read' expects int, found string"));
+    let d = diags("fun f(g: file) { close(g, g); }");
+    assert!(d[0].message.contains("'close' expects 1 argument, found 2"));
+    let d = diags("fun f(g: file?) { close(g); }");
+    assert!(d[0].message.contains("'close' expects file, found file?"));
+    let d = diags("fun main(a: int): int { return a; }");
+    assert!(
+        d[0].message
+            .contains("takes no parameters or exactly (args: string[])")
+    );
+    assert!(diags("fun main(args: string[]): int { return len(args); }").is_empty());
+}
+
+#[test]
 fn templates_interpolate_strings_but_not_unit_or_null() {
     // ADR 0030: `${s}` passes a string through (the implicit form);
     // unit and null still have no text.

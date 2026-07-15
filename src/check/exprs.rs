@@ -310,6 +310,31 @@ impl Checker<'_> {
                 }
                 return Type::Int;
             }
+            // The world interface (ADR 0031). Failure is a value:
+            // open/read/readLine produce optionals, write/close bools.
+            if name == syntax::BUILTIN_OPEN {
+                self.expect_builtin_args(&name, args, &[Type::Str, Type::Str], span);
+                return Type::Optional(Box::new(Type::File));
+            }
+            if name == syntax::BUILTIN_READ {
+                self.expect_builtin_args(&name, args, &[Type::File, Type::Int], span);
+                return Type::Optional(Box::new(Type::Str));
+            }
+            if name == syntax::BUILTIN_READLINE {
+                // Arity 0 reads stdin; arity 1 reads a file.
+                if !args.is_empty() {
+                    self.expect_builtin_args(&name, args, &[Type::File], span);
+                }
+                return Type::Optional(Box::new(Type::Str));
+            }
+            if name == syntax::BUILTIN_WRITE {
+                self.expect_builtin_args(&name, args, &[Type::File, Type::Str], span);
+                return Type::Bool;
+            }
+            if name == syntax::BUILTIN_CLOSE {
+                self.expect_builtin_args(&name, args, &[Type::File], span);
+                return Type::Bool;
+            }
             if name == syntax::BUILTIN_PUSH {
                 if args.len() != 2 {
                     self.error(
@@ -612,6 +637,39 @@ impl Checker<'_> {
     /// The innermost binding for `name`, searching scopes inside-out.
     pub(super) fn find_var(&self, name: &str) -> Option<&VarInfo> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    /// Arity and per-argument typing for a fixed-signature builtin;
+    /// arguments are always typed (even on arity errors) for recovery.
+    fn expect_builtin_args(&mut self, name: &str, args: &[Expr], want: &[Type], span: Span) {
+        if args.len() != want.len() {
+            self.error(
+                format!(
+                    "'{name}' expects {} argument{}, found {}",
+                    want.len(),
+                    if want.len() == 1 { "" } else { "s" },
+                    args.len()
+                ),
+                span,
+            );
+            for arg in args {
+                self.type_of_expr(arg);
+            }
+            return;
+        }
+        for (arg, want) in args.iter().zip(want) {
+            let ty = self.type_of_expr(arg);
+            if !fits(&ty, want) && !poisoned(&ty) {
+                self.error(
+                    format!(
+                        "'{name}' expects {}, found {}",
+                        self.type_name(want),
+                        self.type_name(&ty)
+                    ),
+                    arg.span(),
+                );
+            }
+        }
     }
 
     pub(super) fn lookup(&mut self, name: &str, span: Span) -> Type {

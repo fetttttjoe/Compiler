@@ -10,6 +10,7 @@ use super::*;
 pub(super) fn run_program(
     graph: &ModuleGraph,
     resolutions: &Resolutions,
+    args: &[Vec<u8>],
 ) -> Result<(Value, Heap), Diagnostic> {
     let mut functions: HashMap<(usize, &str), &Function> = HashMap::new();
     for (mi, module) in graph.modules.iter().enumerate() {
@@ -28,7 +29,17 @@ pub(super) fn run_program(
         heap: Heap::default(),
     };
     let value = match interp.functions.get(&(0, syntax::ENTRY_FN)).copied() {
-        Some(main) => interp.call(main, 0, Vec::new(), Span::new(0, 0))?,
+        // `main(args: string[])` (ADR 0031): materialize argv once.
+        Some(main) => {
+            let argv = if main.params.is_empty() {
+                Vec::new()
+            } else {
+                let items = args.iter().map(|a| Value::Str(a.clone())).collect();
+                interp.heap.arrays.push(items);
+                vec![Value::Array(interp.heap.arrays.len() - 1)]
+            };
+            interp.call(main, 0, argv, Span::new(0, 0))?
+        }
         None => Value::Unit,
     };
     Ok((value, interp.heap))
@@ -267,6 +278,32 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// `open(path, mode)` (ADR 0031): the mode set is pinned to r/w/a —
+    /// both engines validate it themselves, so fopen's extended modes
+    /// can't diverge. Any environmental failure (including a NUL byte
+    /// in the path) is null.
+    fn open_file(&mut self, path: &[u8], mode: &[u8]) -> Value {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::OsStr::from_bytes(path);
+        let entry = match mode {
+            b"r" => std::fs::File::open(path).map(|f| FileEntry::Read(std::io::BufReader::new(f))),
+            b"w" => std::fs::File::create(path).map(FileEntry::Write),
+            b"a" => std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(path)
+                .map(FileEntry::Write),
+            _ => return Value::Null,
+        };
+        match entry {
+            Ok(e) => {
+                self.heap.files.push(e);
+                Value::File(self.heap.files.len() - 1)
+            }
+            Err(_) => Value::Null,
+        }
+    }
+
     fn eval_inner(&mut self, expr: &'a Expr) -> Result<Value, Diagnostic> {
         match expr {
             Expr::Int(n, _) => Ok(Value::Int(*n)),
@@ -343,6 +380,126 @@ impl<'a> Interp<'a> {
                             ));
                         }
                         return Ok(Value::Unit);
+                    }
+                    // The world interface (ADR 0031): environmental
+                    // failure is a value (null / false); use-after-close
+                    // and read(max <= 0) are runtime errors (ADR 0022).
+                    if name == syntax::BUILTIN_OPEN && args.len() == 2 {
+                        let path = self.eval(&args[0])?;
+                        let mode = self.eval(&args[1])?;
+                        return match (path, mode) {
+                            (Value::Str(path), Value::Str(mode)) => {
+                                Ok(self.open_file(&path, &mode))
+                            }
+                            _ => Err(Diagnostic::error("'open' expects (string, string)", *span)),
+                        };
+                    }
+                    if name == syntax::BUILTIN_READ && args.len() == 2 {
+                        let f = self.eval(&args[0])?;
+                        let max = self.eval(&args[1])?;
+                        let (Value::File(id), Value::Int(max)) = (f, max) else {
+                            return Err(Diagnostic::error("'read' expects (file, int)", *span));
+                        };
+                        return match &mut self.heap.files[id] {
+                            // Closed outranks the size check — the
+                            // compiled runtime tests in this order.
+                            FileEntry::Closed => Err(closed(*span)),
+                            _ if max <= 0 => {
+                                Err(Diagnostic::error("read size must be positive", *span))
+                            }
+                            // fread on a write-mode stream reads nothing.
+                            FileEntry::Write(_) => Ok(Value::Null),
+                            FileEntry::Read(r) => {
+                                // fread semantics: loop short reads until
+                                // max bytes or EOF; errors end like EOF.
+                                let mut buf = vec![0u8; max as usize];
+                                let mut n = 0;
+                                loop {
+                                    match std::io::Read::read(r, &mut buf[n..]) {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(k) => {
+                                            n += k;
+                                            if n == buf.len() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if n == 0 {
+                                    Ok(Value::Null)
+                                } else {
+                                    buf.truncate(n);
+                                    Ok(Value::Str(buf))
+                                }
+                            }
+                        };
+                    }
+                    if name == syntax::BUILTIN_READLINE && args.len() <= 1 {
+                        let mut line = Vec::new();
+                        if args.is_empty() {
+                            let _ = std::io::BufRead::read_until(
+                                &mut std::io::stdin().lock(),
+                                b'\n',
+                                &mut line,
+                            );
+                        } else {
+                            match self.eval(&args[0])? {
+                                Value::File(id) => match &mut self.heap.files[id] {
+                                    FileEntry::Closed => return Err(closed(*span)),
+                                    // getline on a write-mode stream fails.
+                                    FileEntry::Write(_) => return Ok(Value::Null),
+                                    FileEntry::Read(r) => {
+                                        let _ = std::io::BufRead::read_until(r, b'\n', &mut line);
+                                    }
+                                },
+                                _ => {
+                                    return Err(Diagnostic::error(
+                                        "'readLine' expects a file",
+                                        *span,
+                                    ));
+                                }
+                            }
+                        }
+                        if line.is_empty() {
+                            return Ok(Value::Null);
+                        }
+                        if line.last() == Some(&b'\n') {
+                            line.pop();
+                        }
+                        return Ok(Value::Str(line));
+                    }
+                    if name == syntax::BUILTIN_WRITE && args.len() == 2 {
+                        let f = self.eval(&args[0])?;
+                        let s = self.eval(&args[1])?;
+                        let (Value::File(id), Value::Str(bytes)) = (f, s) else {
+                            return Err(Diagnostic::error("'write' expects (file, string)", *span));
+                        };
+                        return match &mut self.heap.files[id] {
+                            FileEntry::Closed => Err(closed(*span)),
+                            // fwrite on a read-mode stream writes nothing —
+                            // but zero requested bytes "succeed" (fread/
+                            // fwrite semantics), and the compiled fwrite
+                            // agrees, so the empty write must too.
+                            FileEntry::Read(_) => Ok(Value::Bool(bytes.is_empty())),
+                            FileEntry::Write(f) => {
+                                Ok(Value::Bool(std::io::Write::write_all(f, &bytes).is_ok()))
+                            }
+                        };
+                    }
+                    if name == syntax::BUILTIN_CLOSE && args.len() == 1 {
+                        return match self.eval(&args[0])? {
+                            Value::File(id) => {
+                                let entry =
+                                    std::mem::replace(&mut self.heap.files[id], FileEntry::Closed);
+                                match entry {
+                                    FileEntry::Closed => Err(closed(*span)),
+                                    // Dropping flushes; writes were unbuffered,
+                                    // so success mirrors fclose after fflush.
+                                    _ => Ok(Value::Bool(true)),
+                                }
+                            }
+                            _ => Err(Diagnostic::error("'close' expects a file", *span)),
+                        };
                     }
                     if name == syntax::BUILTIN_LEN && args.len() == 1 {
                         return match self.eval(&args[0])? {
@@ -688,6 +845,11 @@ fn float_op(op: BinOp, a: f64, b: f64, _span: Span) -> Result<Value, Diagnostic>
         }
     };
     Ok(v)
+}
+
+/// Use-after-close (ADR 0031): a program bug, the ADR 0022 error class.
+fn closed(span: Span) -> Diagnostic {
+    Diagnostic::error("operation on closed file", span)
 }
 
 fn str_op(op: BinOp, a: Vec<u8>, b: Vec<u8>, span: Span) -> Result<Value, Diagnostic> {

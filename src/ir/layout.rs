@@ -36,7 +36,7 @@ impl Kind {
 /// `T?` of it is a nullable pointer for free (ADR 0009).
 pub(crate) fn ref_shaped(t: &Type, res: &Resolutions) -> bool {
     match t {
-        Type::Array(_) => true,
+        Type::Array(_) | Type::File => true,
         Type::Struct(m, n) => res.structs[&(*m, n.clone())].by_ref,
         _ => false,
     }
@@ -46,7 +46,7 @@ pub(crate) fn ref_shaped(t: &Type, res: &Resolutions) -> bool {
 /// optionals, float printing aside) or infinite (recursive value struct).
 pub(crate) fn kind_of(t: &Type, res: &Resolutions, fuel: usize) -> Option<Kind> {
     match t {
-        Type::Int | Type::Bool | Type::Float => Some(Kind::Word),
+        Type::Int | Type::Bool | Type::Float | Type::File => Some(Kind::Word),
         // An empty literal's unconstrained element ([]): a handle word.
         Type::Unknown => Some(Kind::Word),
         // A nullable handle is a free word; a value payload gets the

@@ -7,6 +7,18 @@
 
 mod common;
 use common::{compiler, tempdir};
+use std::process::{Command, Stdio};
+
+/// Runs one engine hermetically (ADR 0031): cwd is the scratch dir —
+/// corpus programs may do relative-path file I/O — and stdin is a
+/// closed pipe, so `readLine()` is a deterministic EOF.
+fn run_in(dir: &std::path::Path, program: &mut Command) -> std::process::Output {
+    program
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run")
+}
 
 #[test]
 fn every_engine_reproduces_the_corpus() {
@@ -20,9 +32,14 @@ fn every_engine_reproduces_the_corpus() {
         let name = path.file_stem().unwrap().to_string_lossy().to_string();
         let golden = std::fs::read_to_string(path.with_extension("out"))
             .unwrap_or_else(|_| panic!("{name}: golden .out missing"));
+        // Absolute source path: the engines run with cwd in the scratch dir.
+        let path = std::fs::canonicalize(&path).unwrap();
 
         // The interpreter is the normative semantics: byte-for-byte.
-        let out = compiler(&[path.to_str().unwrap()]);
+        let out = run_in(
+            &dir,
+            Command::new(env!("CARGO_BIN_EXE_Compiler")).arg(path.to_str().unwrap()),
+        );
         assert!(out.status.success(), "{name}: oracle failed");
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
@@ -49,7 +66,7 @@ fn every_engine_reproduces_the_corpus() {
             "{name}: build failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let run = std::process::Command::new(&bin).output().unwrap();
+        let run = run_in(&dir, &mut Command::new(&bin));
         assert_eq!(
             run.status.code(),
             Some((value & 0xff) as i32),
