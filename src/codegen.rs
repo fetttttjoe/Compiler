@@ -26,6 +26,13 @@ use std::fmt::Write;
 /// from a pointer (multi-word elements, ADR 0023).
 pub(crate) const RT_PUSH: &str = "ys_push";
 pub(crate) const RT_PUSH_N: &str = "ys_push_n";
+/// The shared text builder (ADR 0029): `ys_sb_append` grows the static
+/// byte buffer and copies bytes in; `ys_sb_int` renders one i64 into it.
+pub(crate) const RT_SB_APPEND: &str = "ys_sb_append";
+pub(crate) const RT_SB_INT: &str = "ys_sb_int";
+/// The builder's `{len, cap, ptr}` header: lowered code stores len = 0
+/// to reset and reads `{len, ptr}` to consume the bytes.
+pub(crate) const SB_HDR: &str = ".Lys_sb";
 pub(crate) const RT_PRINTF: &str = "printf@PLT";
 pub(crate) const RT_MALLOC: &str = "malloc@PLT";
 pub(crate) const RT_REALLOC: &str = "realloc@PLT";
@@ -46,11 +53,10 @@ pub(crate) const TRAP_OVERFLOW: &str = "ys_trap_overflow";
 pub(crate) const TRAP_OOB: &str = "ys_trap_oob";
 pub(crate) const TRAP_F2I: &str = "ys_trap_f2i";
 
-/// printf formats and fixed strings for `print`. The `_RAW` variants
-/// carry no newline — the show routines print fragments (ADR 0025).
+/// printf formats and fixed strings for `print`. `FMT_INT_RAW` carries
+/// no newline — it is `ys_sb_int`'s snprintf format (ADR 0029).
 pub(crate) const FMT_INT: &str = ".Lfmt_int";
 pub(crate) const FMT_INT_RAW: &str = ".Lfmt_int_raw";
-pub(crate) const FMT_STR_RAW: &str = ".Lfmt_str_raw";
 pub(crate) const FMT_CSTR: &str = ".Lfmt_cstr";
 pub(crate) const FMT_STR: &str = ".Lfmt_str";
 pub(crate) const TRUE_S: &str = ".Ltrue_s";
@@ -338,7 +344,77 @@ fn one_message_traps() -> String {
 "
         )
     })
-    .collect()
+    .collect::<String>()
+        + &sb_runtime()
+}
+
+/// The shared text builder (ADR 0029): one static `{len, cap, ptr}`
+/// byte buffer that the show routines, `ys_fmt_f64`, and `ys_sb_int`
+/// append into; `print` and `string()` reset it, run producers, then
+/// consume the bytes. Static is sound — compiled programs are
+/// single-threaded (the ADR 0027 scratch precedent) — and growth
+/// mirrors the array runtime: doubling, realloc from NULL, never freed
+/// (ADR 0015).
+fn sb_runtime() -> String {
+    format!(
+        "\
+{RT_SB_APPEND}:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tleaq {SB_HDR}(%rip), %rax
+\tmovq 0(%rax), %rcx
+\tleaq (%rcx,%rsi), %rdx     # need = len + n
+\tcmpq 8(%rax), %rdx
+\tjbe .Lys_sb_copy
+\tmovq 8(%rax), %rcx
+\ttestq %rcx, %rcx
+\tjne .Lys_sb_grow
+\tmovq $16, %rcx             # first growth lands on 32
+.Lys_sb_grow:
+\taddq %rcx, %rcx
+\tcmpq %rdx, %rcx
+\tjb .Lys_sb_grow
+\tmovq %rcx, 8(%rax)
+\tpushq %rdi
+\tpushq %rsi
+\tmovq %rcx, %rsi            # realloc(ptr, newcap); NULL ptr mallocs
+\tmovq 16(%rax), %rdi
+\tcall {RT_REALLOC}
+\tpopq %rsi
+\tpopq %rdi
+\tmovq %rax, %rcx
+\tleaq {SB_HDR}(%rip), %rax
+\tmovq %rcx, 16(%rax)
+.Lys_sb_copy:
+\tmovq %rsi, %rcx            # rep movsb wants (dst rdi, src rsi, n rcx)
+\tmovq %rdi, %rsi
+\tmovq 16(%rax), %rdi
+\taddq 0(%rax), %rdi
+\taddq %rcx, 0(%rax)         # len += n; n = 0 copies nothing
+\trep movsb
+\tpopq %rbp
+\tret
+{RT_SB_INT}:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tmovq %rdi, %rcx            # snprintf(scratch, 24, \"%ld\", value)
+\tleaq {FMT_INT_RAW}(%rip), %rdx
+\tmovl $24, %esi
+\tleaq .Lys_sb_scratch(%rip), %rdi
+\txorl %eax, %eax
+\tcall {RT_SNPRINTF}
+\tmovl %eax, %esi            # the count — an i64 is at most 20 chars
+\tleaq .Lys_sb_scratch(%rip), %rdi
+\tpopq %rbp
+\tjmp {RT_SB_APPEND}
+\t.section .bss
+{SB_HDR}:
+\t.skip 24                   # {{len, cap, ptr}} — zeroed at load
+.Lys_sb_scratch:
+\t.skip 24
+\t.text
+"
+    )
 }
 
 /// The float formatter (ADR 0027), one self-contained unit: code, its
@@ -346,7 +422,7 @@ fn one_message_traps() -> String {
 /// libc for everything hard — correctly-rounded conversion both ways —
 /// and the assembly only orchestrates: probe for the shortest digit
 /// string that round-trips, then re-arrange it positionally with at
-/// most three `%.*s` fragments. Locale is safe: a C program stays in
+/// most three appended fragments. Locale is safe: a C program stays in
 /// the "C" locale unless it calls setlocale, which ys programs never
 /// do. The full phase story and register roles are in the banner
 /// below — they compile into the .s file, so what you debug carries
@@ -355,10 +431,10 @@ fn fmt_f64_runtime() -> String {
     format!(
         "\
 # ----------------------------------------------------------------
-# ys_fmt_f64 — print an f64 exactly as Rust Display does (the
-# interpreter's normative text): the shortest digit string that
-# parses back to the same bits, positional notation always, no
-# trailing newline.
+# ys_fmt_f64 — append an f64's text to the builder, exactly as Rust
+# Display writes it (the interpreter's normative text): the shortest
+# digit string that parses back to the same bits, positional notation
+# always. Consumers reset the builder before and use its bytes after.
 #
 #   in: %rdi = the value's BITS (an integer register, so callers
 #       movq from XMM registers and spill slots alike)
@@ -375,12 +451,12 @@ fn fmt_f64_runtime() -> String {
 #                  E >= n-1    digits, then E-(n-1) zeros    (1e21)
 #                  0 <= E<n-1  D[..E+1] '.' D[E+1..]         (10.5)
 #                  E < 0       \"0.\" then -E-1 zeros, digits (0.03)
-#                a zero-length %.*s prints nothing, so the empty
+#                a zero-length append is a no-op, so the empty
 #                zero-run needs no branch of its own
 #
 # Worked example: -10.5 → p=0 \"-1e+01\" reparses to -10, no;
 # p=1 \"-1.0e+01\" → -10, no; p=2 \"-1.05e+01\" → -10.5, yes →
-# digits \"105\", n=3, E=1, negative → prints \"-\" \"10\" \".\" \"5\".
+# digits \"105\", n=3, E=1, negative → appends \"-\" \"10\" \".\" \"5\".
 #
 # Register roles (callee-saved: they live across the libc calls):
 #   %rbx  the bits — the round-trip comparison target
@@ -410,23 +486,27 @@ fn fmt_f64_runtime() -> String {
 \ttestq %rbx, %rbx           # exactly infinity: the sign decides
 \tjs .Lys_fmt_neg_inf
 \tleaq .Lys_fmt_s_inf(%rip), %rdi
+\tmovl $3, %esi
 \tjmp .Lys_fmt_special
 .Lys_fmt_neg_inf:
 \tleaq .Lys_fmt_s_ninf(%rip), %rdi
+\tmovl $4, %esi
 \tjmp .Lys_fmt_special
 .Lys_fmt_nan:
 \tleaq .Lys_fmt_s_nan(%rip), %rdi
+\tmovl $3, %esi
 \tjmp .Lys_fmt_special
 .Lys_fmt_zero:
 \ttestq %rbx, %rbx
 \tjs .Lys_fmt_neg_zero
 \tleaq .Lys_fmt_s_zero(%rip), %rdi
+\tmovl $1, %esi
 \tjmp .Lys_fmt_special
 .Lys_fmt_neg_zero:
 \tleaq .Lys_fmt_s_nzero(%rip), %rdi
+\tmovl $2, %esi
 .Lys_fmt_special:
-\txorl %eax, %eax
-\tcall {RT_PRINTF}           # the text has no '%': it is its own format
+\tcall {RT_SB_APPEND}
 \tjmp .Lys_fmt_done
 .Lys_fmt_finite:
 \ttestq %rax, %rax
@@ -495,65 +575,53 @@ fn fmt_f64_runtime() -> String {
 \ttestl %r15d, %r15d
 \tje .Lys_fmt_shape
 \tleaq .Lys_fmt_s_minus(%rip), %rdi
-\txorl %eax, %eax
-\tcall {RT_PRINTF}
+\tmovl $1, %esi
+\tcall {RT_SB_APPEND}
 .Lys_fmt_shape:
 \tleaq -1(%r13), %rax        # n-1: the point's rightmost position
 \tcmpq %rax, %r14
 \tjl .Lys_fmt_not_whole
 # ---- E >= n-1: a whole number — digits, then E-(n-1) zeros ------
-\tleaq {FMT_STR_RAW}(%rip), %rdi
+\tleaq .Lys_fmt_digits(%rip), %rdi
 \tmovq %r13, %rsi
-\tleaq .Lys_fmt_digits(%rip), %rdx
-\txorl %eax, %eax
-\tcall {RT_PRINTF}
+\tcall {RT_SB_APPEND}
 \tmovq %r14, %rsi
 \tsubq %r13, %rsi
-\tincq %rsi                  # E - (n-1) trailing zeros
-\tleaq {FMT_STR_RAW}(%rip), %rdi
-\tleaq .Lys_fmt_zeros(%rip), %rdx
-\txorl %eax, %eax
-\tcall {RT_PRINTF}
+\tincq %rsi                  # E - (n-1) trailing zeros, possibly none
+\tleaq .Lys_fmt_zeros(%rip), %rdi
+\tcall {RT_SB_APPEND}
 \tjmp .Lys_fmt_done
 .Lys_fmt_not_whole:
 \ttestq %r14, %r14
 \tjs .Lys_fmt_below_one
 # ---- 0 <= E < n-1: the point sits after digit E+1 ---------------
-\tleaq {FMT_STR_RAW}(%rip), %rdi
+\tleaq .Lys_fmt_digits(%rip), %rdi
 \tleaq 1(%r14), %rsi         # E+1 digits before the point
-\tleaq .Lys_fmt_digits(%rip), %rdx
-\txorl %eax, %eax
-\tcall {RT_PRINTF}
+\tcall {RT_SB_APPEND}
 \tleaq .Lys_fmt_s_dot(%rip), %rdi
-\txorl %eax, %eax
-\tcall {RT_PRINTF}
+\tmovl $1, %esi
+\tcall {RT_SB_APPEND}
+\tleaq .Lys_fmt_digits(%rip), %rdi
+\taddq %r14, %rdi
+\tincq %rdi                  # &digits[E+1]
 \tmovq %r13, %rsi
 \tsubq %r14, %rsi
 \tdecq %rsi                  # the n-(E+1) digits after the point
-\tleaq {FMT_STR_RAW}(%rip), %rdi
-\tleaq .Lys_fmt_digits(%rip), %rdx
-\taddq %r14, %rdx
-\tincq %rdx                  # &digits[E+1]
-\txorl %eax, %eax
-\tcall {RT_PRINTF}
+\tcall {RT_SB_APPEND}
 \tjmp .Lys_fmt_done
 .Lys_fmt_below_one:
 # ---- E < 0: below one — \"0.\", -E-1 zeros, all the digits -------
 \tleaq .Lys_fmt_s_zerodot(%rip), %rdi
-\txorl %eax, %eax
-\tcall {RT_PRINTF}
+\tmovl $2, %esi
+\tcall {RT_SB_APPEND}
 \tmovq %r14, %rsi
 \tnegq %rsi
 \tdecq %rsi                  # -E-1 zeros between the point and digits
-\tleaq {FMT_STR_RAW}(%rip), %rdi
-\tleaq .Lys_fmt_zeros(%rip), %rdx
-\txorl %eax, %eax
-\tcall {RT_PRINTF}
+\tleaq .Lys_fmt_zeros(%rip), %rdi
+\tcall {RT_SB_APPEND}
+\tleaq .Lys_fmt_digits(%rip), %rdi
 \tmovq %r13, %rsi
-\tleaq {FMT_STR_RAW}(%rip), %rdi
-\tleaq .Lys_fmt_digits(%rip), %rdx
-\txorl %eax, %eax
-\tcall {RT_PRINTF}
+\tcall {RT_SB_APPEND}
 .Lys_fmt_done:
 \taddq $8, %rsp
 \tpopq %r15
@@ -611,8 +679,6 @@ fn rodata() -> String {
 \t.string \"%.*s\\n\"
 {FMT_INT_RAW}:
 \t.string \"%ld\"
-{FMT_STR_RAW}:
-\t.string \"%.*s\"
 {TRUE_S}:
 \t.string \"true\"
 {FALSE_S}:

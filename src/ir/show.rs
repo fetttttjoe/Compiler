@@ -1,13 +1,14 @@
-//! Monomorphized `print` routines for aggregates (ADR 0025): one IR
-//! function per printed type, mirroring `interpreter/render.rs` — the
-//! normative text — byte for byte: name-sorted fields, raw strings,
-//! and the depth budget where a refstruct hop costs a level.
+//! Monomorphized text routines for aggregates (ADR 0025/0029): one IR
+//! function per rendered type, appending to the shared builder and
+//! mirroring `interpreter/render.rs` — the normative text — byte for
+//! byte: name-sorted fields, raw strings, and the depth budget where a
+//! refstruct hop costs a level. `print` and `string()` both consume.
 
 use super::layout::{FUEL, Kind, kind_of, offset_of, ref_shaped};
 use super::{FunctionIr, Inst, Lbl, V};
 use crate::ast::BinOp;
 use crate::check::Resolutions;
-use crate::codegen::{FMT_INT_RAW, FMT_STR_RAW, RT_FMT_F64, RT_PRINTF, Strings, label_of};
+use crate::codegen::{RT_FMT_F64, RT_SB_APPEND, RT_SB_INT, Strings, label_of};
 use crate::types::Type;
 use std::collections::HashMap;
 
@@ -15,9 +16,9 @@ use std::collections::HashMap;
 /// SAME depth.
 pub(crate) const DEPTH_BUDGET: i64 = 8;
 
-/// The show-routine registry: `print` sites request a label, routines
-/// generate at the end of compilation — transitively over field and
-/// element types, memoized per type.
+/// The show-routine registry: `print` and `string()` sites request a
+/// label, routines generate at the end of compilation — transitively
+/// over field and element types, memoized per type.
 #[derive(Default)]
 pub(crate) struct Printers {
     labels: HashMap<String, String>,
@@ -87,35 +88,22 @@ impl B<'_> {
         v
     }
 
-    /// printf of a fixed fragment: identifier charsets contain no '%',
-    /// so the text is its own format string.
+    /// Appends a fixed fragment to the builder.
     fn piece(&mut self, text: &str) {
         let sym = self.strings.intern_cstr(text);
-        let f = self.fresh();
-        self.insts.push(Inst::LeaSym { dst: f, sym });
-        let dst = self.fresh();
-        self.insts.push(Inst::CallRt {
-            dst,
-            sym: RT_PRINTF,
-            args: vec![f],
-            varargs: true,
-        });
+        let p = self.fresh();
+        self.insts.push(Inst::LeaSym { dst: p, sym });
+        let n = self.konst(text.len() as i64);
+        self.append(p, n);
     }
 
-    fn printf(&mut self, fmt: &'static str, args: &[V]) {
-        let f = self.fresh();
-        self.insts.push(Inst::LeaSym {
-            dst: f,
-            sym: fmt.into(),
-        });
-        let mut all = vec![f];
-        all.extend_from_slice(args);
+    fn append(&mut self, ptr: V, len: V) {
         let dst = self.fresh();
         self.insts.push(Inst::CallRt {
             dst,
-            sym: RT_PRINTF,
-            args: all,
-            varargs: true,
+            sym: RT_SB_APPEND,
+            args: vec![ptr, len],
+            varargs: false,
         });
     }
 
@@ -130,7 +118,7 @@ impl B<'_> {
         self.insts.push(Inst::Ret(z));
     }
 
-    /// `v == imm` → print `...` and return; the depth floor and the
+    /// `v == imm` → append `...` and return; the depth floor and the
     /// refstruct hop test.
     fn eq_ret_ellipsis(&mut self, v: V, imm: i64) {
         let c = self.fresh();
@@ -147,7 +135,7 @@ impl B<'_> {
         self.insts.push(Inst::Label(past));
     }
 
-    /// `handle == 0` → print `null` and return; ref-shaped `T?` shares
+    /// `handle == 0` → append `null` and return; ref-shaped `T?` shares
     /// `T`'s routine, and non-null handles never trigger it.
     fn null_handle_ret(&mut self) {
         let c = self.fresh();
@@ -214,7 +202,15 @@ fn routine(
     // display_depth's entry check: depth 0 renders anything as "...".
     b.eq_ret_ellipsis(D, 0);
     match t {
-        Type::Int => b.printf(FMT_INT_RAW, &[X]),
+        Type::Int => {
+            let dst = b.fresh();
+            b.insts.push(Inst::CallRt {
+                dst,
+                sym: RT_SB_INT,
+                args: vec![X],
+                varargs: false,
+            });
+        }
         // The runtime formatter (ADR 0027); fields load as words, so
         // the bits already ride an integer vreg.
         Type::Float => {
@@ -246,7 +242,7 @@ fn routine(
         Type::Str => {
             let ptr = b.load(X, 0);
             let len = b.load(X, 8);
-            b.printf(FMT_STR_RAW, &[len, ptr]);
+            b.append(ptr, len);
         }
         // Value-shaped optional (request normalized the ref-shaped
         // ones away): the tag decides. The interpreter stores payloads

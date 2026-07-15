@@ -10,7 +10,7 @@ use crate::ast::{BinOp, Expr, Function, Stmt, UnOp};
 use crate::check::Resolutions;
 use crate::codegen::{
     FALSE_S, FMT_CSTR, FMT_INT, FMT_STR, NULL_S, RT_FMT_F64, RT_MALLOC, RT_MEMCPY, RT_PRINTF,
-    RT_PUSH, RT_PUSH_N, Strings, TRUE_S, label_of,
+    RT_PUSH, RT_PUSH_N, SB_HDR, Strings, TRUE_S, label_of,
 };
 use crate::diagnostic::Diagnostic;
 use crate::source::SourceMap;
@@ -1453,10 +1453,11 @@ impl Lowerer<'_> {
                         // routine's tag wrapper handles null.
                         _ => self.print_aggregate(value, &ty, span),
                     },
-                    // The runtime formatter (ADR 0027); the value's
-                    // bits ride an integer register.
+                    // The runtime formatter (ADR 0027) appends to the
+                    // builder; the value's bits ride an integer register.
                     Type::Float => {
                         let v = self.expr(value)?;
+                        self.sb_reset();
                         let dst = self.fresh(false);
                         self.insts.push(Inst::CallRt {
                             dst,
@@ -1464,7 +1465,7 @@ impl Lowerer<'_> {
                             args: vec![v],
                             varargs: false,
                         });
-                        Ok(self.print_newline())
+                        Ok(self.sb_print())
                     }
                     // A unit-typed call: evaluate for effects, print
                     // the oracle's literal text.
@@ -1488,6 +1489,7 @@ impl Lowerer<'_> {
             .ok_or_else(|| unsupported("printing values of this type", span))?;
         let v = self.expr(value)?;
         let name = self.printers.request(ty, self.res);
+        self.sb_reset();
         let depth = self.const_word(DEPTH_BUDGET);
         let dst = self.fresh(false);
         self.insts.push(Inst::Call {
@@ -1496,18 +1498,34 @@ impl Lowerer<'_> {
             args: vec![v, depth],
             sret: None,
         });
-        Ok(self.print_newline())
+        Ok(self.sb_print())
     }
 
-    /// print's contract: one trailing newline after the value text.
-    fn print_newline(&mut self) -> V {
-        let sym = self.strings.intern_cstr("\n");
-        let nl = self.lea_sym(sym);
-        let d = self.fresh(false);
+    /// Clears the shared text builder before its producers run
+    /// (ADR 0029). Callers evaluate the argument first, so a print
+    /// buried in it cannot interleave with this site's builder use.
+    fn sb_reset(&mut self) {
+        let h = self.lea_sym(SB_HDR.into());
+        let z = self.const_word(0);
+        self.insts.push(Inst::StoreAt {
+            base: h,
+            off: 0,
+            val: z,
+        });
+    }
+
+    /// print's tail for builder-rendered values: the accumulated bytes
+    /// and the trailing newline in one `%.*s\n`.
+    fn sb_print(&mut self) -> V {
+        let h = self.lea_sym(SB_HDR.into());
+        let len = self.load_at(h, 0);
+        let ptr = self.load_at(h, 16);
+        let fmt = self.lea_sym(FMT_STR.into());
+        let dst = self.fresh(false);
         self.insts.push(Inst::CallRt {
-            dst: d,
+            dst,
             sym: RT_PRINTF,
-            args: vec![nl],
+            args: vec![fmt, len, ptr],
             varargs: true,
         });
         self.const_word(0)
