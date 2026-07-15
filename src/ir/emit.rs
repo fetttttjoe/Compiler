@@ -47,6 +47,19 @@ fn magic_i64(d: i64) -> (i64, u32) {
     ((q2 + 1) as u64 as i64, p - 64)
 }
 
+/// The bounds-check preamble shared by element reads and writes:
+/// an index below the length falls through to `target`; out-of-range
+/// reports and exits through the OOB trap (ADR 0022).
+fn bounds_check(arr: &str, idx: &str, loc: &str, target: &str) -> String {
+    format!(
+        "\tmovq {arr}, %rax\n\tmovq {idx}, %rcx\n\tcmpq 0(%rax), %rcx\n\
+         \tjb {target}\n\
+         \tmovq %rcx, %rdi\n\tmovq 0(%rax), %rsi\n\tleaq {loc}(%rip), %rdx\n\
+         \tcall {TRAP_OOB}\n\
+         {target}:\n"
+    )
+}
+
 fn operand(loc: Loc) -> String {
     match loc {
         Loc::Reg(r) => r.to_string(),
@@ -497,16 +510,8 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                 agg,
             } => {
                 bounds += 1;
-                let _ = writeln!(
-                    a,
-                    "\tmovq {}, %rax\n\tmovq {}, %rcx\n\tcmpq 0(%rax), %rcx\n\
-                     \tjb .LTB{module}_{name}_{bounds}\n\
-                     \tmovq %rcx, %rdi\n\tmovq 0(%rax), %rsi\n\tleaq {loc}(%rip), %rdx\n\
-                     \tcall {TRAP_OOB}\n\
-                     .LTB{module}_{name}_{bounds}:",
-                    at(*arr),
-                    at(*idx)
-                );
+                let target = format!(".LTB{module}_{name}_{bounds}");
+                a.push_str(&bounds_check(&at(*arr), &at(*idx), loc, &target));
                 match agg {
                     None => {
                         a.push_str("\tmovq 16(%rax), %rax\n\tmovq (%rax,%rcx,8), %rax\n");
@@ -530,16 +535,8 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                 agg,
             } => {
                 bounds += 1;
-                let _ = writeln!(
-                    a,
-                    "\tmovq {}, %rax\n\tmovq {}, %rcx\n\tcmpq 0(%rax), %rcx\n\
-                     \tjb .LTB{module}_{name}_{bounds}\n\
-                     \tmovq %rcx, %rdi\n\tmovq 0(%rax), %rsi\n\tleaq {loc}(%rip), %rdx\n\
-                     \tcall {TRAP_OOB}\n\
-                     .LTB{module}_{name}_{bounds}:",
-                    at(*arr),
-                    at(*idx)
-                );
+                let target = format!(".LTB{module}_{name}_{bounds}");
+                a.push_str(&bounds_check(&at(*arr), &at(*idx), loc, &target));
                 match agg {
                     None => {
                         let _ = writeln!(
