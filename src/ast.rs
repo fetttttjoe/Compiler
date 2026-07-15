@@ -4,6 +4,7 @@
 //! `sexpr` rendering exists only for shape assertions in tests.
 
 use crate::span::Span;
+use crate::syntax;
 
 pub type Ast = Vec<Item>;
 
@@ -126,6 +127,25 @@ pub enum Stmt {
     Expr(Expr),
 }
 
+/// `Expr::Convert`'s target type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Conv {
+    Int,
+    Float,
+    Str,
+}
+
+impl Conv {
+    /// The surface keyword — the conversion's name in diagnostics.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Conv::Int => syntax::KW_INT,
+            Conv::Float => syntax::KW_FLOAT,
+            Conv::Str => syntax::KW_STRING,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Expr {
     Int(i64, Span),
@@ -139,10 +159,11 @@ pub enum Expr {
         rhs: Box<Expr>,
         span: Span,
     },
-    /// `float(x)` / `int(x)` — explicit numeric conversion (ADR 0028).
-    /// The names are type keywords, so the form is unshadowable.
+    /// `int(x)` / `float(x)` / `string(x)` — explicit conversion to the
+    /// named type (ADR 0028/0029). The names are type keywords, so the
+    /// form is unshadowable.
     Convert {
-        to_float: bool,
+        to: Conv,
         arg: Box<Expr>,
         span: Span,
     },
@@ -312,9 +333,8 @@ impl Expr {
             Expr::Ident(name, _) => name.clone(),
             Expr::Null(_) => "null".to_string(),
             Expr::Unary { op, rhs, .. } => format!("({} {})", op.symbol(), rhs.sexpr()),
-            Expr::Convert { to_float, arg, .. } => {
-                let name = if *to_float { "float" } else { "int" };
-                format!("({name} {})", arg.sexpr())
+            Expr::Convert { to, arg, .. } => {
+                format!("({} {})", to.keyword(), arg.sexpr())
             }
             Expr::Binary { op, lhs, rhs, .. } => {
                 format!("({} {} {})", op.symbol(), lhs.sexpr(), rhs.sexpr())

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{BinOp, Expr, Function, Item, Stmt, TypeAnn, UnOp};
+use crate::ast::{BinOp, Conv, Expr, Function, Item, Stmt, TypeAnn, UnOp};
 use crate::diagnostic::Diagnostic;
 use crate::modules::ModuleGraph;
 use crate::narrow::{NarrowFrame, body_effects, covers, diverges, null_checks};

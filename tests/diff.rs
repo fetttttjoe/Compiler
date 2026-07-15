@@ -2015,6 +2015,79 @@ fn conversions_flow_through_calls_and_aggregates() {
     );
 }
 
+// ---- string(x) conversion (ADR 0029) -------------------------------------
+
+#[test]
+fn string_conversion_matches_print_for_every_shape() {
+    // The defining invariant: print(string(x)) and print(x) write the
+    // same bytes — scalars, aggregates, cycles, and optionals alike.
+    diff(
+        "strconv",
+        r#"struct P { x: int, y: float }
+        refstruct Node { v: int, next: Node? }
+        fun main(): int {
+            print(string(42) + "|" + string(true) + "|" + string(false));
+            const p: P = P { x: 3, y: 0.5 };
+            print(string(p));
+            print(p);
+            const xs: P[] = [p, P { x: 4, y: 1.5 }];
+            print(string(xs));
+            print(xs);
+            var n: Node = Node { v: 1, next: null };
+            n.next = n;
+            print(string(n));
+            print(n);
+            var o: int? = null;
+            print(string(o) + "!");
+            o = 9;
+            if o != null { print(string(o)); }
+            return 0;
+        }"#,
+    );
+}
+
+#[test]
+fn string_of_floats_round_trips_the_bit_space() {
+    // The ADR 0027 harness through the string() path: the same
+    // xorshift stream, exercising the builder-and-copy pipeline
+    // instead of direct print.
+    let mut s: u64 = 0x9e3779b97f4a7c15;
+    let mut prints = Vec::new();
+    while prints.len() < 120 {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let x = f64::from_bits(s);
+        if !x.is_finite() {
+            continue;
+        }
+        prints.push(format!("print(string({}));", float_lit(x)));
+    }
+    diff(
+        "strfloatbits",
+        &format!("fun main(): int {{ {} return 0; }}", prints.join("\n")),
+    );
+}
+
+#[test]
+fn string_conversion_edges() {
+    // An empty str? payload (a zero-length take), builder reuse across
+    // a loop, and the float shapes with long zero runs.
+    diff(
+        "strconvedge",
+        r#"fun main(): int {
+            var e: string? = "";
+            print(string(e) + "|");
+            var s: string = "";
+            var i: int = 0;
+            while i < 5 { s = s + string(i * 1000000000000); i = i + 1; }
+            print(s);
+            print(string([true, false]) + string(1000000000000000000000.0) + string(0.005));
+            return 0;
+        }"#,
+    );
+}
+
 #[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as

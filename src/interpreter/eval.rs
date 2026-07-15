@@ -282,19 +282,17 @@ impl<'a> Interp<'a> {
             // ADR 0028: float(i) is total (nearest-even); int(f)
             // truncates toward zero and is checked - valid iff
             // f in [-2^63, 2^63), which NaN fails by comparing false.
-            Expr::Convert {
-                to_float,
-                arg,
-                span,
-            } => match (self.eval(arg)?, to_float) {
-                (Value::Int(i), true) => Ok(Value::Float(i as f64)),
-                (Value::Float(f), false) => {
+            // ADR 0029: string(x) is print's text for any value.
+            Expr::Convert { to, arg, span } => match (self.eval(arg)?, *to) {
+                (Value::Int(i), Conv::Float) => Ok(Value::Float(i as f64)),
+                (Value::Float(f), Conv::Int) => {
                     if (-9223372036854775808.0..9223372036854775808.0).contains(&f) {
                         Ok(Value::Int(f as i64))
                     } else {
                         Err(Diagnostic::error("invalid float to int conversion", *span))
                     }
                 }
+                (v, Conv::Str) => Ok(Value::Str(v.display(&self.heap))),
                 _ => unreachable!("checker enforced the operand type"),
             },
             Expr::Binary { op, lhs, rhs, span } => match op {

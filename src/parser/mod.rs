@@ -1,5 +1,5 @@
 use crate::ast::{
-    Ast, BinOp, Expr, Field, Function, ImportDecl, Item, Param, Stmt, Struct, TypeAnn, UnOp,
+    Ast, BinOp, Conv, Expr, Field, Function, ImportDecl, Item, Param, Stmt, Struct, TypeAnn, UnOp,
 };
 use crate::diagnostic::Diagnostic;
 use crate::span::Span;

@@ -6,15 +6,16 @@
 use super::layout::{FUEL, Kind, kind_of, offset_of, ref_shaped};
 use super::show::{DEPTH_BUDGET, Printers};
 use super::{FunctionIr, Inst, Lbl, V, unsupported};
-use crate::ast::{BinOp, Expr, Function, Stmt, UnOp};
+use crate::ast::{BinOp, Conv, Expr, Function, Stmt, UnOp};
 use crate::check::Resolutions;
 use crate::codegen::{
     FALSE_S, FMT_CSTR, FMT_INT, FMT_STR, NULL_S, RT_FMT_F64, RT_MALLOC, RT_MEMCPY, RT_PRINTF,
-    RT_PUSH, RT_PUSH_N, SB_HDR, Strings, TRUE_S, label_of,
+    RT_PUSH, RT_PUSH_N, RT_SB_INT, SB_HDR, Strings, TRUE_S, label_of,
 };
 use crate::diagnostic::Diagnostic;
 use crate::source::SourceMap;
 use crate::span::Span;
+use crate::syntax;
 use crate::types::Type;
 use std::collections::HashMap;
 
@@ -643,24 +644,24 @@ impl Lowerer<'_> {
                 Ok(b.v)
             }
             // float(i) is one convert; int(f) is the checked form —
-            // NaN and out-of-range report and exit 1 (ADR 0028).
-            Expr::Convert {
-                to_float,
-                arg,
-                span,
-            } => {
-                let v = self.expr(arg)?;
-                if *to_float {
+            // NaN and out-of-range report and exit 1 (ADR 0028);
+            // string(x) renders through the shared builder (ADR 0029).
+            Expr::Convert { to, arg, span } => match to {
+                Conv::Float => {
+                    let v = self.expr(arg)?;
                     let dst = self.fresh(true);
                     self.insts.push(Inst::IntToFloat(dst, v));
                     Ok(dst)
-                } else {
+                }
+                Conv::Int => {
+                    let v = self.expr(arg)?;
                     let loc = self.loc_of(*span);
                     let dst = self.fresh(false);
                     self.insts.push(Inst::FloatToInt { dst, src: v, loc });
                     Ok(dst)
                 }
-            }
+                Conv::Str => self.stringify(arg, *span),
+            },
             Expr::Unary { op, rhs, .. } => {
                 let float = self.is_float(rhs);
                 let r = self.expr(rhs)?;
@@ -1529,6 +1530,108 @@ impl Lowerer<'_> {
             varargs: true,
         });
         self.const_word(0)
+    }
+
+    /// `string(x)` (ADR 0029): bool selects a static `"true"`/`"false"`
+    /// descriptor; every other type renders through the shared builder
+    /// and copies out to an exact-length heap string. Dispatch reads
+    /// the recorded (possibly narrowed) type, like `print`.
+    fn stringify(&mut self, arg: &Expr, span: Span) -> Result<V, Diagnostic> {
+        let ty = self
+            .ty(&arg.span())
+            .cloned()
+            .ok_or_else(|| unsupported("converting this value", span))?;
+        let v = self.expr(arg)?;
+        match &ty {
+            Type::Bool => {
+                let t = self.strings.intern(syntax::KW_TRUE);
+                let r = self.lea_sym(t);
+                let end = self.fresh_label();
+                let isfalse = self.fresh(false);
+                self.insts.push(Inst::BinImm {
+                    op: BinOp::Eq,
+                    dst: isfalse,
+                    lhs: v,
+                    imm: 0,
+                });
+                self.insts.push(Inst::BrZero(isfalse, end));
+                let f = self.strings.intern(syntax::KW_FALSE);
+                let fv = self.lea_sym(f);
+                self.insts.push(Inst::Copy(r, fv));
+                self.insts.push(Inst::Label(end));
+                return Ok(r);
+            }
+            Type::Int => {
+                self.sb_reset();
+                let dst = self.fresh(false);
+                self.insts.push(Inst::CallRt {
+                    dst,
+                    sym: RT_SB_INT,
+                    args: vec![v],
+                    varargs: false,
+                });
+            }
+            Type::Float => {
+                self.sb_reset();
+                let dst = self.fresh(false);
+                self.insts.push(Inst::CallRt {
+                    dst,
+                    sym: RT_FMT_F64,
+                    args: vec![v],
+                    varargs: false,
+                });
+            }
+            _ => {
+                kind_of(&ty, self.res, FUEL)
+                    .ok_or_else(|| unsupported("converting values of this type", span))?;
+                let name = self.printers.request(&ty, self.res);
+                self.sb_reset();
+                let depth = self.const_word(DEPTH_BUDGET);
+                let dst = self.fresh(false);
+                self.insts.push(Inst::Call {
+                    dst,
+                    label: label_of(0, &name),
+                    args: vec![v, depth],
+                    sret: None,
+                });
+            }
+        }
+        Ok(self.sb_take())
+    }
+
+    /// Copies the builder's bytes into a fresh exact-length string —
+    /// `string(x)`'s one allocation, a statement temp like concat's.
+    fn sb_take(&mut self) -> V {
+        let h = self.lea_sym(SB_HDR.into());
+        let len = self.load_at(h, 0);
+        let buf = self.fresh(false);
+        self.insts.push(Inst::CallRt {
+            dst: buf,
+            sym: RT_MALLOC,
+            args: vec![len],
+            varargs: false,
+        });
+        let src = self.load_at(h, 16);
+        let d = self.fresh(false);
+        self.insts.push(Inst::CallRt {
+            dst: d,
+            sym: RT_MEMCPY,
+            args: vec![buf, src, len],
+            varargs: false,
+        });
+        let out = self.fresh(false);
+        self.insts.push(Inst::Temp { dst: out, words: 2 });
+        self.insts.push(Inst::StoreAt {
+            base: out,
+            off: 0,
+            val: buf,
+        });
+        self.insts.push(Inst::StoreAt {
+            base: out,
+            off: 8,
+            val: len,
+        });
+        out
     }
 
     fn print_int(&mut self, v: V) -> V {

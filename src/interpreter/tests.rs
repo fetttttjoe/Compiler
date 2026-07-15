@@ -233,6 +233,24 @@ fn invalid_float_to_int_conversion_is_a_runtime_error() {
 }
 
 #[test]
+fn string_conversion_renders_prints_text() {
+    // ADR 0029: string(x) is exactly the text print(x) writes.
+    assert_eq!(
+        run("fun main(): string { return string(42) + string(true) + string(2.5); }"),
+        Ok(Value::Str("42true2.5".into()))
+    );
+    assert_eq!(
+        run("struct P { b: bool, a: int }\n\
+             fun main(): string { return string(P { b: true, a: 7 }); }"),
+        Ok(Value::Str("P { a: 7, b: true }".into()))
+    );
+    assert_eq!(
+        run("fun main(): string { var o: int? = null; return string(o) + string([1, 2]); }"),
+        Ok(Value::Str("null[1, 2]".into()))
+    );
+}
+
+#[test]
 fn division_overflow_is_a_runtime_error() {
     // i64::MIN / -1 has no i64 result; like division by zero it must
     // be a diagnostic, not a panic (or SIGFPE once compiled).

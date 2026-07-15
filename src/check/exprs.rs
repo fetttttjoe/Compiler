@@ -26,27 +26,41 @@ impl Checker<'_> {
             Expr::Str(_, _) => Type::Str,
             Expr::Ident(name, span) => self.lookup(name, *span),
             Expr::Null(_) => Type::Null,
-            // `float(x)` / `int(x)` cross-convert only (ADR 0028):
-            // identity conversions are rejected — a no-op spelled as a
-            // conversion is noise, not explicitness.
-            Expr::Convert {
-                to_float,
-                arg,
-                span,
-            } => {
+            // Conversions cross-convert only (ADR 0028): identity
+            // conversions are rejected — a no-op spelled as a conversion
+            // is noise, not explicitness. `string(x)` (ADR 0029) renders
+            // any value as `print` would; only the identity and the
+            // no-value types (`unit`, `null`) are rejected. Narrowing
+            // applies — a narrowed `string?` is a `string`.
+            Expr::Convert { to, arg, span } => {
                 let ty = self.type_of_expr(arg);
-                let (name, want, result) = if *to_float {
-                    ("float", Type::Int, Type::Float)
-                } else {
-                    ("int", Type::Float, Type::Int)
-                };
                 if poisoned(&ty) {
                     return Type::Error;
                 }
+                if *to == Conv::Str {
+                    if matches!(ty, Type::Str | Type::Unit | Type::Null) {
+                        let mut diag = Diagnostic::error(
+                            format!("string() cannot convert {}", self.type_name(&ty)),
+                            *span,
+                        );
+                        if ty == Type::Str {
+                            diag = diag.with_help("the value is already string".to_string());
+                        }
+                        self.diagnostics.push(diag);
+                        return Type::Error;
+                    }
+                    return Type::Str;
+                }
+                let (want, result) = if *to == Conv::Float {
+                    (Type::Int, Type::Float)
+                } else {
+                    (Type::Float, Type::Int)
+                };
                 if ty != want {
                     let mut diag = Diagnostic::error(
                         format!(
-                            "{name}() expects {}, found {}",
+                            "{}() expects {}, found {}",
+                            to.keyword(),
                             self.type_name(&want),
                             self.type_name(&ty)
                         ),

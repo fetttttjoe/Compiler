@@ -45,9 +45,13 @@ fn function_call() {
 
 #[test]
 fn conversion_calls_parse_as_their_own_node() {
-    // ADR 0028: int/float are keywords, so this is not a Call.
+    // ADR 0028/0029: int/float/string are keywords, so this is not a Call.
     assert_eq!(expr("int(x + 1.5)").sexpr(), "(int (+ x 1.5))");
     assert_eq!(expr("float(3) / 2.0").sexpr(), "(/ (float 3) 2)");
+    assert_eq!(
+        expr("string(x) + string(1)").sexpr(),
+        "(+ (string x) (string 1))"
+    );
 }
 
 #[test]

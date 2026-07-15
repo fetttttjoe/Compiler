@@ -88,14 +88,19 @@ impl Parser<'_> {
                     Expr::Ident(name, tok.span)
                 }
             }
-            // `float(x)` / `int(x)` — conversion calls (ADR 0028); the
-            // type keywords cannot be shadowed, so this is unambiguous.
-            kind @ (TokenKind::IntType | TokenKind::FloatType) => {
+            // `int(x)` / `float(x)` / `string(x)` — conversion calls
+            // (ADR 0028/0029); the type keywords cannot be shadowed, so
+            // the form is unambiguous.
+            kind @ (TokenKind::IntType | TokenKind::FloatType | TokenKind::StringType) => {
                 self.expect(TokenKind::LeftParen);
                 let arg = self.parse_expr(0);
                 let end = self.expect(TokenKind::RightParen);
                 Expr::Convert {
-                    to_float: kind == TokenKind::FloatType,
+                    to: match kind {
+                        TokenKind::IntType => Conv::Int,
+                        TokenKind::FloatType => Conv::Float,
+                        _ => Conv::Str,
+                    },
                     arg: Box::new(arg),
                     span: tok.span.to(end),
                 }

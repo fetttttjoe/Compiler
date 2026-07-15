@@ -79,6 +79,25 @@ fn conversions_are_strictly_cross_typed() {
 }
 
 #[test]
+fn string_conversion_accepts_values_and_rejects_no_ops() {
+    // ADR 0029: every value type converts; the identity and the
+    // no-value types (unit, null) are rejected.
+    assert!(diags("fun f(): string { return string(1) + string(0.5) + string(true); }").is_empty());
+    assert!(diags("struct P { x: int }\nfun f(p: P): string { return string(p); }").is_empty());
+    assert!(diags("fun f(o: int?): string { return string(o); }").is_empty());
+    let d = diags("fun f(s: string): string { return string(s); }");
+    assert!(d[0].message.contains("string() cannot convert string"));
+    assert_eq!(d[0].help.as_deref(), Some("the value is already string"));
+    let d = diags("fun g() {}\nfun f() { const s: string = string(g()); }");
+    assert!(d[0].message.contains("string() cannot convert unit"));
+    let d = diags("fun f() { const s: string = string(null); }");
+    assert!(d[0].message.contains("string() cannot convert null"));
+    // Narrowing applies: inside the guard the payload IS a string.
+    let d = diags("fun f(o: string?): string { if o != null { return string(o); } return \"\"; }");
+    assert!(d[0].message.contains("string() cannot convert string"));
+}
+
+#[test]
 fn diverging_guards_narrow_the_code_after_the_if() {
     // ADR 0020: a branch that never falls through leaves the negation
     // facts (or the fall-through branch's survivors) behind.

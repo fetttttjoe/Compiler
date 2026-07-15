@@ -362,6 +362,13 @@ fn recursive_value_struct_is_a_clean_diagnostic() {
         fun f(p: S): int { return 0; }
         fun main(): int { return 1; }",
     );
+    // string() of the same unconstructible type reports, never falls back.
+    assert_not_yet_compilable(
+        "recurstr",
+        "struct S { s: S }
+        fun f(p: S): string { return string(p); }
+        fun main(): int { return 1; }",
+    );
 }
 
 #[test]

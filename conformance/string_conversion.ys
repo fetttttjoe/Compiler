@@ -1,0 +1,29 @@
+struct Point { x: int, y: float }
+
+fun label(p: Point): string {
+    return "(" + string(p.x) + ", " + string(p.y) + ")";
+}
+
+fun main(): int {
+    print(label(Point { x: 3, y: 0.5 }));
+    print(label(Point { x: -1, y: 2.0 }));
+
+    var csv: string = "";
+    var i: int = 1;
+    while i <= 4 {
+        csv = csv + string(i * i);
+        if i < 4 { csv = csv + ","; }
+        i = i + 1;
+    }
+    print(csv);
+
+    const flags: bool[] = [true, false, true];
+    print(string(flags));
+
+    var best: int? = null;
+    print("best=" + string(best));
+    best = 17;
+    print("best=" + string(best));
+
+    return 0;
+}
