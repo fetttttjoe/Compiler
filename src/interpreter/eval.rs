@@ -272,7 +272,7 @@ impl<'a> Interp<'a> {
             Expr::Int(n, _) => Ok(Value::Int(*n)),
             Expr::Float(f, _) => Ok(Value::Float(*f)),
             Expr::Bool(b, _) => Ok(Value::Bool(*b)),
-            Expr::Str(s, _) => Ok(Value::Str(s.clone())),
+            Expr::Str(s, _) => Ok(Value::Str(s.as_bytes().to_vec())),
             Expr::Ident(name, span) => self.lookup(name, *span),
             Expr::Null(_) => Ok(Value::Null),
             Expr::Unary { op, rhs, span } => {
@@ -328,7 +328,9 @@ impl<'a> Interp<'a> {
                     if name == syntax::BUILTIN_PRINT && args.len() == 1 {
                         let v = self.eval(&args[0])?;
                         use std::io::Write;
-                        if let Err(e) = writeln!(std::io::stdout(), "{}", v.display(&self.heap)) {
+                        let mut out = v.display(&self.heap);
+                        out.push(b'\n');
+                        if let Err(e) = std::io::stdout().write_all(&out) {
                             // A closed pipe means the consumer is done —
                             // stop quietly (GNU convention). Anything else
                             // (full disk, bad fd) is a real error.
@@ -688,9 +690,13 @@ fn float_op(op: BinOp, a: f64, b: f64, _span: Span) -> Result<Value, Diagnostic>
     Ok(v)
 }
 
-fn str_op(op: BinOp, a: String, b: String, span: Span) -> Result<Value, Diagnostic> {
+fn str_op(op: BinOp, a: Vec<u8>, b: Vec<u8>, span: Span) -> Result<Value, Diagnostic> {
     match op {
-        BinOp::Add => Ok(Value::Str(a + &b)),
+        BinOp::Add => {
+            let mut out = a;
+            out.extend_from_slice(&b);
+            Ok(Value::Str(out))
+        }
         BinOp::Eq => Ok(Value::Bool(a == b)),
         BinOp::Ne => Ok(Value::Bool(a != b)),
         _ => Err(Diagnostic::error(

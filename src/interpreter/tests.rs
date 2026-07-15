@@ -237,16 +237,16 @@ fn string_conversion_renders_prints_text() {
     // ADR 0029: string(x) is exactly the text print(x) writes.
     assert_eq!(
         run("fun main(): string { return string(42) + string(true) + string(2.5); }"),
-        Ok(Value::Str("42true2.5".into()))
+        Ok(Value::Str(b"42true2.5".to_vec()))
     );
     assert_eq!(
         run("struct P { b: bool, a: int }\n\
              fun main(): string { return string(P { b: true, a: 7 }); }"),
-        Ok(Value::Str("P { a: 7, b: true }".into()))
+        Ok(Value::Str(b"P { a: 7, b: true }".to_vec()))
     );
     assert_eq!(
         run("fun main(): string { var o: int? = null; return string(o) + string([1, 2]); }"),
-        Ok(Value::Str("null[1, 2]".into()))
+        Ok(Value::Str(b"null[1, 2]".to_vec()))
     );
 }
 
@@ -256,7 +256,7 @@ fn template_literals_render_like_print() {
     // print's text — including optionals and the string pass-through.
     assert_eq!(
         run("fun main(): string { const p: int? = null; return `p=${p} q=${2.5} s=${\"x\"}`; }"),
-        Ok(Value::Str("p=null q=2.5 s=x".into()))
+        Ok(Value::Str(b"p=null q=2.5 s=x".to_vec()))
     );
 }
 
@@ -328,7 +328,7 @@ fn logical_operators_short_circuit() {
 fn string_concatenation() {
     assert_eq!(
         run("fun main(): string { return \"foo\" + \"bar\"; }"),
-        Ok(Value::Str("foobar".to_string()))
+        Ok(Value::Str(b"foobar".to_vec()))
     );
 }
 
@@ -737,20 +737,20 @@ fn scalar_rendering_matches_debug() {
 fn display_shows_user_values_not_enum_internals() {
     let mut heap = Heap::default();
     heap.arrays
-        .push(vec![Value::Int(1), Value::Str("x".into()), Value::Null]);
+        .push(vec![Value::Int(1), Value::Str(b"x".to_vec()), Value::Null]);
     let array = Value::Array(0);
-    assert_eq!(array.display(&heap), "[1, x, null]");
+    assert_eq!(array.display(&heap), b"[1, x, null]");
     let s = Value::Struct {
         name: "P".into(),
         fields: vec![("x".into(), Value::Int(1))],
     };
-    assert_eq!(s.display(&heap), "P { x: 1 }");
+    assert_eq!(s.display(&heap), b"P { x: 1 }");
     heap.structs.push(StructObj {
         name: "N".into(),
         fields: vec![("v".into(), Value::Bool(true))],
     });
     let r = Value::Ref(0);
-    assert_eq!(r.display(&heap), "N { v: true }");
+    assert_eq!(r.display(&heap), b"N { v: true }");
 }
 
 /// The kitchen-sink program: a binary search tree combining refstruct

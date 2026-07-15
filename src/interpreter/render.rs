@@ -1,9 +1,12 @@
 //! Turning values into text: `display` is what `print` writes (scalars
 //! and strings raw, aggregates source-like), `render` the debug-style
-//! result line. Struct fields render in name-sorted storage order —
-//! observable language spec pinned by the conformance corpus, so a
-//! future compiled renderer must sort the same way. Both are
-//! depth-capped: cyclic refstructs would recurse forever otherwise.
+//! result line. `display` produces BYTES — strings are raw bytes
+//! (ADR 0013), so non-UTF-8 file input passes through untouched; only
+//! the oracle-only `render` result line goes lossy. Struct fields
+//! render in name-sorted storage order — observable language spec
+//! pinned by the conformance corpus, so a future compiled renderer
+//! must sort the same way. Both are depth-capped: cyclic refstructs
+//! would recurse forever otherwise.
 
 use super::*;
 
@@ -12,41 +15,42 @@ impl Value {
     /// and arrays in source-like shape, refs printed through the handle.
     /// Depth-capped like `render` — a handle hop costs a level, so cycles
     /// stay as bounded as they were under the Rc oracle.
-    pub fn display(&self, heap: &Heap) -> String {
+    pub fn display(&self, heap: &Heap) -> Vec<u8> {
         self.display_depth(heap, 8)
     }
 
-    fn display_depth(&self, heap: &Heap, depth: usize) -> String {
+    fn display_depth(&self, heap: &Heap, depth: usize) -> Vec<u8> {
         if depth == 0 {
-            return "...".to_string();
+            return b"...".to_vec();
         }
         match self {
-            Value::Int(n) => n.to_string(),
-            Value::Float(f) => f.to_string(),
-            Value::Bool(b) => b.to_string(),
+            Value::Int(n) => n.to_string().into_bytes(),
+            Value::Float(f) => f.to_string().into_bytes(),
+            Value::Bool(b) => b.to_string().into_bytes(),
             Value::Str(s) => s.clone(),
-            Value::Null => "null".to_string(),
-            Value::Unit => "unit".to_string(),
+            Value::Null => b"null".to_vec(),
+            Value::Unit => b"unit".to_vec(),
             // The hop consumes a level, the object's children another.
             Value::Ref(id) if depth == 1 => {
                 let _ = id;
-                "...".to_string()
+                b"...".to_vec()
             }
             Value::Ref(id) => {
                 let obj = &heap.structs[*id];
-                render_struct(&obj.name, &obj.fields, |v| v.display_depth(heap, depth - 2))
+                display_struct(&obj.name, &obj.fields, |v| v.display_depth(heap, depth - 2))
             }
             Value::Array(id) => {
-                render_items(&heap.arrays[*id], |v| v.display_depth(heap, depth - 1))
+                display_items(&heap.arrays[*id], |v| v.display_depth(heap, depth - 1))
             }
             Value::Struct { name, fields } => {
-                render_struct(name, fields, |v| v.display_depth(heap, depth - 1))
+                display_struct(name, fields, |v| v.display_depth(heap, depth - 1))
             }
         }
     }
 
     /// Debug-style rendering with a depth cap — cyclic refstruct values
-    /// would recurse forever otherwise.
+    /// would recurse forever otherwise. Oracle-only (the `=>` result
+    /// line), so binary strings may render lossily here.
     // ponytail: depth cap, not cycle detection — 8 levels is plenty for a
     // result dump; switch to handle-tracking if real output needs it.
     pub fn render(&self, heap: &Heap) -> String {
@@ -72,6 +76,7 @@ impl Value {
             Value::Struct { name, fields } => {
                 render_struct(name, fields, |v| v.render_depth(heap, depth - 1))
             }
+            Value::Str(s) => format!("Str({:?})", String::from_utf8_lossy(s)),
             other => format!("{other:?}"),
         }
     }
@@ -88,6 +93,36 @@ impl Value {
             Value::Unit => "unit",
         }
     }
+}
+
+fn display_struct(
+    name: &str,
+    fields: &[(String, Value)],
+    mut one: impl FnMut(&Value) -> Vec<u8>,
+) -> Vec<u8> {
+    let mut out = format!("{name} {{ ").into_bytes();
+    for (i, (f, v)) in fields.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(b", ");
+        }
+        out.extend_from_slice(f.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(&one(v));
+    }
+    out.extend_from_slice(b" }");
+    out
+}
+
+fn display_items(items: &[Value], mut one: impl FnMut(&Value) -> Vec<u8>) -> Vec<u8> {
+    let mut out = b"[".to_vec();
+    for (i, v) in items.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(b", ");
+        }
+        out.extend_from_slice(&one(v));
+    }
+    out.extend_from_slice(b"]");
+    out
 }
 
 fn render_struct(

@@ -50,7 +50,10 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Bool(bool),
-    Str(String),
+    /// Raw length-carried bytes — the ADR 0013 representation. Source
+    /// literals are always valid UTF-8, but file input (ADR 0031) need
+    /// not be, and both engines pass bytes through untouched.
+    Str(Vec<u8>),
     /// Fields sorted by name (literals may write them in any order, and
     /// sorting makes `PartialEq` order-independent); lookup is a linear
     /// scan — structs are small, and the checker guarantees the field
