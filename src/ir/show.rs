@@ -7,7 +7,7 @@ use super::layout::{FUEL, Kind, kind_of, offset_of, ref_shaped};
 use super::{FunctionIr, Inst, Lbl, V};
 use crate::ast::BinOp;
 use crate::check::Resolutions;
-use crate::codegen::{FMT_INT_RAW, FMT_STR_RAW, RT_PRINTF, Strings, label_of};
+use crate::codegen::{FMT_INT_RAW, FMT_STR_RAW, RT_FMT_F64, RT_PRINTF, Strings, label_of};
 use crate::types::Type;
 use std::collections::HashMap;
 
@@ -215,6 +215,17 @@ fn routine(
     b.eq_ret_ellipsis(D, 0);
     match t {
         Type::Int => b.printf(FMT_INT_RAW, &[X]),
+        // The runtime formatter (ADR 0027); fields load as words, so
+        // the bits already ride an integer vreg.
+        Type::Float => {
+            let dst = b.fresh();
+            b.insts.push(Inst::CallRt {
+                dst,
+                sym: RT_FMT_F64,
+                args: vec![X],
+                varargs: false,
+            });
+        }
         Type::Bool => {
             let c = b.fresh();
             b.insts.push(Inst::BinImm {

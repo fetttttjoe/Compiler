@@ -159,13 +159,6 @@ fn undeliverable_output_is_not_a_silent_success() {
     assert!(!status.success(), "ENOSPC must not look like success");
 }
 
-/// Printing floats needs formatting parity with Rust's f64 Display —
-/// its own project, gated until then.
-#[test]
-fn printing_floats_is_not_yet_compilable() {
-    assert_not_yet_compilable("printfloat", "fun main(): int { print(1.5); return 0; }");
-}
-
 /// The end-to-end milestone: the multi-module fib example compiles to a
 /// native binary whose exit code is fib(10) = 55.
 #[test]
@@ -353,15 +346,6 @@ fn compiled_runtime_errors_report_and_exit_1() {
     }
 }
 
-/// `float?` printing waits on float printing itself (ADR 0021/0025).
-#[test]
-fn value_optional_gates_are_precise() {
-    assert_not_yet_compilable(
-        "printfloatopt",
-        "fun main(): int { var x: float? = 1.5; print(x); return 0; }",
-    );
-}
-
 /// A recursive value struct has infinite size; the checker allows the
 /// declaration (its values are unconstructible), so codegen must
 /// diagnose instead of recursing forever.
@@ -372,26 +356,6 @@ fn recursive_value_struct_is_a_clean_diagnostic() {
         "struct S { s: S }
         fun f(p: S): int { return 0; }
         fun main(): int { return 1; }",
-    );
-}
-
-/// Floats inside aggregates stay gated with float printing itself
-/// (ADR 0025) — through every route, cyclic types included.
-#[test]
-fn printing_float_aggregates_is_gated() {
-    assert_not_yet_compilable(
-        "printfloatstruct",
-        "struct V { f: float }
-        fun main(): int { print(V { f: 1.0 }); return 0; }",
-    );
-    assert_not_yet_compilable(
-        "printfloatarr",
-        "fun main(): int { print([1.5]); return 0; }",
-    );
-    assert_not_yet_compilable(
-        "printfloatdeep",
-        "refstruct N { f: float?, next: N? }
-        fun main(): int { print(N { f: null, next: null }); return 0; }",
     );
 }
 

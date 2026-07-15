@@ -1885,6 +1885,93 @@ fn equality_walk_snapshots_before_rhs_mutation() {
     );
 }
 
+// ---- Float printing (ADR 0027) -------------------------------------------
+
+/// A value as a float-typed ys literal: its own Display text, with
+/// `.0` appended when dot-free (whole numbers would lex as ints).
+/// Shortest-round-trip means the lexer reparses the exact bits.
+fn float_lit(x: f64) -> String {
+    let mut t = format!("{x}");
+    if !t.contains('.') {
+        t.push_str(".0");
+    }
+    t
+}
+
+#[test]
+fn float_display_parity_on_the_fixed_matrix() {
+    diff(
+        "floatfmt",
+        r#"struct P { w: float, name: string }
+        fun main(): int {
+            print(1.0);
+            print(0.1);
+            print(-10.5);
+            print(-0.0);
+            print(1000000000000000000000.0);
+            print(0.0000000001);
+            print(1.0 / 3.0);
+            print(0.1 + 0.2);
+            print(0.0 / 0.0);
+            print(1.0 / 0.0);
+            print(-1.0 / 0.0);
+            var m: float? = null;
+            print(m);
+            m = 1.25;
+            print(m);
+            print([1.5, -0.25]);
+            print(P { w: 0.1, name: "x" });
+            return 0;
+        }"#,
+    );
+}
+
+#[test]
+fn float_display_parity_at_the_extremes() {
+    // Subnormals, the largest finite, 17-digit cases — the zero-run
+    // buffer and the precision-16 probe both get exercised.
+    let prints: Vec<String> = [
+        5e-324,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        2.225073858507201e-308, // largest subnormal
+        0.1 + 0.2,
+        9007199254740992.0, // 2^53
+        1.23456789012345e300,
+        -1e-300,
+    ]
+    .iter()
+    .map(|x| format!("print({});", float_lit(*x)))
+    .collect();
+    diff(
+        "floatedge",
+        &format!("fun main(): int {{ {} return 0; }}", prints.join("\n")),
+    );
+}
+
+#[test]
+fn float_display_parity_on_random_bit_patterns() {
+    // xorshift64 over the f64 bit space, finite values only. The
+    // oracle prints through Rust Display itself, so engine agreement
+    // is ground-truth agreement.
+    let mut s: u64 = 0x9e3779b97f4a7c15;
+    let mut prints = Vec::new();
+    while prints.len() < 120 {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let x = f64::from_bits(s);
+        if !x.is_finite() {
+            continue;
+        }
+        prints.push(format!("print({});", float_lit(x)));
+    }
+    diff(
+        "floatbits",
+        &format!("fun main(): int {{ {} return 0; }}", prints.join("\n")),
+    );
+}
+
 #[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as

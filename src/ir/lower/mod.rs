@@ -3,14 +3,14 @@
 //! Anything the backend can't represent yet returns a clean
 //! "not yet compilable" diagnostic — there is no fallback path.
 
-use super::layout::{FUEL, Kind, contains_float, kind_of, offset_of, ref_shaped};
+use super::layout::{FUEL, Kind, kind_of, offset_of, ref_shaped};
 use super::show::{DEPTH_BUDGET, Printers};
 use super::{FunctionIr, Inst, Lbl, V, unsupported};
 use crate::ast::{BinOp, Expr, Function, Stmt, UnOp};
 use crate::check::Resolutions;
 use crate::codegen::{
-    FALSE_S, FMT_CSTR, FMT_INT, FMT_STR, NULL_S, RT_MALLOC, RT_MEMCPY, RT_PRINTF, RT_PUSH,
-    RT_PUSH_N, Strings, TRUE_S, label_of,
+    FALSE_S, FMT_CSTR, FMT_INT, FMT_STR, NULL_S, RT_FMT_F64, RT_MALLOC, RT_MEMCPY, RT_PRINTF,
+    RT_PUSH, RT_PUSH_N, Strings, TRUE_S, label_of,
 };
 use crate::diagnostic::Diagnostic;
 use crate::source::SourceMap;
@@ -1403,7 +1403,6 @@ impl Lowerer<'_> {
                     // A tagged optional prints its payload or `null`
                     // (ADR 0021 decision 6).
                     Type::Optional(inner) if !ref_shaped(inner, self.res) => match inner.as_ref() {
-                        Type::Float => Err(unsupported("printing floats", span)),
                         Type::Int | Type::Bool | Type::Str => {
                             let v = self.expr(value)?;
                             let tag = self.load_at(v, 0);
@@ -1435,9 +1434,19 @@ impl Lowerer<'_> {
                         // routine's tag wrapper handles null.
                         _ => self.print_aggregate(value, &ty, span),
                     },
-                    // Formatting parity with Rust's f64 Display is its
-                    // own project.
-                    Type::Float => Err(unsupported("printing floats", span)),
+                    // The runtime formatter (ADR 0027); the value's
+                    // bits ride an integer register.
+                    Type::Float => {
+                        let v = self.expr(value)?;
+                        let dst = self.fresh(false);
+                        self.insts.push(Inst::CallRt {
+                            dst,
+                            sym: RT_FMT_F64,
+                            args: vec![v],
+                            varargs: false,
+                        });
+                        Ok(self.print_newline())
+                    }
                     // A unit-typed call: evaluate for effects, print
                     // the oracle's literal text.
                     Type::Unit => {
@@ -1454,11 +1463,8 @@ impl Lowerer<'_> {
     }
 
     /// Aggregates print through their monomorphized show routine
-    /// (ADR 0025); floats stay gated until float formatting exists.
+    /// (ADR 0025).
     fn print_aggregate(&mut self, value: &Expr, ty: &Type, span: Span) -> Result<V, Diagnostic> {
-        if contains_float(ty, self.res, &mut Vec::new()) {
-            return Err(unsupported("printing floats", span));
-        }
         kind_of(ty, self.res, FUEL)
             .ok_or_else(|| unsupported("printing values of this type", span))?;
         let v = self.expr(value)?;
@@ -1471,7 +1477,11 @@ impl Lowerer<'_> {
             args: vec![v, depth],
             sret: None,
         });
-        // print's contract: one trailing newline after the value.
+        Ok(self.print_newline())
+    }
+
+    /// print's contract: one trailing newline after the value text.
+    fn print_newline(&mut self) -> V {
         let sym = self.strings.intern_cstr("\n");
         let nl = self.lea_sym(sym);
         let d = self.fresh(false);
@@ -1481,7 +1491,7 @@ impl Lowerer<'_> {
             args: vec![nl],
             varargs: true,
         });
-        Ok(self.const_word(0))
+        self.const_word(0)
     }
 
     fn print_int(&mut self, v: V) -> V {
