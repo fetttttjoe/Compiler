@@ -92,7 +92,10 @@ same lowering shape optionals proved; the interpreter's
 contract extends by the existing playbook (show routines, trap-shaped
 exits, diff harness).
 
-**Accepted costs:** two special-cased unions (optional, error) instead
+**Accepted costs:** `error` and `try` become keywords — a post-1.0
+surface change; the corpus, examples, and benches were audited clean,
+so no golden moves, but user programs using those identifiers must
+rename. Two special-cased unions (optional, error) instead
 of one general mechanism — accepted deliberately; the general one
 (generics + sum types) can still arrive and interoperate. The checker
 carries a second narrowing state kind. Error identity is nominal and
