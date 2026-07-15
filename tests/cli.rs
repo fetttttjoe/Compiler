@@ -166,21 +166,6 @@ fn printing_floats_is_not_yet_compilable() {
     assert_not_yet_compilable("printfloat", "fun main(): int { print(1.5); return 0; }");
 }
 
-/// memcmp can't decide float equality (NaN, negative zero), so structs
-/// with float fields can't use the one-memcmp equality path.
-#[test]
-fn equality_on_structs_containing_floats_is_gated() {
-    assert_not_yet_compilable(
-        "floateq",
-        "struct V { f: float }
-        fun main(): int {
-            const a: V = V { f: 1.0 };
-            if a == (V { f: 1.0 }) { return 1; }
-            return 0;
-        }",
-    );
-}
-
 /// The end-to-end milestone: the multi-module fib example compiles to a
 /// native binary whose exit code is fib(10) = 55.
 #[test]
@@ -368,23 +353,12 @@ fn compiled_runtime_errors_report_and_exit_1() {
     }
 }
 
-/// The tag-word model (ADR 0021) leaves precise gates: `float?` printing
-/// waits on float printing itself, and equality over optionals of
-/// no-memcmp structs keeps the struct-equality gate.
+/// `float?` printing waits on float printing itself (ADR 0021/0025).
 #[test]
 fn value_optional_gates_are_precise() {
     assert_not_yet_compilable(
         "printfloatopt",
         "fun main(): int { var x: float? = 1.5; print(x); return 0; }",
-    );
-    assert_not_yet_compilable(
-        "optfloatstructeq",
-        "struct V { f: float }
-        fun main(): int {
-            var a: V? = V { f: 1.0 };
-            if a == (V { f: 1.0 }) { return 1; }
-            return 0;
-        }",
     );
 }
 

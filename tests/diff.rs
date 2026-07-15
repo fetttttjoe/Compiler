@@ -1788,6 +1788,103 @@ fn printed_structs_embed_optionals_and_strings() {
     );
 }
 
+// ---- Structural equality walk (ADR 0026) ---------------------------------
+
+#[test]
+fn string_field_structs_compare_by_content() {
+    // Different allocations, equal bytes — identity would say no.
+    diff(
+        "eqstrfield",
+        r#"struct Tag { name: string, id: int }
+        fun main(): int {
+            var r: int = 0;
+            const a: Tag = Tag { name: "a" + "x", id: 1 };
+            if a == (Tag { name: "ax", id: 1 }) { r = r + 1; }
+            if a != (Tag { name: "ay", id: 1 }) { r = r + 10; }
+            if a != (Tag { name: "ax", id: 2 }) { r = r + 100; }
+            return r;
+        }"#,
+    );
+}
+
+#[test]
+fn float_field_structs_compare_ieee() {
+    // NaN != NaN and -0.0 == 0.0 — exactly the cases memcmp gets
+    // wrong, and exactly the oracle's f64 semantics.
+    diff(
+        "eqfloatfield",
+        "struct V { f: float }
+        fun main(): int {
+            var r: int = 0;
+            const nan: float = 0.0 / 0.0;
+            if (V { f: nan }) != (V { f: nan }) { r = r + 1; }
+            if (V { f: -0.0 }) == (V { f: 0.0 }) { r = r + 10; }
+            if (V { f: 1.5 }) == (V { f: 1.5 }) { r = r + 100; }
+            return r;
+        }",
+    );
+}
+
+#[test]
+fn nested_no_memcmp_structs_walk_recursively() {
+    diff(
+        "eqnested",
+        r#"struct In { s: string, hit: int? }
+        struct Out { v: In, k: int }
+        fun main(): int {
+            var r: int = 0;
+            const a: Out = Out { v: In { s: "x", hit: null }, k: 3 };
+            if a == (Out { v: In { s: "x", hit: null }, k: 3 }) { r = r + 1; }
+            if a != (Out { v: In { s: "x", hit: 5 }, k: 3 }) { r = r + 10; }
+            if a != (Out { v: In { s: "y", hit: null }, k: 3 }) { r = r + 100; }
+            return r;
+        }"#,
+    );
+}
+
+#[test]
+fn optional_no_memcmp_structs_compare_through_the_tag() {
+    // The old gate's cases: V? == V? and V? == V with float/string
+    // payloads, plus string? fields inside the walk.
+    diff(
+        "eqoptwalk",
+        r#"struct V { f: float, s: string? }
+        fun main(): int {
+            var r: int = 0;
+            var a: V? = V { f: 1.5, s: "tag" };
+            var b: V? = V { f: 1.5, s: "tag" };
+            if a == b { r = r + 1; }
+            if a == (V { f: 1.5, s: "tag" }) { r = r + 10; }
+            b = V { f: 1.5, s: null };
+            if a != b { r = r + 100; }
+            b = null;
+            if a != b { r = r + 1000; }
+            if b == null { r = r + 10000; }
+            return r;
+        }"#,
+    );
+}
+
+#[test]
+fn equality_walk_snapshots_before_rhs_mutation() {
+    // s == f() where f rewrites s's string field: the left value
+    // compares as it was BEFORE the call.
+    diff(
+        "eqwalksnap",
+        r#"struct Box { s: string }
+        refstruct Holder { b: Box }
+        fun clobber(h: Holder): Box {
+            h.b = Box { s: "changed" };
+            return Box { s: "orig" };
+        }
+        fun main(): int {
+            const h: Holder = Holder { b: Box { s: "orig" } };
+            if h.b == clobber(h) { return 1; }
+            return 0;
+        }"#,
+    );
+}
+
 #[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as
