@@ -43,8 +43,16 @@ class Gen:
         b = self.int_expr(vars_, depth + 1)
         op = r.choice(INT_BIN + ["/", "%"])
         if op in "/%":
-            # Keep divisors nonzero constants so the oracle runs clean.
-            b = str(r.choice([2, 3, 4, 7, 8, 10, 12, 100]))
+            if vars_ and r.random() < 0.4:
+                # A runtime divisor exercises the checked path (ADR
+                # 0022). d*d + 1 is provably never 0 or -1, even under
+                # wrapping (squares mod 8 are 0/1/4), so the oracle
+                # still runs clean.
+                d = r.choice(vars_)
+                b = f"({d} * {d} + 1)"
+            else:
+                # Nonzero constants strength-reduce (pow2/magic paths).
+                b = str(r.choice([2, 3, 4, 7, 8, 10, 12, 100]))
         return f"({a} {op} {b})"
 
     def bool_expr(self, vars_):

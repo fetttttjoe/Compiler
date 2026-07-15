@@ -330,10 +330,15 @@ fn compiled_runtime_errors_report_and_exit_1() {
         std::fs::write(&src, program).unwrap();
         let out = compiler(&[src.to_str().unwrap()]);
         assert_eq!(out.status.code(), Some(1), "{name}: oracle exits 1");
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains(message),
-            "{name}: oracle message"
-        );
+        let oracle_err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(oracle_err.contains(message), "{name}: oracle message");
+        // The compiled binary's entire stderr is the oracle's first two
+        // lines — message and location — byte-identical (ADR 0022).
+        let head: String = oracle_err
+            .lines()
+            .take(2)
+            .map(|l| format!("{l}\n"))
+            .collect();
 
         let bin = dir.join(name);
         let out = compiler(&["build", src.to_str().unwrap(), "-o", bin.to_str().unwrap()]);
@@ -350,8 +355,12 @@ fn compiled_runtime_errors_report_and_exit_1() {
             Some(1),
             "{name}: exit code, not a signal"
         );
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            head,
+            "{name}: stderr must be the oracle's first two lines"
+        );
         let err = String::from_utf8_lossy(&run.stderr);
-        assert!(err.contains(message), "{name}: {err}");
         assert!(
             err.contains(&format!("{name}.ys:")),
             "{name}: location: {err}"

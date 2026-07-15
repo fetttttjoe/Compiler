@@ -12,3 +12,6 @@
 
 # Benchmark artifacts are rebuilt by benches/run.sh.
 /benches/out/
+
+# Python bytecode (tools/)
+__pycache__/
