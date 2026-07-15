@@ -1081,21 +1081,27 @@ impl Lowerer<'_> {
             .expect("routed on an optional side");
         let ik = kind_of(&inner, self.res, FUEL)
             .ok_or_else(|| unsupported("values of this type", span))?;
-        if matches!(
-            ik,
-            Kind::Struct {
-                no_memcmp: true,
-                ..
-            }
-        ) {
+        let total = 1 + ik.words();
+        let l_null = matches!(self.ty(&lhs.span()), None | Some(Type::Null));
+        let r_null = matches!(self.ty(&rhs.span()), None | Some(Type::Null));
+        // `x == null` is a pure tag test (ADR 0021 decision 5) — legal
+        // for every payload class; only actual payload comparisons need
+        // memcmp-ability.
+        if !l_null
+            && !r_null
+            && matches!(
+                ik,
+                Kind::Struct {
+                    no_memcmp: true,
+                    ..
+                }
+            )
+        {
             return Err(unsupported(
                 "'==' on structs containing strings or floats",
                 span,
             ));
         }
-        let total = 1 + ik.words();
-        let l_null = matches!(self.ty(&lhs.span()), None | Some(Type::Null));
-        let r_null = matches!(self.ty(&rhs.span()), None | Some(Type::Null));
         let eq = if r_null {
             // `x == null`: the tag decides.
             let l = self.expr(lhs)?;

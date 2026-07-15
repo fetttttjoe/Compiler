@@ -1536,6 +1536,29 @@ fn optional_element_arrays_through_outer_optionals_and_fields() {
 }
 
 #[test]
+fn null_tests_on_no_memcmp_optional_payloads_are_tag_tests() {
+    // ADR 0021 decision 5: `x == null` never compares the payload, so
+    // it is legal even when the payload class can't memcmp (floats,
+    // strings). Payload comparisons (`V? == V`) stay gated — pinned by
+    // cli.rs value_optional_gates_are_precise.
+    diff(
+        "optnulltag",
+        "struct V { f: float, s: string }
+        fun main(): int {
+            var a: V? = null;
+            var r: int = 0;
+            if a == null { r = r + 1; }
+            if null == a { r = r + 10; }
+            a = V { f: 1.5, s: \"x\" };
+            if a != null { r = r + 100; }
+            const vs: V?[] = [null];
+            if vs[0] == null { r = r + 1000; }
+            return r;
+        }",
+    );
+}
+
+#[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as
     // tall as the chain is long; 6000 terms used to overflow the checker's
