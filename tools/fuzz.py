@@ -6,11 +6,15 @@ Usage: tools/fuzz.py [seed_start] [seed_end]   (default 0..200)
 
 The generator covers ints, bools, floats, strings, the conversions
 (int()/float()/string()), template literals, int arrays with for-in
-and push, control flow, and int->int helper calls. Structs and optionals are NOT
-generated yet - cover those manually (or extend the generator) when
-touching their lowering. A program whose float path traps int() at
-runtime is skipped like any other oracle-diagnosed run. A divergence
-saves the program next to this script and exits nonzero.
+and push, control flow, int->int helper calls, int? optionals (null
+tests, ??, guard narrowing incl. the ADR 0033 guard-return-on-locals
+shape), and value structs (literals, field reads/writes, copy
+semantics, structural equality, aggregate printing). Refstructs,
+files, and errors are NOT generated yet - cover those manually (or
+extend the generator) when touching their lowering. A program whose
+float path traps int() at runtime is skipped like any other
+oracle-diagnosed run. A divergence saves the program next to this
+script and exits nonzero.
 """
 
 import random
@@ -47,6 +51,14 @@ class Gen:
         r = self.r
         ints = of_type(vars_, "int")
         if depth > 3 or r.random() < 0.3:
+            opts = of_type(vars_, "opt")
+            pts = of_type(vars_, "pt")
+            roll = r.random()
+            # `o ?? k` and `q.x` are always-sound int atoms.
+            if opts and roll < 0.15:
+                return f"({r.choice(opts)} ?? {r.randint(-9, 9)})"
+            if pts and roll < 0.3:
+                return f"{r.choice(pts)}.{r.choice(['x', 'y'])}"
             if ints and r.random() < 0.6:
                 return r.choice(ints)
             return str(r.randint(-100, 100))
@@ -99,7 +111,7 @@ class Gen:
                 elif roll < 0.6:
                     bits.append(f"${{{self.int_expr(vars_, 3)}}}")
                 elif roll < 0.8:
-                    bits.append(f"${{{self.bool_expr(vars_)}}}")
+                    bits.append(f"${{{self.bool_expr(vars_, null_ok=True)}}}")
                 else:
                     bits.append(f"${{{self.float_expr(vars_)}}}")
             bits.append(r.choice(["", "end"]))
@@ -120,8 +132,21 @@ class Gen:
                 parts.append(f"string({self.float_expr(vars_)})")
         return " + ".join(parts)
 
-    def bool_expr(self, vars_):
+    def bool_expr(self, vars_, null_ok=False):
+        """null_ok gates `o == null` atoms: legal only where no branch
+        follows (print, templates) — as an if/while condition the
+        checker narrows the tested var inside the branch, retyping it
+        under the generator's feet (the guard arms model that; this
+        does not)."""
         r = self.r
+        opts = of_type(vars_, "opt")
+        pts = of_type(vars_, "pt")
+        if null_ok and opts and r.random() < 0.15:
+            return f"({r.choice(opts)} {r.choice(['==', '!='])} null)"
+        if len(pts) >= 2 and r.random() < 0.1:
+            # Structural equality (ADR 0026), including through copies.
+            a, b = r.sample(pts, 2)
+            return f"({a} {r.choice(['==', '!='])} {b})"
         if r.random() < 0.25:
             a = self.float_expr(vars_, 2)
             b = self.float_expr(vars_, 2)
@@ -137,14 +162,25 @@ class Gen:
         return e
 
     def assign(self, vars_):
-        """One reassignment of a v*/g*/s* variable (loop counters i*
-        stay untouched - reassigning one makes nonterminating loops)."""
-        mut = [(n, t) for n, t in vars_ if not n.startswith(("i", "p"))]
+        """One reassignment of a v*/g*/s*/o*/q* variable (loop counters
+        i* stay untouched - reassigning one makes nonterminating loops;
+        p* params and n* narrowed optionals are read-only: rebinding a
+        narrowed local would kill its fact and unsound the generator)."""
+        mut = [(n, t) for n, t in vars_ if not n.startswith(("i", "p", "n"))]
         n, t = self.r.choice(mut)
         if t == "int":
             return f"{n} = {self.int_expr(vars_)};"
         if t == "float":
             return f"{n} = {self.float_expr(vars_)};"
+        if t == "opt":
+            # Wrap points (ADR 0021): null and T both flow into T? slots.
+            if self.r.random() < 0.3:
+                return f"{n} = null;"
+            return f"{n} = {self.int_expr(vars_)};"
+        if t == "pt":
+            if self.r.random() < 0.5:
+                return f"{n}.{self.r.choice(['x', 'y'])} = {self.int_expr(vars_)};"
+            return f"{n} = Pt {{ x: {self.int_expr(vars_)}, y: {self.int_expr(vars_)} }};"
         # Growth is bounded: loops run at most 4 iterations, two deep.
         return f"{n} = {n} + {self.str_expr(vars_)};"
 
@@ -171,16 +207,52 @@ class Gen:
                 v = self.name("v")
                 lines.append(f"var {v}: int = int({self.float_expr(vars_)} % 997.0);")
                 vars_ = vars_ + [(v, "int")]
-            elif roll < 0.52 and [n for n, t in vars_ if not n.startswith(("i", "p"))]:
+            elif roll < 0.49:
+                v = self.name("o")
+                init = "null" if r.random() < 0.35 else self.int_expr(vars_)
+                lines.append(f"var {v}: int? = {init};")
+                vars_ = vars_ + [(v, "opt")]
+            elif roll < 0.54:
+                v = self.name("q")
+                lines.append(
+                    f"var {v}: Pt = Pt {{ x: {self.int_expr(vars_)}, y: {self.int_expr(vars_)} }};"
+                )
+                vars_ = vars_ + [(v, "pt")]
+            elif roll < 0.58 and of_type(vars_, "pt"):
+                # Copy semantics observable (ADR 0006): mutate the copy,
+                # print both.
+                src = r.choice(of_type(vars_, "pt"))
+                v = self.name("q")
+                lines.append(
+                    f"var {v}: Pt = {src}; {v}.x = {self.int_expr(vars_)}; "
+                    f"print({src}.x); print({v}.x);"
+                )
+                vars_ = vars_ + [(v, "pt")]
+            elif roll < 0.62 and [n for n, t in vars_ if not n.startswith(("i", "p", "n"))]:
                 lines.append(self.assign(vars_))
-            elif roll < 0.62:
-                lines.append(f"print({self.int_expr(vars_)});")
             elif roll < 0.68:
+                lines.append(f"print({self.int_expr(vars_)});")
+            elif roll < 0.71:
                 lines.append(f"print({self.float_expr(vars_)});")
             elif roll < 0.74:
                 lines.append(f"print({self.str_expr(vars_)});")
-            elif roll < 0.8:
-                lines.append(f"print({self.bool_expr(vars_)});")
+            elif roll < 0.77:
+                lines.append(f"print({self.bool_expr(vars_, null_ok=True)});")
+            elif roll < 0.81 and (of_type(vars_, "opt") or of_type(vars_, "pt")):
+                # Tag-dispatch and aggregate printing.
+                pool = of_type(vars_, "opt") + of_type(vars_, "pt")
+                lines.append(f"print({r.choice(pool)});")
+            elif roll < 0.86 and of_type(vars_, "opt") and depth < 2:
+                # Guard narrowing (ADR 0007/0020): inside the branch the
+                # optional reads as int, so it leaves the inner pool —
+                # `o ?? k` / `o == null` on a narrowed int are type
+                # errors, and a reassignment would kill the fact under
+                # later reads. The fresh int copy carries its value.
+                o = r.choice(of_type(vars_, "opt"))
+                v = self.name("v")
+                inner_pool = [(n, t) for n, t in vars_ if n != o] + [(v, "int")]
+                inner = self.body(inner_pool, depth + 1)
+                lines.append(f"if {o} != null {{ var {v}: int = {o} + 1; {inner} }}")
             elif roll < 0.9 and depth < 2:
                 inner = self.body(list(vars_), depth + 1)
                 lines.append(
@@ -211,9 +283,20 @@ class Gen:
             names.append((fname, len(params)))
             sig = ", ".join(f"{p}: int" for p in params)
             pool = [(p, "int") for p in params]
+            prologue = ""
+            if r.random() < 0.4:
+                # The ADR 0033 shape: guard-return narrows a LOCAL; the
+                # narrowed name threads read-only (prefix n, see assign).
+                o = self.name("n")
+                init = "null" if r.random() < 0.3 else str(r.randint(-9, 9))
+                prologue = (
+                    f"var {o}: int? = {init}; "
+                    f"if {o} == null {{ return {self.int_expr(list(pool))}; }} "
+                )
+                pool = pool + [(o, "int")]
             body = self.body(list(pool))
             ret = self.int_expr(list(pool))
-            helpers.append(f"fun {fname}({sig}): int {{ {body} return {ret}; }}")
+            helpers.append(f"fun {fname}({sig}): int {{ {prologue}{body} return {ret}; }}")
         main_body = self.body([])
         calls = " ".join(
             f"print({n}({', '.join(str(r.randint(-9, 9)) for _ in range(arity))}));"
@@ -227,7 +310,8 @@ class Gen:
         )
         ret = self.int_expr([])
         return "\n".join(
-            helpers
+            ["struct Pt { x: int, y: int }"]
+            + helpers
             + [f"fun main(): int {{ {main_body} {calls} {arr_part} return ({ret}) % 251; }}"]
         )
 
