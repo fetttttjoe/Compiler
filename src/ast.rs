@@ -164,6 +164,9 @@ pub enum Expr {
     /// form is unshadowable.
     Convert {
         to: Conv,
+        /// True for a template's `${e}` (ADR 0030): the string identity
+        /// passes through instead of being rejected as a no-op.
+        implicit: bool,
         arg: Box<Expr>,
         span: Span,
     },

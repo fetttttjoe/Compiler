@@ -2089,6 +2089,34 @@ fn string_conversion_edges() {
 }
 
 #[test]
+fn template_literals_agree_with_manual_concat() {
+    // ADR 0030: templates are parser sugar, so both engines see the
+    // same desugared concat — nesting, struct literals inside `${}`,
+    // escapes, optionals, and loop growth included.
+    diff(
+        "template",
+        r#"struct P { x: int, y: float }
+        fun main(): int {
+            const name: string = "ada";
+            const p: P = P { x: 2, y: 1.5 };
+            print(`${name} scored ${p.x * 10} (${p.y})`);
+            print(`${name} scored ` + string(p.x * 10) + ` (` + string(p.y) + `)`);
+            print(`nested ${`inner ${p.x}`} done`);
+            print(`struct ${P { x: 1, y: 0.5 }} end`);
+            print(`escaped: \` \${x} $5 b=${1 < 2}`);
+            var o: int? = null;
+            print(`o=${o}`);
+            o = 4;
+            var acc: string = "";
+            var i: int = 0;
+            while i < 3 { acc = `${acc}${i * (o ?? 0)};`; i = i + 1; }
+            print(acc);
+            return 0;
+        }"#,
+    );
+}
+
+#[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as
     // tall as the chain is long; 6000 terms used to overflow the checker's

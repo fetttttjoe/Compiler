@@ -646,7 +646,7 @@ impl Lowerer<'_> {
             // float(i) is one convert; int(f) is the checked form —
             // NaN and out-of-range report and exit 1 (ADR 0028);
             // string(x) renders through the shared builder (ADR 0029).
-            Expr::Convert { to, arg, span } => match to {
+            Expr::Convert { to, arg, span, .. } => match to {
                 Conv::Float => {
                     let v = self.expr(arg)?;
                     let dst = self.fresh(true);
@@ -1543,6 +1543,9 @@ impl Lowerer<'_> {
             .ok_or_else(|| unsupported("converting this value", span))?;
         let v = self.expr(arg)?;
         match &ty {
+            // Implicit identity — a template's `${s}` (ADR 0030): the
+            // value already IS its text.
+            Type::Str => return Ok(v),
             Type::Bool => {
                 let t = self.strings.intern(syntax::KW_TRUE);
                 let r = self.lea_sym(t);

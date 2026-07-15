@@ -283,7 +283,7 @@ impl<'a> Interp<'a> {
             // truncates toward zero and is checked - valid iff
             // f in [-2^63, 2^63), which NaN fails by comparing false.
             // ADR 0029: string(x) is print's text for any value.
-            Expr::Convert { to, arg, span } => match (self.eval(arg)?, *to) {
+            Expr::Convert { to, arg, span, .. } => match (self.eval(arg)?, *to) {
                 (Value::Int(i), Conv::Float) => Ok(Value::Float(i as f64)),
                 (Value::Float(f), Conv::Int) => {
                     if (-9223372036854775808.0..9223372036854775808.0).contains(&f) {

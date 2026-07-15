@@ -251,6 +251,16 @@ fn string_conversion_renders_prints_text() {
 }
 
 #[test]
+fn template_literals_render_like_print() {
+    // ADR 0030: the desugar is string() + concat, so template text is
+    // print's text — including optionals and the string pass-through.
+    assert_eq!(
+        run("fun main(): string { const p: int? = null; return `p=${p} q=${2.5} s=${\"x\"}`; }"),
+        Ok(Value::Str("p=null q=2.5 s=x".into()))
+    );
+}
+
+#[test]
 fn division_overflow_is_a_runtime_error() {
     // i64::MIN / -1 has no i64 result; like division by zero it must
     // be a diagnostic, not a panic (or SIGFPE once compiled).

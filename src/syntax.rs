@@ -39,6 +39,9 @@ pub const UNDERSCORE: char = '_';
 // --- String literals ---
 pub const QUOTE: char = '"';
 pub const BACKSLASH: char = '\\';
+/// Template literals (ADR 0030): `` ` `` delimits, `${` interpolates.
+pub const BACKTICK: char = '`';
+pub const DOLLAR: char = '$';
 /// Escape names: `\n` and `\t` inside a string literal.
 pub const ESCAPE_LF: char = 'n';
 pub const ESCAPE_TAB: char = 't';

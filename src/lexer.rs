@@ -25,6 +25,7 @@ pub fn lex_at(source: &str, base: usize) -> (Vec<Token>, Vec<Diagnostic>) {
         pos: 0,
         base,
         diagnostics: Vec::new(),
+        templates: Vec::new(),
     };
     let mut tokens = Vec::new();
     loop {
@@ -43,6 +44,10 @@ struct Lexer<'a> {
     pos: usize,
     base: usize,
     diagnostics: Vec<Diagnostic>,
+    /// Open template interpolations (ADR 0030), innermost last; each
+    /// entry counts the interpolation's own nested `{`…`}` pairs so a
+    /// struct literal's `}` doesn't end the `${`.
+    templates: Vec<usize>,
 }
 
 impl Lexer<'_> {
@@ -96,8 +101,24 @@ impl Lexer<'_> {
         match c {
             syntax::LPAREN => self.single(TokenKind::LeftParen),
             syntax::RPAREN => self.single(TokenKind::RightParen),
-            syntax::LBRACE => self.single(TokenKind::LeftBrace),
-            syntax::RBRACE => self.single(TokenKind::RightBrace),
+            syntax::LBRACE => {
+                if let Some(depth) = self.templates.last_mut() {
+                    *depth += 1;
+                }
+                self.single(TokenKind::LeftBrace)
+            }
+            // A `}` at interpolation depth 0 resumes the template's text.
+            syntax::RBRACE => match self.templates.last_mut() {
+                Some(depth) if *depth > 0 => {
+                    *depth -= 1;
+                    self.single(TokenKind::RightBrace)
+                }
+                Some(_) => {
+                    self.templates.pop();
+                    self.scan_template(false)
+                }
+                None => self.single(TokenKind::RightBrace),
+            },
             syntax::LBRACKET => self.single(TokenKind::LeftBracket),
             syntax::RBRACKET => self.single(TokenKind::RightBracket),
             syntax::COLON => self.single(TokenKind::Colon),
@@ -113,6 +134,7 @@ impl Lexer<'_> {
             syntax::LESS => self.maybe_eq(TokenKind::Less, TokenKind::LessEq),
             syntax::GREATER => self.maybe_eq(TokenKind::Greater, TokenKind::GreaterEq),
             syntax::QUOTE => self.scan_string(),
+            syntax::BACKTICK => self.scan_template(true),
             syntax::AMPERSAND => self.double(syntax::AMPERSAND, TokenKind::AmpAmp),
             syntax::PIPE => self.double(syntax::PIPE, TokenKind::PipePipe),
             syntax::QUESTION => self.scan_question(),
@@ -203,6 +225,91 @@ impl Lexer<'_> {
                         Some(c) if syntax::is_line_break(c) => {
                             self.error(
                                 "unterminated string literal".to_string(),
+                                self.abs_span(start),
+                            );
+                            return None;
+                        }
+                        Some(other) => {
+                            self.error(
+                                format!("unknown escape '\\{other}'"),
+                                Span::new(
+                                    self.base + escape_start,
+                                    self.base + self.pos + other.len_utf8(),
+                                ),
+                            );
+                            text.push(other); // recover with the raw character
+                        }
+                        None => continue, // EOF: the loop reports unterminated
+                    }
+                    self.bump();
+                }
+                Some(c) => {
+                    text.push(c);
+                    self.bump();
+                }
+            }
+        }
+    }
+
+    /// Template-literal text (ADR 0030), entered at the opening backtick
+    /// or at an interpolation's closing `}`. Decodes the string escapes
+    /// plus `` \` `` and `\$`; `${` suspends into code (the parser sees
+    /// Head/Middle), a backtick closes the template — with no
+    /// interpolation at all it is an ordinary string literal. Text is
+    /// single-line, like strings; a lone `$` is literal.
+    fn scan_template(&mut self, open: bool) -> Option<TokenKind> {
+        let start = self.pos;
+        self.bump(); // ` (open) or } (resume)
+        let mut text = String::new();
+        loop {
+            match self.peek() {
+                None => {
+                    self.error(
+                        "unterminated template literal".to_string(),
+                        self.abs_span(start),
+                    );
+                    return None;
+                }
+                Some(c) if syntax::is_line_break(c) => {
+                    self.error(
+                        "unterminated template literal".to_string(),
+                        self.abs_span(start),
+                    );
+                    return None;
+                }
+                Some(syntax::BACKTICK) => {
+                    self.bump();
+                    return Some(if open {
+                        TokenKind::StringLiteral(text)
+                    } else {
+                        TokenKind::TemplateTail(text)
+                    });
+                }
+                Some(syntax::DOLLAR) if self.source[self.pos + 1..].starts_with(syntax::LBRACE) => {
+                    self.bump(); // $
+                    self.bump(); // {
+                    self.templates.push(0);
+                    return Some(if open {
+                        TokenKind::TemplateHead(text)
+                    } else {
+                        TokenKind::TemplateMiddle(text)
+                    });
+                }
+                Some(syntax::BACKSLASH) => {
+                    // The string escape set (mirrors scan_string) plus the
+                    // template's own delimiters.
+                    let escape_start = self.pos;
+                    self.bump();
+                    match self.peek() {
+                        Some(syntax::QUOTE) => text.push(syntax::QUOTE),
+                        Some(syntax::BACKSLASH) => text.push(syntax::BACKSLASH),
+                        Some(syntax::BACKTICK) => text.push(syntax::BACKTICK),
+                        Some(syntax::DOLLAR) => text.push(syntax::DOLLAR),
+                        Some(syntax::ESCAPE_LF) => text.push(syntax::LF),
+                        Some(syntax::ESCAPE_TAB) => text.push(syntax::TAB),
+                        Some(c) if syntax::is_line_break(c) => {
+                            self.error(
+                                "unterminated template literal".to_string(),
                                 self.abs_span(start),
                             );
                             return None;
@@ -536,6 +643,80 @@ mod tests {
                 TokenKind::StringLiteral("a\"b\\c\nd\te".to_string()),
                 TokenKind::Eof
             ]
+        );
+    }
+
+    #[test]
+    fn template_literals_tokenize_by_parts() {
+        assert_eq!(
+            kinds("`a${x}b${y}c`"),
+            vec![
+                TokenKind::TemplateHead("a".into()),
+                TokenKind::Identifier("x".into()),
+                TokenKind::TemplateMiddle("b".into()),
+                TokenKind::Identifier("y".into()),
+                TokenKind::TemplateTail("c".into()),
+                TokenKind::Eof
+            ]
+        );
+        // No interpolation: an ordinary string literal.
+        assert_eq!(
+            kinds("`ab`"),
+            vec![TokenKind::StringLiteral("ab".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn template_escapes_and_literal_dollar() {
+        assert_eq!(
+            kinds(r"`\`a\${ $5\n`"),
+            vec![TokenKind::StringLiteral("`a${ $5\n".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn template_braces_nest_inside_interpolations() {
+        // A struct literal's `}` must not end the `${` — the depth
+        // counter absorbs it; templates nest via the mode stack.
+        assert_eq!(
+            kinds("`${P { x: 1 }}!`"),
+            vec![
+                TokenKind::TemplateHead("".into()),
+                TokenKind::Identifier("P".into()),
+                TokenKind::LeftBrace,
+                TokenKind::Identifier("x".into()),
+                TokenKind::Colon,
+                TokenKind::IntLiteral(1),
+                TokenKind::RightBrace,
+                TokenKind::TemplateTail("!".into()),
+                TokenKind::Eof
+            ]
+        );
+        assert_eq!(
+            kinds("`a${`b${x}`}c`"),
+            vec![
+                TokenKind::TemplateHead("a".into()),
+                TokenKind::TemplateHead("b".into()),
+                TokenKind::Identifier("x".into()),
+                TokenKind::TemplateTail("".into()),
+                TokenKind::TemplateTail("c".into()),
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn unterminated_template_reports_a_diagnostic() {
+        let (tokens, diags) = lex("`abc\nx");
+        assert_eq!(diags.len(), 1);
+        assert!(
+            diags[0].message.contains("unterminated template"),
+            "{diags:?}"
+        );
+        // Recovery: lexing continues on the next line.
+        assert_eq!(
+            tokens.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+            vec![TokenKind::Identifier("x".into()), TokenKind::Eof]
         );
     }
 

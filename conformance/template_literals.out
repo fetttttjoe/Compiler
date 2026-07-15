@@ -1,0 +1,8 @@
+ada is 36
+p=Point { x: 2, y: 1.5 } sum=3.5
+best=null
+best=7 (7)
+items=[true, false] n=2
+inline=Point { x: 1, y: 0.5 }
+escaped: ` and ${x} and $5
+=> Int(0)

@@ -72,6 +72,73 @@ impl Parser<'_> {
         }
     }
 
+    /// A template literal (ADR 0030) desugars during parsing: text runs
+    /// become string literals, each `${e}` an implicit `string(e)`, all
+    /// folded left over `+` concat — the checker and both engines only
+    /// ever see the desugar. Spans stay unique in the span-keyed type
+    /// table: a conversion spans its `${...}` delimiters, text keeps its
+    /// token span, each fold node runs from the backtick to its
+    /// rightmost part.
+    fn parse_template(&mut self, first: String, head_span: Span) -> Expr {
+        let mut acc = (!first.is_empty()).then_some(Expr::Str(first, head_span));
+        let mut delim_end = head_span.end; // just past this part's `${`
+        loop {
+            let prev = self.struct_literals_allowed;
+            self.struct_literals_allowed = true;
+            let arg = self.parse_expr(0);
+            self.struct_literals_allowed = prev;
+            let next = self.advance(); // `}text${`, `}text\``, or junk
+            let conv = Expr::Convert {
+                to: Conv::Str,
+                implicit: true,
+                arg: Box::new(arg),
+                span: Span::new(delim_end - 2, next.span.start + 1),
+            };
+            acc = Some(self.template_join(acc, conv, head_span));
+            match next.kind {
+                TokenKind::TemplateMiddle(text) => {
+                    if !text.is_empty() {
+                        let part = Expr::Str(text, next.span);
+                        acc = Some(self.template_join(acc, part, head_span));
+                    }
+                    delim_end = next.span.end;
+                }
+                TokenKind::TemplateTail(text) => {
+                    if !text.is_empty() {
+                        let part = Expr::Str(text, next.span);
+                        acc = Some(self.template_join(acc, part, head_span));
+                    }
+                    return acc.expect("at least one interpolation part");
+                }
+                other => {
+                    self.error(
+                        format!(
+                            "expected '}}' to close the interpolation, found {}",
+                            describe(&other)
+                        ),
+                        next.span,
+                    );
+                    return acc.expect("at least one interpolation part");
+                }
+            }
+        }
+    }
+
+    /// One fold step of the template desugar: `acc + part`.
+    fn template_join(&mut self, acc: Option<Expr>, part: Expr, start: Span) -> Expr {
+        let Some(lhs) = acc else { return part };
+        if !self.claim_op(start) {
+            return lhs; // budget exceeded: freeze growth, like chains
+        }
+        let span = start.to(part.span());
+        Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(lhs),
+            rhs: Box::new(part),
+            span,
+        }
+    }
+
     pub(super) fn parse_atom(&mut self) -> Expr {
         let tok = self.advance();
         match tok.kind {
@@ -101,10 +168,12 @@ impl Parser<'_> {
                         TokenKind::FloatType => Conv::Float,
                         _ => Conv::Str,
                     },
+                    implicit: false,
                     arg: Box::new(arg),
                     span: tok.span.to(end),
                 }
             }
+            TokenKind::TemplateHead(first) => self.parse_template(first, tok.span),
             TokenKind::LeftParen => {
                 // Parentheses re-enable struct literals inside a condition.
                 let prev = self.struct_literals_allowed;

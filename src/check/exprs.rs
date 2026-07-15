@@ -31,19 +31,33 @@ impl Checker<'_> {
             // is noise, not explicitness. `string(x)` (ADR 0029) renders
             // any value as `print` would; only the identity and the
             // no-value types (`unit`, `null`) are rejected. Narrowing
-            // applies — a narrowed `string?` is a `string`.
-            Expr::Convert { to, arg, span } => {
+            // applies — a narrowed `string?` is a `string`. A template's
+            // `${e}` (ADR 0030) is the implicit form: there the string
+            // identity passes through — the template's `+` does the work.
+            Expr::Convert {
+                to,
+                implicit,
+                arg,
+                span,
+            } => {
                 let ty = self.type_of_expr(arg);
                 if poisoned(&ty) {
                     return Type::Error;
                 }
                 if *to == Conv::Str {
                     if matches!(ty, Type::Str | Type::Unit | Type::Null) {
+                        if *implicit && ty == Type::Str {
+                            return Type::Str;
+                        }
                         let mut diag = Diagnostic::error(
-                            format!("string() cannot convert {}", self.type_name(&ty)),
+                            if *implicit {
+                                format!("cannot interpolate {} in a template", self.type_name(&ty))
+                            } else {
+                                format!("string() cannot convert {}", self.type_name(&ty))
+                            },
                             *span,
                         );
-                        if ty == Type::Str {
+                        if !*implicit && ty == Type::Str {
                             diag = diag.with_help("the value is already string".to_string());
                         }
                         self.diagnostics.push(diag);

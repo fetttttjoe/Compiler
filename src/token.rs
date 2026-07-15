@@ -32,6 +32,12 @@ pub enum TokenKind {
     IntLiteral(i64),
     FloatLiteral(f64),
     StringLiteral(String),
+    /// Template-literal text runs (ADR 0030): `` `text${ ``, `}text${`,
+    /// and `` }text` ``. A template with no interpolation lexes as a
+    /// plain `StringLiteral`.
+    TemplateHead(String),
+    TemplateMiddle(String),
+    TemplateTail(String),
     // Punctuation
     Colon,
     Semicolon,

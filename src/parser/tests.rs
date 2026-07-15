@@ -55,6 +55,22 @@ fn conversion_calls_parse_as_their_own_node() {
 }
 
 #[test]
+fn template_literals_desugar_to_concat() {
+    // ADR 0030: text parts are string literals, `${e}` an implicit
+    // string(e), the whole a left fold over `+`.
+    assert_eq!(
+        expr("`a ${x} b`").sexpr(),
+        r#"(+ (+ "a " (string x)) " b")"#
+    );
+    assert_eq!(expr("`${x}${y}`").sexpr(), "(+ (string x) (string y))");
+    assert_eq!(expr("``").sexpr(), "\"\"");
+    assert_eq!(
+        expr("`${`i${x}`}!`").sexpr(),
+        r#"(+ (string (+ "i" (string x))) "!")"#
+    );
+}
+
+#[test]
 fn conversion_without_parens_is_an_error() {
     let (tokens, _) = lex("fun main(): int { return int; }");
     let (_, diags) = parse(&tokens);

@@ -5,8 +5,8 @@ through both engines; stdout and exit codes must agree byte-for-byte.
 Usage: tools/fuzz.py [seed_start] [seed_end]   (default 0..200)
 
 The generator covers ints, bools, floats, strings, the conversions
-(int()/float()/string()), int arrays with for-in and push, control
-flow, and int->int helper calls. Structs and optionals are NOT
+(int()/float()/string()), template literals, int arrays with for-in
+and push, control flow, and int->int helper calls. Structs and optionals are NOT
 generated yet - cover those manually (or extend the generator) when
 touching their lowering. A program whose float path traps int() at
 runtime is skipped like any other oracle-diagnosed run. A divergence
@@ -86,6 +86,25 @@ class Gen:
     def str_expr(self, vars_):
         r = self.r
         strs = of_type(vars_, "str")
+        if r.random() < 0.35:
+            # Template literal (ADR 0030): text runs and ${} parts. The
+            # generated sub-expressions contain no braces or backticks,
+            # so no escaping is needed.
+            bits = ["`"]
+            for _ in range(r.randint(1, 3)):
+                bits.append(r.choice(["t", "u ", "", "-"]))
+                roll = r.random()
+                if strs and roll < 0.25:
+                    bits.append(f"${{{r.choice(strs)}}}")
+                elif roll < 0.6:
+                    bits.append(f"${{{self.int_expr(vars_, 3)}}}")
+                elif roll < 0.8:
+                    bits.append(f"${{{self.bool_expr(vars_)}}}")
+                else:
+                    bits.append(f"${{{self.float_expr(vars_)}}}")
+            bits.append(r.choice(["", "end"]))
+            bits.append("`")
+            return "".join(bits)
         parts = []
         for _ in range(r.randint(1, 3)):
             roll = r.random()

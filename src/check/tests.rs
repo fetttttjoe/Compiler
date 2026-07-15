@@ -98,6 +98,23 @@ fn string_conversion_accepts_values_and_rejects_no_ops() {
 }
 
 #[test]
+fn templates_interpolate_strings_but_not_unit_or_null() {
+    // ADR 0030: `${s}` passes a string through (the implicit form);
+    // unit and null still have no text.
+    assert!(diags("fun f(name: string, n: int): string { return `${name}:${n}`; }").is_empty());
+    let d = diags("fun g() {}\nfun f(): string { return `${g()}`; }");
+    assert!(
+        d[0].message
+            .contains("cannot interpolate unit in a template")
+    );
+    let d = diags("fun f(): string { return `${null}`; }");
+    assert!(
+        d[0].message
+            .contains("cannot interpolate null in a template")
+    );
+}
+
+#[test]
 fn diverging_guards_narrow_the_code_after_the_if() {
     // ADR 0020: a branch that never falls through leaves the negation
     // facts (or the fall-through branch's survivors) behind.

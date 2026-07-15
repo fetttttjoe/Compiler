@@ -1,0 +1,20 @@
+struct Point { x: int, y: float }
+
+fun greet(name: string, age: int): string {
+    return `${name} is ${age}`;
+}
+
+fun main(): int {
+    print(greet("ada", 36));
+    const p: Point = Point { x: 2, y: 1.5 };
+    print(`p=${p} sum=${float(p.x) + p.y}`);
+    var best: int? = null;
+    print(`best=${best}`);
+    best = 7;
+    print(`best=${best} (${string(best)})`);
+    const items: bool[] = [true, false];
+    print(`items=${items} n=${len(items)}`);
+    print(`inline=${Point { x: 1, y: 0.5 }}`);
+    print(`escaped: \` and \${x} and $5`);
+    return 0;
+}
