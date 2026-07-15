@@ -76,6 +76,19 @@ pub(super) fn emit(ir: FunctionIr) -> String {
             temp_off.insert(i, temp_floor);
         }
     }
+    // Outgoing-args area (ADR 0024): the max stack-slot count over the
+    // function's calls, reserved at the frame bottom — %rsp never moves,
+    // so the alignment invariant holds at every call.
+    let outgoing = insts
+        .iter()
+        .map(|inst| match inst {
+            Inst::Call { args, sret, .. } => {
+                (args.len() + sret.is_some() as usize).saturating_sub(6)
+            }
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0);
     let at = |v: V| operand(*loc.get(&v).expect("allocated"));
 
     let mut a = String::new();
@@ -84,10 +97,10 @@ pub(super) fn emit(ir: FunctionIr) -> String {
         let _ = writeln!(a, "\t.globl {label}");
     }
     let _ = writeln!(a, "{label}:\n\tpushq %rbp\n\tmovq %rsp, %rbp");
-    // One frame covers saves, spills, and temps, 16-byte aligned; this
-    // backend never pushes operands, so %rsp stays aligned at every call
-    // with no fix-ups.
-    let frame = ((-temp_floor) + 15) & !15;
+    // One frame covers saves, spills, temps, and outgoing args, 16-byte
+    // aligned; this backend never pushes operands, so %rsp stays aligned
+    // at every call with no fix-ups.
+    let frame = ((-temp_floor + 8 * outgoing as i64) + 15) & !15;
     if frame > 0 {
         let _ = writeln!(a, "\tsubq ${frame}, %rsp");
     }
@@ -100,10 +113,24 @@ pub(super) fn emit(ir: FunctionIr) -> String {
         }
     };
     // Params land in vregs 0..nparams (sret pointer included) in
-    // argument-register order.
-    for (i, reg) in ARG_REGS.iter().take(nparams).enumerate() {
-        if let Some(l) = loc.get(&i) {
-            let _ = writeln!(a, "\tmovq {reg}, {}", operand(*l));
+    // argument-register order; slots 6+ read from above the frame
+    // (ADR 0024). Param intervals start at instruction 0 — no defining
+    // instruction, so liveness reaches entry — making these prologue
+    // writes safe from later clobbers.
+    for i in 0..nparams {
+        let Some(l) = loc.get(&i) else { continue };
+        match ARG_REGS.get(i) {
+            Some(reg) => {
+                let _ = writeln!(a, "\tmovq {reg}, {}", operand(*l));
+            }
+            None => {
+                let off = 16 + 8 * (i as i64 - 6);
+                if let Loc::Reg(r) = l {
+                    let _ = writeln!(a, "\tmovq {off}(%rbp), {r}");
+                } else {
+                    let _ = writeln!(a, "\tmovq {off}(%rbp), %rax\n\tmovq %rax, {}", operand(*l));
+                }
+            }
         }
     }
 
@@ -405,7 +432,18 @@ pub(super) fn emit(ir: FunctionIr) -> String {
                     let _ = writeln!(a, "\tmovq {}, %rdi", at(*s));
                 }
                 for (i, v) in args.iter().enumerate() {
-                    let _ = writeln!(a, "\tmovq {}, {}", at(*v), ARG_REGS[i + shift]);
+                    match ARG_REGS.get(i + shift) {
+                        Some(reg) => {
+                            let _ = writeln!(a, "\tmovq {}, {reg}", at(*v));
+                        }
+                        // Slots 6+ store into the outgoing area, one
+                        // block right before the call (ADR 0024).
+                        None => {
+                            let off = 8 * (i + shift - 6);
+                            let _ =
+                                writeln!(a, "\tmovq {}, %rax\n\tmovq %rax, {off}(%rsp)", at(*v));
+                        }
+                    }
                 }
                 let _ = writeln!(a, "\tcall {label}");
                 if let Some(l) = loc.get(dst) {

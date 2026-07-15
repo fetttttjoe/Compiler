@@ -413,15 +413,6 @@ fn printing_structs_is_not_yet_compilable() {
 }
 
 #[test]
-fn more_than_six_parameters_is_not_yet_compilable() {
-    assert_not_yet_compilable(
-        "seven",
-        "fun f(a: int, b: int, c: int, d: int, e: int, g: int, h: int): int { return a; }
-        fun main(): int { return f(1, 2, 3, 4, 5, 6, 7); }",
-    );
-}
-
-#[test]
 fn build_refuses_to_overwrite_its_own_source() {
     let dir = tempdir();
     let program = "fun main(): int { return 1; }";

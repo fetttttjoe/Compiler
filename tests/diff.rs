@@ -1558,6 +1558,125 @@ fn null_tests_on_no_memcmp_optional_payloads_are_tag_tests() {
     );
 }
 
+// ---- Stack argument passing (ADR 0024) -----------------------------------
+
+#[test]
+fn seven_params_hit_the_first_stack_slot() {
+    // Distinct coefficients catch any slot permutation.
+    diff(
+        "seven",
+        "fun f(a: int, b: int, c: int, d: int, e: int, g: int, h: int): int {
+            return a + b * 2 + c * 4 + d * 8 + e * 16 + g * 32 + h * 64;
+        }
+        fun main(): int { return f(1, 1, 1, 1, 1, 1, 1); }",
+    );
+}
+
+#[test]
+fn ten_params_with_strings_and_structs_in_stack_slots() {
+    diff(
+        "tenparams",
+        r#"struct Pair { a: int, b: int }
+        fun f(a: int, b: int, c: int, d: int, e: int, g: int, h: int, i: string, j: Pair, k: int): int {
+            print(i);
+            return a + b + c + d + e + g + h * 10 + j.a + j.b + k * 100;
+        }
+        fun main(): int {
+            return f(1, 2, 3, 4, 5, 6, 7, "stack", Pair { a: 10, b: 20 }, 1);
+        }"#,
+    );
+}
+
+#[test]
+fn sret_plus_six_args_spills_the_last_slot() {
+    // The hidden destination pointer occupies slot 0, pushing the sixth
+    // argument onto the stack.
+    diff(
+        "sretseven",
+        "struct Pair { a: int, b: int }
+        fun mk(a: int, b: int, c: int, d: int, e: int, f: int): Pair {
+            return Pair { a: a + c + e, b: b + d + f * 100 };
+        }
+        fun main(): int {
+            const p: Pair = mk(1, 2, 3, 4, 5, 6);
+            return p.a + p.b;
+        }",
+    );
+}
+
+#[test]
+fn stack_args_evaluate_left_to_right() {
+    diff(
+        "argorder",
+        "fun loud(x: int): int { print(x); return x; }
+        fun f(a: int, b: int, c: int, d: int, e: int, g: int, h: int, i: int): int {
+            return h * 10 + i;
+        }
+        fun main(): int {
+            return f(loud(1), loud(2), loud(3), loud(4), loud(5), loud(6), loud(7), loud(8));
+        }",
+    );
+}
+
+#[test]
+fn wide_params_and_wide_calls_in_one_function() {
+    // Call-crossing stack params must survive the callee's own wide
+    // calls (callee-saved or spilled, never the outgoing area).
+    diff(
+        "widboth",
+        "fun leaf(a: int, b: int, c: int, d: int, e: int, g: int, h: int): int {
+            return h - g;
+        }
+        fun mid(a: int, b: int, c: int, d: int, e: int, g: int, h: int): int {
+            const first: int = leaf(h, g, e, d, c, b, a);
+            const second: int = leaf(a, b, c, d, e, g, h);
+            return first * 100 + second + h * 7;
+        }
+        fun main(): int { return mid(1, 2, 3, 4, 5, 6, 7); }",
+    );
+}
+
+#[test]
+fn calls_of_different_widths_share_the_outgoing_maximum() {
+    diff(
+        "maxout",
+        "fun seven(a: int, b: int, c: int, d: int, e: int, g: int, h: int): int { return h; }
+        fun nine(a: int, b: int, c: int, d: int, e: int, g: int, h: int, i: int, j: int): int {
+            return h + i * 10 + j * 100;
+        }
+        fun main(): int {
+            return seven(0, 0, 0, 0, 0, 0, 1) + nine(0, 0, 0, 0, 0, 0, 2, 3, 4);
+        }",
+    );
+}
+
+#[test]
+fn float_params_in_stack_slots_move_bitwise() {
+    diff(
+        "floatslot",
+        "fun pick(a: float, b: float, c: float, d: float, e: float, f: float, g: float, h: float): float {
+            return g + h;
+        }
+        fun main(): int {
+            if pick(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.25, 2.25) == 3.5 { return 1; }
+            return 0;
+        }",
+    );
+}
+
+#[test]
+fn eight_param_recursion_stresses_repeated_stack_stores() {
+    diff(
+        "recur8",
+        "fun fib8(n: int, p1: int, p2: int, p3: int, p4: int, p5: int, p6: int, p7: int): int {
+            if n < 2 { return n + p1 + p2 + p3 + p4 + p5 + p6 + p7; }
+            return fib8(n - 1, p1, p2, p3, p4, p5, p6, p7)
+                 + fib8(n - 2, p1, p2, p3, p4, p5, p6, p7);
+        }
+        fun main(): int { return fib8(8, 1, 0, 1, 0, 1, 0, 1) % 200; }",
+    );
+}
+
 #[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as

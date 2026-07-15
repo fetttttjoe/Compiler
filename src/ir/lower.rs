@@ -61,9 +61,6 @@ pub(super) fn lower(
         t => kind_of(t, res, FUEL).ok_or_else(|| unsupported("this return type", f.span))?,
     };
     let sret = ret_kind != Kind::Word;
-    if f.params.len() + sret as usize > 6 {
-        return Err(unsupported("more than 6 parameters", f.span));
-    }
 
     let mut lo = Lowerer {
         res,
@@ -1611,9 +1608,6 @@ impl Lowerer<'_> {
                 .ok_or_else(|| unsupported("calls returning this type", span))?,
         };
         let sret = ret_kind != Kind::Word;
-        if args.len() + sret as usize > 6 {
-            return Err(unsupported("calls with more than 6 arguments", span));
-        }
         // Multi-word arguments copy into private temps AT EVALUATION
         // TIME: the oracle copies as it evaluates, so a later argument
         // mutating the storage through an alias must not be visible.
