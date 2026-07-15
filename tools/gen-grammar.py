@@ -26,7 +26,7 @@ GRAMMAR = ROOT / "editors" / "vscode" / "syntaxes" / "ys.tmLanguage.json"
 CATEGORIES = {
     "storage.type.ys": ["fun", "struct", "refstruct", "var", "const"],
     "keyword.control.ys": ["return", "break", "continue", "if", "else", "while", "for", "in", "import", "export", "from"],
-    "support.type.primitive.ys": ["int", "float", "bool", "string"],
+    "support.type.primitive.ys": ["int", "float", "bool", "string", "file"],
     "constant.language.ys": ["true", "false", "null"],
 }
 
@@ -69,8 +69,8 @@ def build_grammar():
         "name": "Ys",
         "scopeName": "source.ys",
         "patterns": [{"include": f"#{n}"} for n in (
-            "comments", "strings", "function-definition", "keywords",
-            "numbers", "function-call", "operators",
+            "comments", "strings", "templates", "function-definition",
+            "keywords", "numbers", "function-call", "operators",
         )],
         "repository": {
             "comments": {"name": "comment.line.double-slash.ys", "match": r"//.*$"},
@@ -80,6 +80,22 @@ def build_grammar():
                 "end": r'"|$',
                 "patterns": [
                     {"name": "constant.character.escape.ys", "match": r'\\["\\nt]'}
+                ],
+            },
+            "templates": {
+                "name": "string.quoted.other.template.ys",
+                "begin": r"`",
+                "end": r"`|$",
+                "patterns": [
+                    {"name": "constant.character.escape.ys", "match": r'\\["\\nt`$]'},
+                    {
+                        "name": "meta.interpolation.ys",
+                        "begin": r"\$\{",
+                        "end": r"\}",
+                        "beginCaptures": {"0": {"name": "punctuation.definition.interpolation.begin.ys"}},
+                        "endCaptures": {"0": {"name": "punctuation.definition.interpolation.end.ys"}},
+                        "patterns": [{"include": "source.ys"}],
+                    },
                 ],
             },
             "function-definition": {

@@ -10,6 +10,9 @@
       "include": "#strings"
     },
     {
+      "include": "#templates"
+    },
+    {
       "include": "#function-definition"
     },
     {
@@ -41,6 +44,37 @@
         }
       ]
     },
+    "templates": {
+      "name": "string.quoted.other.template.ys",
+      "begin": "`",
+      "end": "`|$",
+      "patterns": [
+        {
+          "name": "constant.character.escape.ys",
+          "match": "\\\\[\"\\\\nt`$]"
+        },
+        {
+          "name": "meta.interpolation.ys",
+          "begin": "\\$\\{",
+          "end": "\\}",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.interpolation.begin.ys"
+            }
+          },
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.interpolation.end.ys"
+            }
+          },
+          "patterns": [
+            {
+              "include": "source.ys"
+            }
+          ]
+        }
+      ]
+    },
     "function-definition": {
       "match": "\\b(fun)\\s+([A-Za-z_][A-Za-z0-9_]*)",
       "captures": {
@@ -64,7 +98,7 @@
         },
         {
           "name": "support.type.primitive.ys",
-          "match": "\\b(bool|float|int|string)\\b"
+          "match": "\\b(bool|file|float|int|string)\\b"
         },
         {
           "name": "constant.language.ys",
