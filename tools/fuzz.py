@@ -11,7 +11,11 @@ tests, ??, guard narrowing incl. the ADR 0033 guard-return-on-locals
 shape), value structs (literals, field reads/writes, copy
 semantics, structural equality, aggregate printing), and error unions
 (ADR 0034: int! helpers, try chains, == error narrowing on both
-branches, whole-union printing). Refstructs and files are NOT
+branches, whole-union printing), and generics (ADR 0035: fixed
+templates instantiated at int/float/string/struct call sites — word,
+XMM, and multi-word/sret shapes — optional wrapping through T? slots,
+generic struct literals, field writes, and instance printing).
+Refstructs and files are NOT
 generated yet - cover those manually (or extend the generator) when
 touching their lowering. A program whose
 float path traps int() at runtime is skipped like any other
@@ -328,6 +332,51 @@ class Gen:
                 "const y: int = try mayerr(b); "
                 "return x + y; }"
             )
+        # Generics (ADR 0035): fixed self-contained templates — g* names
+        # never enter the general pool — instantiated at randomized call
+        # sites. Uninstantiated templates cost nothing, so the helpers
+        # and GBox always declare; only the calls are rolled. Shapes:
+        # word T (int), XMM T (float), multi-word T (string, Pt — sret
+        # returns), T? wrapping, explicit vs inferred arguments.
+        g_part = ""
+        if r.random() < 0.7:
+            gcalls = []
+            for _ in range(r.randint(2, 5)):
+                pick = r.random()
+                if pick < 0.2:
+                    gcalls.append(
+                        f"print(gmax({self.int_expr([])}, {self.int_expr([])}));"
+                    )
+                elif pick < 0.35:
+                    gcalls.append(
+                        f"print(gmax({self.float_expr([])}, {self.float_expr([])}));"
+                    )
+                elif pick < 0.5:
+                    gcalls.append(f"print(gid({self.str_expr([])}));")
+                elif pick < 0.6:
+                    gcalls.append(
+                        f"print(gid(Pt {{ x: {self.int_expr([])}, "
+                        f"y: {self.int_expr([])} }}));"
+                    )
+                elif pick < 0.7:
+                    gcalls.append(
+                        f"print(gid(gmax({self.int_expr([])}, {self.int_expr([])})));"
+                    )
+                elif pick < 0.85:
+                    v = "null" if r.random() < 0.4 else self.int_expr([])
+                    args = "<int>" if r.random() < 0.5 else ""
+                    gcalls.append(f"print(gor{args}({v}, {self.int_expr([])}));")
+                else:
+                    gcalls.append(
+                        f"print(GBox<float> {{ v: {self.float_expr([])} }});"
+                    )
+            gb = self.name("gb")
+            gcalls.append(
+                f"var {gb}: GBox<int>= GBox<int> {{ v: {self.int_expr([])} }}; "
+                f"{gb}.v = {gb}.v + {self.int_expr([])}; "
+                f"print({gb}); print({gb}.v);"
+            )
+            g_part = " ".join(gcalls) + " "
         arr = self.name("xs")
         stop = f"if ix == {r.randint(3, 5)} {{ break; }} " if r.random() < 0.5 else ""
         arr_part = (
@@ -336,10 +385,17 @@ class Gen:
         )
         ret = self.int_expr([])
         return "\n".join(
-            ["struct Pt { x: int, y: int }", "error Efuzz, Egro;"]
+            [
+                "struct Pt { x: int, y: int }",
+                "struct GBox<T> { v: T }",
+                "error Efuzz, Egro;",
+                "fun gmax<T>(a: T, b: T): T { if a > b { return a; } return b; }",
+                "fun gid<T>(x: T): T { return x; }",
+                "fun gor<T>(v: T?, f: T): T { if v != null { return v; } return f; }",
+            ]
             + helpers
             + [
-                f"fun main(): int {{ {main_body} {calls} {err_part}{arr_part} "
+                f"fun main(): int {{ {main_body} {calls} {err_part}{g_part}{arr_part} "
                 f"return ({ret}) % 251; }}"
             ]
         )
