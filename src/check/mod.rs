@@ -249,10 +249,7 @@ pub fn check(graph: &ModuleGraph, map: &mut SourceMap) -> (Resolutions, Vec<Diag
                     let fields = s
                         .fields
                         .iter()
-                        .map(|f| {
-                            let ty = resolve_guarded(&f.ty, &mut cx, s.span, "struct fields");
-                            (f.name.clone(), ty)
-                        })
+                        .map(|f| (f.name.clone(), resolve_type(&f.ty, &mut cx, s.span)))
                         .collect();
                     cx.mono.structs.insert(
                         (mi, s.name.clone()),
@@ -276,7 +273,7 @@ pub fn check(graph: &ModuleGraph, map: &mut SourceMap) -> (Resolutions, Vec<Diag
                             let payloads = v
                                 .payloads
                                 .iter()
-                                .map(|ann| resolve_guarded(ann, &mut cx, v.span, "enum payloads"))
+                                .map(|ann| resolve_type(ann, &mut cx, v.span))
                                 .collect();
                             (v.name.clone(), payloads)
                         })
@@ -459,8 +456,7 @@ pub fn check(graph: &ModuleGraph, map: &mut SourceMap) -> (Resolutions, Vec<Diag
 
 /// A signature with `bind` substituted into the annotations, resolved
 /// in `cx.module` — the template's own module for instances (ADR 0035
-/// decision 7); monomorphic functions pass an empty bind. `T!` returns
-/// are legal (ADR 0034); `T!` parameters diagnose.
+/// decision 7); monomorphic functions pass an empty bind.
 fn instance_signature(
     f: &Function,
     bind: &HashMap<String, Type>,
@@ -470,26 +466,13 @@ fn instance_signature(
     let params = f
         .params
         .iter()
-        .map(|p| resolve_guarded(&substitute_ann(&p.ty, bind), cx, span, "parameters"))
+        .map(|p| resolve_type(&substitute_ann(&p.ty, bind), cx, span))
         .collect();
     let ret = match &f.return_type {
         Some(t) => resolve_type(&substitute_ann(t, bind), cx, span),
         None => Type::Unit,
     };
     FnSig { params, ret }
-}
-
-/// `resolve_type` plus the gate for positions that can't carry an
-/// error union yet (parameters, struct fields, enum payloads).
-fn resolve_guarded(ann: &TypeAnn, cx: &mut TypeCx, span: Span, what: &str) -> Type {
-    let ty = resolve_type(ann, cx, span);
-    if matches!(ty, Type::ErrUnion(_)) {
-        cx.diags.push(Diagnostic::error(
-            format!("error unions in {what} are not yet supported"),
-            span,
-        ));
-    }
-    ty
 }
 
 /// Duplicate and shadowing rules for `<T, U>` lists (ADR 0035): names
@@ -589,17 +572,7 @@ fn resolve_type(ann: &TypeAnn, cx: &mut TypeCx, span: Span) -> Type {
             Type::ErrUnion(Box::new(inner))
         }
         TypeAnn::Optional(inner) => Type::Optional(Box::new(resolve_type(inner, cx, span))),
-        TypeAnn::Array(inner) => {
-            let inner = resolve_type(inner, cx, span);
-            if matches!(inner, Type::ErrUnion(_)) {
-                cx.diags.push(Diagnostic::error(
-                    "arrays of error unions are not yet supported".to_string(),
-                    span,
-                ));
-                return Type::Error;
-            }
-            Type::Array(Box::new(inner))
-        }
+        TypeAnn::Array(inner) => Type::Array(Box::new(resolve_type(inner, cx, span))),
         // The monomorphizer's substitution carrier (ADR 0035).
         TypeAnn::Resolved(t) => t.clone(),
         // `Pair<int, string>` — instantiate the template (ADR
@@ -685,8 +658,7 @@ fn instantiate_struct(
                 .iter()
                 .map(|f| {
                     let ann = substitute_ann(&f.ty, &bind);
-                    let ty = resolve_guarded(&ann, cx, tmpl.span, "struct fields");
-                    (f.name.clone(), ty)
+                    (f.name.clone(), resolve_type(&ann, cx, tmpl.span))
                 })
                 .collect()
         });
@@ -776,10 +748,7 @@ fn instantiate_enum(tkey: &(usize, String), args: Vec<Type>, cx: &mut TypeCx, sp
                     let payloads = v
                         .payloads
                         .iter()
-                        .map(|ann| {
-                            let ann = substitute_ann(ann, &bind);
-                            resolve_guarded(&ann, cx, v.span, "enum payloads")
-                        })
+                        .map(|ann| resolve_type(&substitute_ann(ann, &bind), cx, v.span))
                         .collect();
                     (v.name.clone(), payloads)
                 })

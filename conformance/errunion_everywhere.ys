@@ -1,0 +1,73 @@
+error Bad, Worse;
+
+struct Slot { r: int!, label: string }
+refstruct Cell { r: int! }
+enum Res<T, E> { Ok(T!), Err(E) }
+
+fun pick(x: int!, alt: int): int {
+    if x == error { return alt; }
+    return x;
+}
+
+fun stamp(s: string!): string {
+    if s == error { return "?"; }
+    return s + "!";
+}
+
+fun main(): int {
+    // Parameters: word and multi-word payloads, value and code.
+    print(pick(3, -1));
+    print(pick(error.Bad, -1));
+    print(stamp("ok"));
+    print(stamp(error.Worse));
+
+    // Struct fields: init, print, narrow (payload and code), mutate, try.
+    var s: Slot = Slot { r: 41, label: "a" };
+    print(s);
+    if s.r != error { print(s.r + 1); }
+    s.r = error.Worse;
+    if s.r == error { print(s.r); }
+    print(s);
+
+    // Arrays: literal, index write, iterate with element narrowing.
+    var xs: int![] = [1, error.Bad, 3];
+    print(xs);
+    xs[1] = 2;
+    var sum: int = 0;
+    for x in xs {
+        if x != error { sum = sum + x; }
+        if x == error { sum = sum - 10; }
+    }
+    print(sum);
+
+    // Enum payloads through generics: T := int gives Ok(int!).
+    const good: Res<int, string> = Res<int, string>.Ok(5);
+    const bad: Res<int, string> = Res<int, string>.Ok(error.Bad);
+    print(good);
+    print(bad);
+    var total: int = 0;
+    match good {
+        Ok(v) { total = total + pick(v, 0); }
+        Err(_) { }
+    }
+    match bad {
+        Ok(v) { total = total + pick(v, -5); }
+        Err(_) { }
+    }
+    print(total);
+
+    // Refstructs: handle identity survives the union field; aliasing.
+    const a: Cell = Cell { r: 1 };
+    const b: Cell = a;
+    print(a == b);
+    b.r = error.Bad;
+    if a.r == error { print("aliased"); }
+
+    // Optional chain onto a union field.
+    const some: Slot? = s;
+    const none: Slot? = null;
+    print(some?.r);
+    print(none?.r);
+
+    return sum;
+}

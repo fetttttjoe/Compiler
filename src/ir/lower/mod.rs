@@ -126,12 +126,13 @@ pub(super) fn lower(
             kind_of(ty, res, FUEL).ok_or_else(|| unsupported("parameters of this type", f.span))?;
             let v = lo.fresh(*ty == Type::Float);
             let opt_inner = lo.opt_inner_of(ty);
+            let err_inner = lo.err_inner_of(ty);
             lo.scopes[0].insert(
                 p.name.clone(),
                 Binding {
                     v,
                     opt_inner,
-                    err_inner: None, // T! params are checker-rejected
+                    err_inner,
                 },
             );
         }
@@ -684,7 +685,7 @@ impl Lowerer<'_> {
                     Binding {
                         v: x,
                         opt_inner: self.opt_inner_of(&elem),
-                        err_inner: None, // T! array elements are checker-rejected
+                        err_inner: self.err_inner_of(&elem),
                     },
                 );
                 if let Some(ix) = index {
@@ -785,7 +786,7 @@ impl Lowerer<'_> {
                                 Binding {
                                     v,
                                     opt_inner: self.opt_inner_of(pt),
-                                    err_inner: None, // T! payloads are checker-rejected
+                                    err_inner: self.err_inner_of(pt),
                                 },
                             );
                         }
@@ -1072,6 +1073,34 @@ impl Lowerer<'_> {
                         }
                     });
                     return Ok(r);
+                }
+                // The `T!` mirror (ADR 0037): a proven-value field reads
+                // its payload, a proven-error field reads the tag — it
+                // IS the code (same contract as locals, ADR 0034).
+                if let Some(inner) = self.err_inner_of(&slot_ty) {
+                    match self.ty(span) {
+                        Some(Type::ErrUnion(_)) | None => {}
+                        Some(Type::ErrCode) => return Ok(self.load_at(b, off)),
+                        Some(_) => {
+                            let k = kind_of(&inner, self.res, FUEL)
+                                .ok_or_else(|| unsupported("fields of this type", *span))?;
+                            let r = self.fresh(inner == Type::Float);
+                            self.insts.push(if k == Kind::Word {
+                                Inst::LoadAt {
+                                    dst: r,
+                                    base: b,
+                                    off: off + 8,
+                                }
+                            } else {
+                                Inst::LeaAt {
+                                    dst: r,
+                                    base: b,
+                                    off: off + 8,
+                                }
+                            });
+                            return Ok(r);
+                        }
+                    }
                 }
                 if kind == Kind::Word {
                     // No null check: the checker's narrowing is sound, so

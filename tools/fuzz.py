@@ -11,7 +11,9 @@ tests, ??, guard narrowing incl. the ADR 0033 guard-return-on-locals
 shape), value structs (literals, field reads/writes, copy
 semantics, structural equality, aggregate printing), and error unions
 (ADR 0034: int! helpers, try chains, == error narrowing on both
-branches, whole-union printing), and generics (ADR 0035: fixed
+branches, whole-union printing; ADR 0037: int! struct fields with
+place-path narrowing and mutation, int![] arrays iterated and
+printed, int! parameters), and generics (ADR 0035: fixed
 templates instantiated at int/float/string/struct call sites — word,
 XMM, and multi-word/sret shapes — optional wrapping through T? slots,
 generic struct literals, field writes, and instance printing).
@@ -335,6 +337,28 @@ class Gen:
                 "const y: int = try mayerr(b); "
                 "return x + y; }"
             )
+            # ADR 0037: unions in fields, elements, and params — one
+            # struct with a T! field (narrow, mutate), one int![] walk
+            # through a T!-param helper. Still self-contained.
+            if r.random() < 0.6:
+                v1 = "error.Efuzz" if r.random() < 0.4 else str(r.randint(-9, 9))
+                v2 = "error.Egro" if r.random() < 0.4 else str(r.randint(-9, 9))
+                err_part += (
+                    f"var es: EBox = EBox {{ r: {v1} }}; "
+                    "print(es); "
+                    "if es.r != error { print(es.r * 2); } "
+                    f"es.r = {v2}; "
+                    "if es.r == error { print(es.r); } "
+                    f"var ea: int![] = [{v1}, {v2}, mayerr({r.randint(-6, 6)})]; "
+                    "print(ea); "
+                    "for ex in ea { print(epick(ex)); } "
+                )
+                helpers.append(
+                    "struct EBox { r: int! } "
+                    "fun epick(x: int!): int { "
+                    "if x == error { return -1; } "
+                    "return x; }"
+                )
         # Generics (ADR 0035): fixed self-contained templates — g* names
         # never enter the general pool — instantiated at randomized call
         # sites. Uninstantiated templates cost nothing, so the helpers

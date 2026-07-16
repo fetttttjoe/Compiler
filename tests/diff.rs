@@ -2641,3 +2641,148 @@ fn match_binding_copies_do_not_alias() {
          }",
     );
 }
+
+// --- Error unions everywhere (ADR 0037) ---
+
+#[test]
+fn err_union_params_pass_and_narrow() {
+    // Word and multi-word (string) payloads through parameters; `try`
+    // on a param inside the callee.
+    diff(
+        "err_param",
+        "error Bad;\n\
+         fun pick(x: int!, alt: int): int {\n\
+             if x == error { return alt; }\n\
+             return x;\n\
+         }\n\
+         fun tag(s: string!): string! {\n\
+             const v: string = try s;\n\
+             return v + \"!\";\n\
+         }\n\
+         fun main(): int {\n\
+             print(pick(3, -1));\n\
+             print(pick(error.Bad, -1));\n\
+             print(tag(\"ok\"));\n\
+             print(tag(error.Bad));\n\
+             return pick(error.Bad, 7);\n\
+         }",
+    );
+}
+
+#[test]
+fn err_union_struct_fields_narrow_and_mutate() {
+    // Field init from value and code, place-path narrowing (payload
+    // and code reads), `try s.f`, mutation, aggregate printing.
+    diff(
+        "err_field",
+        "error Bad, Worse;\n\
+         struct S { r: int!, name: string }\n\
+         fun main(): int! {\n\
+             var s: S = S { r: 41, name: \"a\" };\n\
+             print(s);\n\
+             if s.r != error { print(s.r + 1); }\n\
+             s.r = error.Worse;\n\
+             print(s);\n\
+             if s.r == error {\n\
+                 if s.r == error.Worse { print(\"worse\"); }\n\
+                 print(s.r);\n\
+             }\n\
+             s.r = 5;\n\
+             const v: int = try s.r;\n\
+             return v;\n\
+         }",
+    );
+}
+
+#[test]
+fn err_union_arrays_index_and_iterate() {
+    diff(
+        "err_array",
+        "error Bad;\n\
+         fun main(): int {\n\
+             var xs: int![] = [1, error.Bad, 3];\n\
+             print(xs);\n\
+             xs[1] = 2;\n\
+             xs[0] = error.Bad;\n\
+             var sum: int = 0;\n\
+             for x in xs {\n\
+                 if x == error { sum = sum - 10; }\n\
+                 if x != error { sum = sum + x; }\n\
+             }\n\
+             print(xs);\n\
+             return sum;\n\
+         }",
+    );
+}
+
+#[test]
+fn err_union_enum_payloads_and_generics() {
+    // `T := int!` through the 0035 machinery: generic struct fields
+    // and enum payloads carry unions; match bindings narrow.
+    diff(
+        "err_generic",
+        "error Bad;\n\
+         struct Box<T> { v: T }\n\
+         enum Out<T> { Done(T), Skip }\n\
+         fun main(): int {\n\
+             const b: Box<int!> = Box<int!> { v: error.Bad };\n\
+             if b.v == error { print(\"boxed err\"); }\n\
+             const o: Out<int!> = Out<int!>.Done(41);\n\
+             match o {\n\
+                 Done(r) {\n\
+                     if r != error { print(r + 1); return r + 1; }\n\
+                 }\n\
+                 Skip { }\n\
+             }\n\
+             return 0;\n\
+         }",
+    );
+}
+
+#[test]
+fn err_union_refstruct_fields_alias_and_compare() {
+    // Refstructs holding unions still compare as handles (the walk
+    // cuts, ADR 0037) and mutations alias through the handle.
+    diff(
+        "err_refstruct",
+        "error Bad;\n\
+         refstruct R { r: int! }\n\
+         fun poison(x: R) { x.r = error.Bad; }\n\
+         fun main(): int {\n\
+             const a: R = R { r: 1 };\n\
+             const b: R = a;\n\
+             print(a == b);\n\
+             poison(a);\n\
+             if b.r == error { print(\"aliased\"); }\n\
+             const c: R = R { r: 1 };\n\
+             print(a == c);\n\
+             return 0;\n\
+         }",
+    );
+}
+
+#[test]
+fn err_union_behind_optional_chain() {
+    // `s?.f` onto a `T!` field: the transient `int!?` prints and
+    // coalesces like any optional (ADR 0037 composition).
+    diff(
+        "err_opt_chain",
+        "error Bad;\n\
+         struct S { r: int! }\n\
+         fun get(s: S?): int {\n\
+             if s != null {\n\
+                 if s.r != error { return s.r; }\n\
+             }\n\
+             return -1;\n\
+         }\n\
+         fun main(): int {\n\
+             const some: S? = S { r: 8 };\n\
+             const none: S? = null;\n\
+             print(some?.r);\n\
+             print(none?.r);\n\
+             print(get(some));\n\
+             print(get(none));\n\
+             return get(some);\n\
+         }",
+    );
+}

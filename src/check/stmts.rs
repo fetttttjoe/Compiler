@@ -85,10 +85,6 @@ impl Checker<'_, '_> {
         self.nonnull.iter().any(|f| !f.facts.is_empty())
     }
 
-    pub(super) fn is_nonnull(&self, path: &str) -> bool {
-        self.fact_of(path) == Some(Fact::NonNull)
-    }
-
     /// The innermost standing fact for `path`, if any. Innermost first: a
     /// shadow hides outer facts for its own region. Within a frame, facts
     /// outrank the shadow — a fact can only enter after the frame's shadow

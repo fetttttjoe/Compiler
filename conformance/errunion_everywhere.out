@@ -1,0 +1,18 @@
+3
+-1
+ok!
+?
+Slot { label: a, r: 41 }
+42
+error.Worse
+Slot { label: a, r: error.Worse }
+[1, error.Bad, 3]
+6
+Ok(5)
+Ok(error.Bad)
+0
+true
+aliased
+error.Worse
+null
+=> Int(6)

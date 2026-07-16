@@ -909,18 +909,94 @@ fn try_position_and_context_are_enforced() {
 }
 
 #[test]
-fn error_union_positions_are_restricted() {
-    let d = diags("fun f(x: int!): int { return 0; }");
-    assert!(d.iter().any(|e| e.message.contains("parameters")), "{d:?}");
-    let d = diags("struct S { x: int! }\nfun f(): int { return 0; }");
-    assert!(
-        d.iter().any(|e| e.message.contains("struct fields")),
-        "{d:?}"
+fn error_unions_are_legal_in_every_position() {
+    // ADR 0037: params, struct fields, array elements, enum payloads.
+    let d = diags(
+        "error E;\n\
+         struct S { r: int! }\n\
+         enum Out<T> { Done(T!), Skip }\n\
+         fun pick(x: int!, alt: int): int {\n\
+             if x == error { return alt; }\n\
+             return x;\n\
+         }\n\
+         fun f(): int {\n\
+             const s: S = S { r: error.E };\n\
+             var xs: int![] = [1, error.E];\n\
+             xs[0] = error.E;\n\
+             const o: Out<int> = Out<int>.Done(3);\n\
+             match o { Done(v) { return pick(v, 0); } Skip { } }\n\
+             return pick(s.r, -1);\n\
+         }",
     );
-    let d = diags("fun f(): int { var xs: int![] = []; return 0; }");
-    assert!(d.iter().any(|e| e.message.contains("arrays")), "{d:?}");
+    assert!(d.is_empty(), "unexpected: {d:?}");
+    // `error!` stays redundant; `T?!`/`T!?` stay parser-rejected.
     let d = diags("fun f(): error! { return error.E; }");
     assert!(d.iter().any(|e| e.message.contains("redundant")), "{d:?}");
+}
+
+#[test]
+fn error_union_fields_narrow_by_place_path() {
+    // The `T!` mirror of optional field narrowing (ADR 0037): proven
+    // value reads the payload, proven error reads the code; a call
+    // kills the field fact.
+    let d = diags(
+        "error E;\n\
+         struct S { r: int! }\n\
+         fun f(s: S): int {\n\
+             if s.r != error { return s.r + 1; }\n\
+             if s.r == error.E { return -1; }\n\
+             return 0;\n\
+         }",
+    );
+    assert!(d.is_empty(), "unexpected: {d:?}");
+    let d = diags(
+        "error E;\n\
+         struct S { r: int! }\n\
+         fun g() {}\n\
+         fun f(s: S): int {\n\
+             if s.r != error { g(); return s.r + 1; }\n\
+             return 0;\n\
+         }",
+    );
+    assert!(
+        d.iter().any(|e| e.message.contains("cannot apply '+'")),
+        "the call must kill the field fact: {d:?}"
+    );
+}
+
+#[test]
+fn equality_ban_reaches_through_value_aggregates() {
+    // ADR 0037: a `T!` reachable by value bans `==`; refstructs and
+    // arrays compare as handles and cut the walk.
+    let banned = [
+        "struct S { r: int! }\n\
+         fun f(a: S, b: S): bool { return a == b; }",
+        "enum E2 { V(int!), W }\n\
+         fun f(a: E2, b: E2): bool { return a == b; }",
+        "struct S { r: int! }\n\
+         struct W { s: S? }\n\
+         fun f(a: W, b: W): bool { return a == b; }",
+    ];
+    for src in banned {
+        let d = diags(&format!("error E;\n{src}"));
+        assert!(
+            d.iter()
+                .any(|e| e.message.contains("contains an error union")),
+            "expected the ban for: {src}\n{d:?}"
+        );
+    }
+    let allowed = [
+        "refstruct R { r: int! }\n\
+         fun f(a: R, b: R): bool { return a == b; }",
+        "fun f(a: int![], b: int![]): bool { return a == b; }",
+    ];
+    for src in allowed {
+        let d = diags(&format!("error E;\n{src}"));
+        assert!(
+            d.is_empty(),
+            "identity compare must stay legal: {src}\n{d:?}"
+        );
+    }
 }
 
 #[test]

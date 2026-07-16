@@ -6,6 +6,11 @@
 
 use super::*;
 
+/// Recursion cap for the `reaches_err_union` walk (ADR 0037) — the
+/// same order as the layout walk's fuel; only uninstantiable
+/// self-embedding value types can spend it.
+const EQ_FUEL: usize = 64;
+
 impl Checker<'_, '_> {
     // Recursion here (and in every later pass) is stack-safe because the
     // parser bounds AST height at construction (`MAX_FN_OPS`), and the
@@ -339,7 +344,28 @@ impl Checker<'_, '_> {
             Lt | Le | Gt | Ge => (lt == rt && is_numeric(&lt), Type::Bool),
             // Equality on any matching primitive or struct type (struct
             // identity is (module, name)), plus null checks on optionals.
-            Eq | Ne => (eq_comparable(&lt, &rt), Type::Bool),
+            // Aggregates reaching a `T!` by value don't compare — the
+            // direct ban, without a wrapper back door (ADR 0037). Null
+            // tests are exempt: they read the tag, never the contents
+            // — they ARE the narrowing idiom.
+            Eq | Ne => {
+                if lt != Type::Null
+                    && rt != Type::Null
+                    && eq_comparable(&lt, &rt)
+                    && (self.reaches_err_union(&lt, EQ_FUEL)
+                        || self.reaches_err_union(&rt, EQ_FUEL))
+                {
+                    self.error(
+                        format!(
+                            "cannot compare {} — it contains an error union; narrow first",
+                            self.type_name(&lt)
+                        ),
+                        span,
+                    );
+                    return Type::Error;
+                }
+                (eq_comparable(&lt, &rt), Type::Bool)
+            }
             // Logic on bools.
             And | Or => (lt == Type::Bool && rt == Type::Bool, Type::Bool),
             // `a ?? b`: a must be optional; b re-fills it (`T` unwraps,
@@ -920,13 +946,16 @@ impl Checker<'_, '_> {
             },
             // A narrowed field path reads as its inner type, same as
             // narrowed variables in `lookup`.
-            Some(Type::Optional(inner))
-                if self.has_facts()
-                    && base
-                        .place_path()
-                        .is_some_and(|p| self.is_nonnull(&format!("{p}.{field}"))) =>
-            {
+            Some(Type::Optional(inner)) if self.field_fact(base, field) == Some(Fact::NonNull) => {
                 *inner
+            }
+            // The `T!` mirror (ADR 0037): a proven-value field reads as
+            // its payload type, a proven-error field as the code.
+            Some(Type::ErrUnion(inner)) if self.field_fact(base, field) == Some(Fact::NoErr) => {
+                *inner
+            }
+            Some(Type::ErrUnion(_)) if self.field_fact(base, field) == Some(Fact::IsErr) => {
+                Type::ErrCode
             }
             Some(ty) => ty,
             None => {
@@ -1041,6 +1070,43 @@ impl Checker<'_, '_> {
             }
             // Arrays are references — element writes never touch the binding.
             Expr::Index { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// The standing fact for the field path `base.field`, if any.
+    fn field_fact(&self, base: &Expr, field: &str) -> Option<Fact> {
+        if !self.has_facts() {
+            return None;
+        }
+        base.place_path()
+            .and_then(|p| self.fact_of(&format!("{p}.{field}")))
+    }
+
+    /// Is a `T!` reachable through `t` by value (ADR 0037)? Cuts at
+    /// refstructs and arrays — handle identity never inspects contents
+    /// — and at the fuel floor, which only pathological self-embedding
+    /// (uninstantiable value types) can reach.
+    fn reaches_err_union(&self, t: &Type, fuel: usize) -> bool {
+        let Some(next) = fuel.checked_sub(1) else {
+            return false;
+        };
+        match t {
+            Type::ErrUnion(_) => true,
+            Type::Optional(inner) => self.reaches_err_union(inner, next),
+            Type::Struct(m, n) => {
+                let def = &self.mono.structs[&(*m, n.clone())];
+                !def.by_ref
+                    && def
+                        .fields
+                        .iter()
+                        .any(|(_, ft)| self.reaches_err_union(ft, next))
+            }
+            Type::Enum(m, n) => self.mono.enums[&(*m, n.clone())]
+                .variants
+                .iter()
+                .flat_map(|(_, payloads)| payloads)
+                .any(|pt| self.reaches_err_union(pt, next)),
             _ => false,
         }
     }
