@@ -22,6 +22,12 @@ use std::collections::HashMap;
 
 mod eq;
 
+/// The `{tag, payload}` tag words (ADR 0021/0034): an optional's
+/// present state is 1, an error union's value state is 0 — codes
+/// occupy ≥2, and 1 doubles as the reserved `T?!` null seat.
+const TAG_PRESENT: i64 = 1;
+const TAG_VALUE: i64 = 0;
+
 pub(super) struct Lowerer<'a> {
     pub(super) res: &'a Resolutions,
     pub(super) strings: &'a mut Strings,
@@ -279,8 +285,7 @@ impl Lowerer<'_> {
         t
     }
 
-    /// Wraps a payload into a fresh `{tag, payload}` temp — tag 1 for
-    /// an optional's present state, 0 for an error union's value state
+    /// Wraps a payload into a fresh `{tag, payload}` temp
     /// (ADR 0021/0034).
     fn wrap_present(&mut self, tag: i64, payload: V, payload_kind: Kind, words: usize) -> V {
         let t = self.fresh(false);
@@ -332,7 +337,7 @@ impl Lowerer<'_> {
                         let k = kind_of(inner, self.res, FUEL)
                             .ok_or_else(|| unsupported("values of this type", e.span()))?;
                         let v = self.expr(e)?;
-                        Ok(self.wrap_present(1, v, k, total))
+                        Ok(self.wrap_present(TAG_PRESENT, v, k, total))
                     }
                 }
             }
@@ -352,7 +357,7 @@ impl Lowerer<'_> {
                         let k = kind_of(inner, self.res, FUEL)
                             .ok_or_else(|| unsupported("values of this type", e.span()))?;
                         let v = self.expr(e)?;
-                        Ok(self.wrap_present(0, v, k, total))
+                        Ok(self.wrap_present(TAG_VALUE, v, k, total))
                     }
                 }
             }

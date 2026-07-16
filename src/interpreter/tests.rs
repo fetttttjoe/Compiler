@@ -947,6 +947,47 @@ fun main(): int { return down(4000); }";
 }
 
 #[test]
+fn try_propagates_and_stops_the_statement_chain() {
+    // ADR 0034: the first erring try returns from the enclosing
+    // function — later statements (and their side effects) never run.
+    let src = "\
+error Neg;
+fun step(n: int): int! {
+    if n < 0 { return error.Neg; }
+    return n * 2;
+}
+fun run(a: int, b: int): int! {
+    const x: int = try step(a);
+    const y: int = try step(b);
+    return x + y;
+}
+fun main(): int {
+    var r: int! = run(3, 4);
+    if r == error { return -1; }
+    var bad: int! = run(-1, 4);
+    if bad != error { return -2; }
+    if bad == error.Neg { return r; }
+    return -3;
+}";
+    assert_eq!(run(src), Ok(Value::Int(14)));
+}
+
+#[test]
+fn main_error_union_surfaces_the_error_value() {
+    // ADR 0034 decision 8: the CLI turns this into the trap-shaped
+    // exit; at the eval level the error IS the result.
+    let src = "\
+error Nope;
+fun main(): int! {
+    if 2 > 1 { return error.Nope; }
+    return 0;
+}";
+    let (value, heap) = run_full(src).unwrap();
+    assert!(matches!(value, Value::Err(_)));
+    assert_eq!(value.display(&heap), b"error.Nope".to_vec());
+}
+
+#[test]
 fn recursion_with_control_flow() {
     let fib = "\
 fun fib(n: int): int {

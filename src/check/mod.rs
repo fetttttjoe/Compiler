@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{BinOp, Conv, Expr, Function, Item, Stmt, TypeAnn, UnOp};
 use crate::diagnostic::Diagnostic;
 use crate::modules::ModuleGraph;
-use crate::narrow::{Fact, NarrowFrame, body_effects, covers, diverges, null_checks};
+use crate::narrow::{Fact, NarrowFrame, body_effects, condition_facts, covers, diverges};
 use crate::span::Span;
 use crate::syntax;
 use crate::types::{
@@ -427,9 +427,9 @@ struct Checker<'a> {
     loop_depth: usize,
     ret: Type,
     /// True exactly while typing a statement's direct right-hand side —
-    /// the only positions where `try` is supported (ADR 0034). Taken
-    /// (and reset) at every `type_of_expr` entry, so operands never
-    /// inherit it.
+    /// the only positions where `try` is supported (ADR 0034). Set
+    /// ONLY by `type_of_rhs`; taken (and reset) at every
+    /// `type_of_expr` entry, so operands never inherit it.
     try_ok: bool,
     /// Codegen resolution tables filled in as expressions type (see
     /// `Resolutions::field_slots` / `struct_lits`).

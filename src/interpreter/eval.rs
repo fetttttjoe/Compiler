@@ -46,6 +46,14 @@ pub(super) fn run_program(
     Ok((value, interp.heap))
 }
 
+/// What a statement's right-hand side produced: a value, or `try`'s
+/// propagation (ADR 0034) — the error returning from the enclosing
+/// function.
+enum Rhs {
+    Value(Value),
+    Propagate(Flow),
+}
+
 enum Flow {
     Normal,
     Return(Value),
@@ -126,8 +134,8 @@ impl<'a> Interp<'a> {
         match stmt {
             Stmt::Let { name, value, .. } => {
                 let v = match self.eval_rhs(value)? {
-                    Ok(v) => v,
-                    Err(flow) => return Ok(flow),
+                    Rhs::Value(v) => v,
+                    Rhs::Propagate(flow) => return Ok(flow),
                 };
                 self.scopes.last_mut().unwrap().insert(name.clone(), v);
                 Ok(Flow::Normal)
@@ -135,8 +143,8 @@ impl<'a> Interp<'a> {
             Stmt::Return { value, .. } => {
                 let v = match value {
                     Some(e) => match self.eval_rhs(e)? {
-                        Ok(v) => v,
-                        Err(flow) => return Ok(flow),
+                        Rhs::Value(v) => v,
+                        Rhs::Propagate(flow) => return Ok(flow),
                     },
                     None => Value::Unit,
                 };
@@ -209,15 +217,15 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal)
             }
             Stmt::Expr(e) => {
-                if let Err(flow) = self.eval_rhs(e)? {
+                if let Rhs::Propagate(flow) = self.eval_rhs(e)? {
                     return Ok(flow);
                 }
                 Ok(Flow::Normal)
             }
             Stmt::Assign { target, value, .. } => {
                 let v = match self.eval_rhs(value)? {
-                    Ok(v) => v,
-                    Err(flow) => return Ok(flow),
+                    Rhs::Value(v) => v,
+                    Rhs::Propagate(flow) => return Ok(flow),
                 };
                 self.assign_place(target, v)?;
                 Ok(Flow::Normal)
@@ -227,17 +235,17 @@ impl<'a> Interp<'a> {
 
     /// Evaluates a statement's right-hand side, honoring `try`
     /// (ADR 0034): an error value becomes the enclosing function's
-    /// return (`Err(Flow::Return)`), a payload continues the normal
-    /// path. The checker restricts `try` to exactly these positions.
-    fn eval_rhs(&mut self, e: &'a Expr) -> Result<Result<Value, Flow>, Diagnostic> {
+    /// return, a payload continues the normal path. The checker
+    /// restricts `try` to exactly these positions.
+    fn eval_rhs(&mut self, e: &'a Expr) -> Result<Rhs, Diagnostic> {
         if let Expr::Try { expr, .. } = e {
             let v = self.eval(expr)?;
             if matches!(v, Value::Err(_)) {
-                return Ok(Err(Flow::Return(v)));
+                return Ok(Rhs::Propagate(Flow::Return(v)));
             }
-            return Ok(Ok(v));
+            return Ok(Rhs::Value(v));
         }
-        Ok(Ok(self.eval(e)?))
+        Ok(Rhs::Value(self.eval(e)?))
     }
 
     /// Runs a nested block in its own scope: bindings made inside die at the

@@ -11,8 +11,9 @@ impl Checker<'_> {
     // parser bounds AST height at construction (`MAX_FN_OPS`), and the
     // pipeline runs on a worker stack sized for that bound (main.rs).
     pub(super) fn type_of_expr(&mut self, expr: &Expr) -> Type {
-        // `try` is statement-positioned (ADR 0034): the flag is taken at
-        // every entry, so operands never inherit it.
+        // `try` is statement-positioned (ADR 0034): only `type_of_rhs`
+        // sets the flag, and it is taken at every entry, so operands
+        // never inherit it.
         let try_allowed = std::mem::take(&mut self.try_ok);
         if let Expr::Try { span, .. } = expr
             && !try_allowed
@@ -198,7 +199,7 @@ impl Checker<'_> {
                 let lt = self.type_of_expr(lhs);
                 // `x != null && …` — the null check guards the right side.
                 let rt = if *op == BinOp::And {
-                    let (if_true, _) = null_checks(lhs);
+                    let (if_true, _) = condition_facts(lhs);
                     self.nonnull.push(NarrowFrame::new(if_true));
                     let rt = self.type_of_expr(rhs);
                     self.nonnull.pop();
@@ -759,6 +760,14 @@ impl Checker<'_> {
                 );
             }
         }
+    }
+
+    /// Types a statement's direct right-hand side — the only positions
+    /// where `try` is legal (ADR 0034). The setter lives here so the
+    /// discipline is structural: no other code touches the flag.
+    pub(super) fn type_of_rhs(&mut self, e: &Expr) -> Type {
+        self.try_ok = true;
+        self.type_of_expr(e)
     }
 
     pub(super) fn lookup(&mut self, name: &str, span: Span) -> Type {

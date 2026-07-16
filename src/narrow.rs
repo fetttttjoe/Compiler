@@ -46,7 +46,7 @@ pub(crate) fn covers(prefix: &str, path: &str) -> bool {
 /// `x == error` proves IsErr true / NoErr false (`!=` the inverse —
 /// unlike null, both error branches carry a fact); `&&` accumulates
 /// its sides' true-facts.
-pub(crate) fn null_checks(cond: &Expr) -> (HashMap<String, Fact>, HashMap<String, Fact>) {
+pub(crate) fn condition_facts(cond: &Expr) -> (HashMap<String, Fact>, HashMap<String, Fact>) {
     let (mut if_true, mut if_false) = (HashMap::new(), HashMap::new());
     if let Expr::Binary { op, lhs, rhs, .. } = cond {
         match op {
@@ -69,7 +69,7 @@ pub(crate) fn null_checks(cond: &Expr) -> (HashMap<String, Fact>, HashMap<String
                 }
             }
             BinOp::And => {
-                let (mut lhs_true, _) = null_checks(lhs);
+                let (mut lhs_true, _) = condition_facts(lhs);
                 // The right side runs after the left's checks — a call in
                 // it can null a checked field through an alias, so field
                 // facts don't cross it. (Bare-variable facts survive; a
@@ -78,7 +78,7 @@ pub(crate) fn null_checks(cond: &Expr) -> (HashMap<String, Fact>, HashMap<String
                     lhs_true.retain(|p, _| !p.contains('.'));
                 }
                 if_true.extend(lhs_true);
-                if_true.extend(null_checks(rhs).0);
+                if_true.extend(condition_facts(rhs).0);
             }
             _ => {}
         }

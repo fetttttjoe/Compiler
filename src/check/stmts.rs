@@ -166,8 +166,7 @@ impl Checker<'_> {
                         // never on the raw annotation.
                         self.let_types.insert(*span, declared.clone());
                         if !self.check_literal_against(value, &declared) {
-                            self.try_ok = true;
-                            let init_ty = self.type_of_expr(value);
+                            let init_ty = self.type_of_rhs(value);
                             if !fits(&init_ty, &declared) {
                                 self.error(
                                     format!(
@@ -194,8 +193,7 @@ impl Checker<'_> {
                                 "every binding declares its type: 'var {name}: <type> = …;'"
                             )),
                         );
-                        self.try_ok = true;
-                        let init_ty = self.type_of_expr(value);
+                        let init_ty = self.type_of_rhs(value);
                         if init_ty == Type::Null || unconstrained(&init_ty) {
                             Type::Error // recovery: nothing usable to bind
                         } else {
@@ -213,10 +211,7 @@ impl Checker<'_> {
                     return;
                 }
                 let ty = match value {
-                    Some(e) => {
-                        self.try_ok = true;
-                        self.type_of_expr(e)
-                    }
+                    Some(e) => self.type_of_rhs(e),
                     None => Type::Unit,
                 };
                 if !fits(&ty, &self.ret) {
@@ -237,7 +232,7 @@ impl Checker<'_> {
                 ..
             } => {
                 self.check_condition("if", cond);
-                let (if_true, if_false) = null_checks(cond);
+                let (if_true, if_false) = condition_facts(cond);
                 let then_diverges = diverges(then_body);
                 let saved = self.checkpoint(then_diverges);
                 let then_survivors = self.check_block_narrowed(then_body, if_true);
@@ -265,7 +260,7 @@ impl Checker<'_> {
             }
             Stmt::While { cond, body, .. } => {
                 self.check_condition("while", cond);
-                let (if_true, _) = null_checks(cond);
+                let (if_true, _) = condition_facts(cond);
                 self.drop_loop_invalidated_facts(body);
                 self.loop_depth += 1;
                 self.check_block_narrowed(body, if_true);
@@ -330,8 +325,7 @@ impl Checker<'_> {
                 self.nonnull.pop();
             }
             Stmt::Expr(e) => {
-                self.try_ok = true;
-                self.type_of_expr(e);
+                self.type_of_rhs(e);
             }
             Stmt::Break { span } | Stmt::Continue { span } => {
                 if self.loop_depth == 0 {
@@ -354,8 +348,7 @@ impl Checker<'_> {
                 let value_ty = if matches!(value, Expr::ArrayLit { .. }) {
                     None
                 } else {
-                    self.try_ok = true;
-                    Some(self.type_of_expr(value))
+                    Some(self.type_of_rhs(value))
                 };
                 // The parser only builds place targets, so a root always exists.
                 let Some((root, root_span)) = root_ident(target) else {
