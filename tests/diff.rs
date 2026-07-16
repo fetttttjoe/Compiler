@@ -2403,3 +2403,138 @@ fn long_operator_chain_within_the_depth_budget() {
     let terms = vec!["1"; 6000].join(" + ");
     diff("chain", &format!("fun main(): int {{ return {terms}; }}"));
 }
+
+// --- Generics (ADR 0035): monomorphic expansion through the backend ---
+
+#[test]
+fn generic_functions_monomorphize_per_type() {
+    diff(
+        "generic_fns",
+        "fun max<T>(a: T, b: T): T { if a > b { return a; } return b; }\n\
+         fun main(): int {\n\
+             print(max(2.5, 1.5));\n\
+             print(max<int>(4, 10));\n\
+             return max(1, 2) + max(30, 9);\n\
+         }",
+    );
+}
+
+#[test]
+fn generic_value_structs_copy_not_alias() {
+    // The value/ref split survives substitution: T = struct copies.
+    diff(
+        "generic_copy",
+        "struct P { x: int }\n\
+         struct Pair<T, U> { a: T, b: U }\n\
+         fun id<T>(v: T): T { return v; }\n\
+         fun main(): int {\n\
+             var p: Pair<P, int> = Pair<P, int> { a: P { x: 1 }, b: 2 };\n\
+             var q: Pair<P, int> = id(p);\n\
+             q.a.x = 99;\n\
+             print(p);\n\
+             print(q);\n\
+             return p.a.x;\n\
+         }",
+    );
+}
+
+#[test]
+fn generic_refstructs_alias_through_instances() {
+    diff(
+        "generic_alias",
+        "refstruct Box<T> { value: T }\n\
+         fun bump(b: Box<int>) { b.value = b.value + 1; }\n\
+         fun main(): int {\n\
+             const b: Box<int> = Box<int> { value: 40 };\n\
+             bump(b);\n\
+             bump(b);\n\
+             print(b);\n\
+             return b.value;\n\
+         }",
+    );
+}
+
+#[test]
+fn generic_optionals_wrap_and_narrow() {
+    // T? through a generic slot: value-optional tagging + narrowing
+    // inside an instance body.
+    diff(
+        "generic_opt",
+        "fun orElse<T>(v: T?, fallback: T): T { if v != null { return v; } return fallback; }\n\
+         fun main(): int {\n\
+             print(orElse<int>(null, 9));\n\
+             print(orElse<string>(\"a\", \"b\"));\n\
+             print(orElse(2.5, 0.5));\n\
+             return orElse<int>(null, 3);\n\
+         }",
+    );
+}
+
+#[test]
+fn arrays_of_generic_instances_lower_with_multiword_strides() {
+    diff(
+        "generic_arrays",
+        "struct Pair<T, U> { a: T, b: U }\n\
+         fun mk<T, U>(a: T, b: U): Pair<T, U> { return Pair<T, U> { a: a, b: b }; }\n\
+         fun main(): int {\n\
+             var xs: Pair<int, string>[] = [];\n\
+             push(xs, mk(1, \"one\"));\n\
+             push(xs, mk(2, \"two\"));\n\
+             print(xs);\n\
+             var total: int = 0;\n\
+             for [i, p] in xs { total = total + p.a * (i + 1); }\n\
+             return total;\n\
+         }",
+    );
+}
+
+#[test]
+fn generic_linked_list_iterates_natively() {
+    diff(
+        "generic_list",
+        "refstruct Node<T> { value: T, next: Node<T>? }\n\
+         fun push_front<T>(head: Node<T>?, value: T): Node<T> {\n\
+             return Node<T> { value: value, next: head };\n\
+         }\n\
+         fun main(): int {\n\
+             var list: Node<string>? = null;\n\
+             list = push_front(list, \"c\");\n\
+             list = push_front(list, \"b\");\n\
+             list = push_front(list, \"a\");\n\
+             print(list);\n\
+             var n: int = 0;\n\
+             var cur: Node<string>? = list;\n\
+             while cur != null { n = n + 1; cur = cur.next; }\n\
+             return n;\n\
+         }",
+    );
+}
+
+#[test]
+fn generic_to_generic_calls_expand_transitively() {
+    diff(
+        "generic_transitive",
+        "struct Pair<T, U> { a: T, b: U }\n\
+         fun swap<T, U>(p: Pair<T, U>): Pair<U, T> { return Pair<U, T> { a: p.b, b: p.a }; }\n\
+         fun twice<T, U>(p: Pair<T, U>): Pair<T, U> { return swap(swap(p)); }\n\
+         fun main(): int {\n\
+             const p: Pair<int, string> = Pair<int, string> { a: 7, b: \"x\" };\n\
+             print(twice(p));\n\
+             return twice(p).a;\n\
+         }",
+    );
+}
+
+#[test]
+fn generic_string_conversion_and_templates() {
+    diff(
+        "generic_string",
+        "struct Pair<T, U> { a: T, b: U }\n\
+         fun describe<T>(v: T): string { return `value: ${string(v)}`; }\n\
+         fun main(): int {\n\
+             print(describe(42));\n\
+             print(describe(Pair<int, int> { a: 1, b: 2 }));\n\
+             return 0;\n\
+         }",
+    );
+}

@@ -3,18 +3,28 @@ use crate::modules::{Module, load_program};
 use crate::source::SourceMap;
 use crate::{lexer::lex, parser::parse};
 
-fn graph_of(src: &str) -> ModuleGraph {
+fn graph_of(src: &str) -> (ModuleGraph, SourceMap) {
+    let mut map = SourceMap::new();
+    map.add("test.ys", src);
     let (tokens, ld) = lex(src);
     assert!(ld.is_empty(), "lex: {ld:?}");
     let (ast, pd) = parse(&tokens);
     assert!(pd.is_empty(), "parse: {pd:?}");
-    ModuleGraph {
+    let graph = ModuleGraph {
         modules: vec![Module {
             path: "test.ys".to_string(),
             ast,
             imports: Vec::new(),
         }],
-    }
+    };
+    (graph, map)
+}
+
+/// Checks a single-file program — the graph plus the span authority
+/// the monomorphizer needs (ADR 0035).
+fn checked(src: &str) -> (Resolutions, Vec<Diagnostic>) {
+    let (graph, mut map) = graph_of(src);
+    check(&graph, &mut map)
 }
 
 /// Checks a multi-file program (first file = entry) through the real
@@ -33,16 +43,14 @@ fn multi(files: &[(&str, &str)]) -> (Resolutions, Vec<Diagnostic>) {
     let mut map = SourceMap::new();
     let (graph, fd) = load_program(files[0].0, &mut read, &mut map).unwrap();
     assert!(fd.is_empty(), "front-end: {fd:?}");
-    check(&graph)
+    check(&graph, &mut map)
 }
 
 #[test]
 fn resolves_local_names_to_the_defining_module() {
-    let (res, d) = check(&graph_of(
-        "struct P { x: int } fun f(a: int): float { return 1.0; }",
-    ));
+    let (res, d) = checked("struct P { x: int } fun f(a: int): float { return 1.0; }");
     assert!(d.is_empty(), "unexpected diagnostics: {d:?}");
-    assert_eq!(res.functions[0]["f"], (0, "f".to_string()));
+    assert!(res.sigs.contains_key(&(0, "f".to_string())));
 }
 
 #[test]
@@ -54,7 +62,7 @@ fn duplicate_function_is_an_error() {
 
 #[test]
 fn unknown_type_is_an_error() {
-    let (_, d) = check(&graph_of("fun f(a: Missing): int { return 1; }"));
+    let (_, d) = checked("fun f(a: Missing): int { return 1; }");
     assert!(
         d.iter()
             .any(|e| e.message.contains("unknown type 'Missing'"))
@@ -62,7 +70,7 @@ fn unknown_type_is_an_error() {
 }
 
 fn diags(src: &str) -> Vec<Diagnostic> {
-    check(&graph_of(src)).1
+    checked(src).1
 }
 
 #[test]
@@ -1798,4 +1806,212 @@ fn assigning_to_const_is_an_error() {
             .any(|e| e.message.contains("cannot assign to const 'x'")),
         "{d:?}"
     );
+}
+
+// --- Generics (ADR 0035) ---
+
+#[test]
+fn generic_bodies_check_at_instantiation_with_a_prefix() {
+    // The template alone is fine; the string instance trips `>`.
+    let d = diags(
+        "fun max<T>(a: T, b: T): T { if a > b { return a; } return b; }\n\
+         fun main(): int { max(\"a\", \"b\"); return 0; }",
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert!(
+        d[0].message
+            .contains("in 'max<string>': cannot apply '>' to string and string"),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn uninstantiated_templates_are_never_checked() {
+    let d = diags("fun broken<T>(a: T): int { return a > \"x\"; } fun main(): int { return 0; }");
+    assert!(d.is_empty(), "{d:?}");
+}
+
+#[test]
+fn inference_conflicts_and_gaps_are_reported() {
+    let d = diags(
+        "fun pick<T>(a: T, b: T): T { return a; }\n\
+         fun main(): int { pick(1, \"x\"); return 0; }",
+    );
+    assert!(
+        d.iter().any(|e| e
+            .message
+            .contains("conflicting types for 'T': int vs string")),
+        "{d:?}"
+    );
+    let d = diags(
+        "fun empty<T>(): T[] { return []; }\n\
+         fun main(): int { const xs: int[] = empty(); return len(xs); }",
+    );
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("cannot infer 'T' from the arguments")),
+        "{d:?}"
+    );
+    // `null` binds nothing; a pinned T accepts it through `T?`.
+    let d = diags(
+        "fun orElse<T>(v: T?, fallback: T): T { if v != null { return v; } return fallback; }\n\
+         fun main(): int { return orElse(null, 4); }",
+    );
+    assert!(d.is_empty(), "{d:?}");
+}
+
+#[test]
+fn explicit_type_arguments_pin_and_count() {
+    let d = diags(
+        "fun pick<T>(a: T, b: T): T { return a; }\n\
+         fun main(): int { return pick<int, int>(1, 2); }",
+    );
+    assert!(
+        d.iter().any(|e| e
+            .message
+            .contains("'pick' expects 1 type argument(s), found 2")),
+        "{d:?}"
+    );
+    let d = diags(
+        "fun f(x: int): int { return x; }\n\
+         fun main(): int { return f<int>(1); }",
+    );
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("'f' takes no type arguments")),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn generic_struct_misuse_is_diagnosed() {
+    let d = diags(
+        "struct Pair<T, U> { a: T, b: U }\n\
+         fun main(): int { const p: Pair = Pair { a: 1, b: 2 }; return 0; }",
+    );
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("struct 'Pair' is generic")),
+        "{d:?}"
+    );
+    let d = diags(
+        "struct Point { x: int }\n\
+         fun main(): int { const p: Point<int> = Point<int> { x: 1 }; return 0; }",
+    );
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("'Point' takes no type arguments")),
+        "{d:?}"
+    );
+    let d = diags(
+        "struct Pair<T, U> { a: T, b: U }\n\
+         fun main(): int { const p: Pair<int> = Pair<int> { a: 1 }; return 0; }",
+    );
+    assert!(
+        d.iter().any(|e| e
+            .message
+            .contains("'Pair' expects 2 type argument(s), found 1")),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn type_parameter_rules() {
+    let d = diags("fun f<T, T>(x: T): T { return x; } fun main(): int { return 0; }");
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("duplicate type parameter 'T'")),
+        "{d:?}"
+    );
+    let d = diags(
+        "struct Box<T> { v: T }\n\
+         fun g<Box>(x: Box): Box { return x; }\n\
+         fun main(): int { return 0; }",
+    );
+    assert!(
+        d.iter().any(|e| e
+            .message
+            .contains("type parameter 'Box' shadows the type 'Box'")),
+        "{d:?}"
+    );
+    let d = diags("fun main<T>(): int { return 0; }");
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("'main' cannot be generic")),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn runaway_instantiation_hits_the_depth_cap() {
+    // Function family: f<T> requests f<T[]>.
+    let d = diags(
+        "fun f<T>(x: T): int { return f([x]); }\n\
+         fun main(): int { return f(1); }",
+    );
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("generic instantiation exceeds depth")),
+        "{d:?}"
+    );
+    // Struct family: A<T> embeds A<T[]>.
+    let d = diags(
+        "struct A<T> { next: A<T[]>? }\n\
+         fun main(): int { const a: A<int> = A<int> { next: null }; return 0; }",
+    );
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("generic instantiation exceeds depth")),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn same_named_structs_from_different_modules_stay_distinct() {
+    // Both modules instantiate Box with a struct named P — the instance
+    // keys must not collide (canonical names qualify by module).
+    let (res, d) = multi(&[
+        (
+            "main.ys",
+            "import { boxed } from \"./lib\";\n\
+             import { Box } from \"./shared\";\n\
+             struct P { x: int }\n\
+             fun main(): int {\n\
+                 const mine: Box<P> = Box<P> { v: P { x: 1 } };\n\
+                 const theirs: Box<P> = boxed();\n\
+                 return mine.v.x;\n\
+             }",
+        ),
+        (
+            "lib.ys",
+            "import { Box } from \"./shared\";\n\
+             struct P { x: int }\n\
+             export fun boxed(): Box<P> { return Box<P> { v: P { x: 2 } }; }",
+        ),
+        ("shared.ys", "export struct Box<T> { v: T }"),
+    ]);
+    // main's Box<P> and lib's Box<P> are different instances: assigning
+    // one to the other must be a type error.
+    assert!(
+        d.iter().any(|e| e.message.contains("initialized with")),
+        "expected a cross-module instance mismatch: {d:?}"
+    );
+    let boxes: Vec<&(usize, String)> = res
+        .structs
+        .keys()
+        .filter(|(_, n)| n.starts_with("Box<"))
+        .collect();
+    assert_eq!(boxes.len(), 2, "two distinct instances: {boxes:?}");
+}
+
+#[test]
+fn instances_and_call_targets_land_in_resolutions() {
+    let (res, d) = checked(
+        "fun id<T>(x: T): T { return x; }\n\
+         fun main(): int { id(\"s\"); return id(7); }",
+    );
+    assert!(d.is_empty(), "{d:?}");
+    assert!(res.instances.contains_key(&(0, "id<int>".to_string())));
+    assert!(res.instances.contains_key(&(0, "id<string>".to_string())));
+    assert!(res.sigs.contains_key(&(0, "id<int>".to_string())));
 }

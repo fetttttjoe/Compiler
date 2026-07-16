@@ -6,7 +6,7 @@
 
 use super::*;
 
-impl Parser<'_> {
+impl Parser {
     pub fn parse_expr(&mut self, min_bp: u8) -> Expr {
         if !self.enter_nested() {
             return Expr::Int(0, self.peek().span); // recovery placeholder
@@ -19,6 +19,21 @@ impl Parser<'_> {
     pub(super) fn parse_expr_inner(&mut self, min_bp: u8) -> Expr {
         let mut lhs = self.parse_prefix();
         loop {
+            // `ident <` may open a type-argument list (ADR 0035): commit
+            // only when a well-formed list closes onto `(` or `{`,
+            // otherwise fall through to comparison. Binds like postfix.
+            if self.check(&TokenKind::Less)
+                && matches!(lhs, Expr::Ident(..))
+                && POSTFIX_BP >= min_bp
+            {
+                match self.try_generic_suffix(lhs) {
+                    Ok(built) => {
+                        lhs = built;
+                        continue;
+                    }
+                    Err(orig) => lhs = orig,
+                }
+            }
             // Postfix (call `(`, field `.`/`?.`) binds tighter than every operator.
             if matches!(
                 self.peek().kind,
@@ -172,7 +187,7 @@ impl Parser<'_> {
             TokenKind::StringLiteral(s) => Expr::Str(s, tok.span),
             TokenKind::Identifier(name) => {
                 if self.struct_literals_allowed && self.check(&TokenKind::LeftBrace) {
-                    self.parse_struct_literal(name, tok.span)
+                    self.parse_struct_literal(name, tok.span, Vec::new())
                 } else {
                     Expr::Ident(name, tok.span)
                 }
@@ -234,32 +249,74 @@ impl Parser<'_> {
         }
     }
 
+    /// Speculative type-argument suffix on an identifier (ADR 0035).
+    /// `Ok` is the committed call or struct literal; `Err` hands the
+    /// identifier back untouched — position and diagnostics rolled back
+    /// — so `<` reads as comparison.
+    fn try_generic_suffix(&mut self, lhs: Expr) -> Result<Expr, Expr> {
+        let start_pos = self.pos;
+        let start_diags = self.diagnostics.len();
+        self.bump(); // '<'
+        let mut type_args = Vec::new();
+        loop {
+            type_args.push(self.parse_type());
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        // Commit needs a clean list (no diagnostics — speculation is
+        // silent), a plain `>`, and `(` or `{` right after.
+        let commit = self.diagnostics.len() == start_diags
+            && self.eat(&TokenKind::Greater)
+            && (self.check(&TokenKind::LeftParen)
+                || (self.struct_literals_allowed && self.check(&TokenKind::LeftBrace)));
+        if !commit {
+            self.pos = start_pos;
+            self.diagnostics.truncate(start_diags);
+            return Err(lhs);
+        }
+        if self.eat(&TokenKind::LeftParen) {
+            return Ok(self.parse_call_tail(lhs, type_args));
+        }
+        let Expr::Ident(name, span) = lhs else {
+            unreachable!("caller guarantees an identifier lhs")
+        };
+        Ok(self.parse_struct_literal(name, span, type_args))
+    }
+
+    /// Call arguments after the `(` was consumed — shared by plain
+    /// postfix calls and committed generic suffixes.
+    fn parse_call_tail(&mut self, lhs: Expr, type_args: Vec<TypeAnn>) -> Expr {
+        // Call parentheses re-enable struct literals inside a
+        // condition, same as grouping parentheses.
+        let prev = self.struct_literals_allowed;
+        self.struct_literals_allowed = true;
+        let mut args = Vec::new();
+        while !self.check(&TokenKind::RightParen) && !self.at_eof() {
+            args.push(self.parse_expr(0));
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.struct_literals_allowed = prev;
+        let end = self.expect(TokenKind::RightParen);
+        if !self.claim_op(end) {
+            return lhs;
+        }
+        let span = lhs.span().to(end);
+        Expr::Call {
+            callee: Box::new(lhs),
+            type_args,
+            args,
+            span,
+        }
+    }
+
     pub(super) fn parse_postfix(&mut self, lhs: Expr) -> Expr {
         match self.peek().kind {
             TokenKind::LeftParen => {
                 self.bump();
-                // Call parentheses re-enable struct literals inside a
-                // condition, same as grouping parentheses.
-                let prev = self.struct_literals_allowed;
-                self.struct_literals_allowed = true;
-                let mut args = Vec::new();
-                while !self.check(&TokenKind::RightParen) && !self.at_eof() {
-                    args.push(self.parse_expr(0));
-                    if !self.eat(&TokenKind::Comma) {
-                        break;
-                    }
-                }
-                self.struct_literals_allowed = prev;
-                let end = self.expect(TokenKind::RightParen);
-                if !self.claim_op(end) {
-                    return lhs;
-                }
-                let span = lhs.span().to(end);
-                Expr::Call {
-                    callee: Box::new(lhs),
-                    args,
-                    span,
-                }
+                self.parse_call_tail(lhs, Vec::new())
             }
             TokenKind::LeftBracket => {
                 self.bump();
@@ -309,7 +366,12 @@ impl Parser<'_> {
         }
     }
 
-    pub(super) fn parse_struct_literal(&mut self, name: String, start: Span) -> Expr {
+    pub(super) fn parse_struct_literal(
+        &mut self,
+        name: String,
+        start: Span,
+        type_args: Vec<TypeAnn>,
+    ) -> Expr {
         self.expect(TokenKind::LeftBrace);
         let mut fields = Vec::new();
         while !self.check(&TokenKind::RightBrace) && !self.at_eof() {
@@ -324,6 +386,7 @@ impl Parser<'_> {
         let end = self.expect(TokenKind::RightBrace);
         Expr::StructLit {
             name,
+            type_args,
             fields,
             span: start.to(end),
         }

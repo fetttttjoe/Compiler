@@ -4,7 +4,7 @@
 
 use super::*;
 
-impl Parser<'_> {
+impl Parser {
     /// A base type with postfix suffixes: `?` (optional), `!` (error
     /// union, ADR 0034), and `[]` (array), composable left to right —
     /// `int?[]` is an array of optional ints, `int[]?` an optional
@@ -110,7 +110,11 @@ impl Parser<'_> {
             }
             TokenKind::Identifier(n) => {
                 self.bump();
-                TypeAnn::Named(n)
+                if self.check(&TokenKind::Less) {
+                    self.parse_applied_type(n)
+                } else {
+                    TypeAnn::Named(n)
+                }
             }
             other => {
                 self.error(
@@ -122,11 +126,77 @@ impl Parser<'_> {
         }
     }
 
+    /// `Pair<int, string>` — a generic type application (ADR 0035). In
+    /// type position `<` after a name is unambiguous. Applied types are
+    /// the type grammar's only recursion point, so they claim nesting.
+    fn parse_applied_type(&mut self, name: String) -> TypeAnn {
+        if !self.enter_nested() {
+            return TypeAnn::Named(name); // recovery placeholder
+        }
+        self.bump(); // '<'
+        let mut args = Vec::new();
+        loop {
+            args.push(self.parse_type());
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.close_type_args();
+        self.depth -= 1;
+        TypeAnn::Applied(name, args)
+    }
+
+    /// Consumes the `>` closing a type-argument list. A `>=` token is
+    /// split in place — `var b: Box<int>= x` — by rewriting it to the
+    /// remaining `=` (ADR 0035); ys has no shift operator, so `>>`
+    /// already lexes as two tokens.
+    pub(super) fn close_type_args(&mut self) {
+        let tok = self.peek().clone();
+        match tok.kind {
+            TokenKind::Greater => self.bump(),
+            TokenKind::GreaterEq => {
+                self.tokens[self.pos] = Token {
+                    kind: TokenKind::Equals,
+                    span: Span::new(tok.span.start + 1, tok.span.end),
+                };
+            }
+            other => {
+                self.error(
+                    format!(
+                        "expected '>' to close the type arguments, found {}",
+                        describe(&other)
+                    ),
+                    tok.span,
+                );
+            }
+        }
+    }
+
+    /// `<T, U>` after a function or struct name — generic type
+    /// parameters (ADR 0035). Absent means an ordinary declaration.
+    fn parse_type_params(&mut self) -> Vec<(String, Span)> {
+        if !self.eat(&TokenKind::Less) {
+            return Vec::new();
+        }
+        let mut params = Vec::new();
+        loop {
+            let span = self.peek().span;
+            let name = self.expect_identifier();
+            params.push((name, span));
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::Greater);
+        params
+    }
+
     pub(super) fn parse_function(&mut self, exported: bool) -> Function {
         self.fn_ops = 0;
         self.fn_ops_reported = false;
         let start = self.expect(TokenKind::Fun);
         let name = self.expect_identifier();
+        let type_params = self.parse_type_params();
         self.expect(TokenKind::LeftParen);
         let mut params = Vec::new();
         while !self.check(&TokenKind::RightParen) && !self.at_eof() {
@@ -152,6 +222,7 @@ impl Parser<'_> {
         Function {
             exported,
             name,
+            type_params,
             params,
             return_type,
             body,
@@ -186,6 +257,7 @@ impl Parser<'_> {
         let by_ref = kw.kind == TokenKind::RefStruct;
         let start = kw.span;
         let name = self.expect_identifier();
+        let type_params = self.parse_type_params();
         self.expect(TokenKind::LeftBrace);
         let mut fields = Vec::new();
         while !self.check(&TokenKind::RightBrace) && !self.at_eof() {
@@ -205,6 +277,7 @@ impl Parser<'_> {
             exported,
             by_ref,
             name,
+            type_params,
             fields,
             span: start.to(end),
         }

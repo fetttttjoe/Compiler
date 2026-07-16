@@ -4,7 +4,7 @@
 
 use super::*;
 
-impl Parser<'_> {
+impl Parser {
     /// Parses an `if`/`while` condition: struct literals are disallowed so
     /// `if x { … }` reads `x` as the condition, not a struct literal `x {}`.
     pub(super) fn parse_condition(&mut self) -> Expr {

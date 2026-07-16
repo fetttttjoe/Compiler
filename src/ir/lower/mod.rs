@@ -33,7 +33,6 @@ pub(super) struct Lowerer<'a> {
     pub(super) strings: &'a mut Strings,
     pub(super) printers: &'a mut Printers,
     pub(super) map: &'a SourceMap,
-    pub(super) module: usize,
     pub(super) insts: Vec<Inst>,
     pub(super) scopes: Vec<HashMap<String, Binding>>,
     pub(super) vregs: usize,
@@ -83,7 +82,6 @@ pub(super) fn lower(
         strings,
         printers,
         map,
-        module,
         insts: Vec::new(),
         scopes: vec![HashMap::new()],
         vregs: 0,
@@ -869,7 +867,9 @@ impl Lowerer<'_> {
                 span,
             } => self.coalesce(lhs, rhs, *span),
             Expr::Binary { op, lhs, rhs, span } => self.binary(*op, lhs, rhs, *span),
-            Expr::Call { callee, args, span } => self.call(callee, args, *span),
+            Expr::Call {
+                callee, args, span, ..
+            } => self.call(callee, args, *span),
             Expr::ArrayLit { elements, span } => {
                 let elem = self.elem_ty(expr)?;
                 let ek = kind_of(&elem, self.res, FUEL)
@@ -1508,8 +1508,10 @@ impl Lowerer<'_> {
         let Expr::Ident(name, _) = callee else {
             return Err(unsupported("this callee", span));
         };
-        // Resolution order: builtins only when no user definition.
-        let Some(key) = self.res.functions[self.module].get(name).cloned() else {
+        // Calls resolve through the checker's per-site table (ADR
+        // 0035) — generic calls point at their instance; an absent
+        // span means a builtin.
+        let Some(key) = self.res.call_targets.get(&span).cloned() else {
             return self.builtin(name, args, span);
         };
         let res = self.res;

@@ -15,10 +15,17 @@ pub(super) fn run_program(
     let mut functions: HashMap<(usize, &str), &Function> = HashMap::new();
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
-            if let Item::Function(f) = item {
+            // Generic templates are never executable — their instances
+            // are (ADR 0035).
+            if let Item::Function(f) = item
+                && f.type_params.is_empty()
+            {
                 functions.insert((mi, f.name.as_str()), f);
             }
         }
+    }
+    for ((mi, name), f) in &resolutions.instances {
+        functions.insert((*mi, name.as_str()), f);
     }
     let mut interp = Interp {
         functions,
@@ -398,7 +405,9 @@ impl<'a> Interp<'a> {
                     eval_binary(*op, l, r, *span)
                 }
             },
-            Expr::Call { callee, args, span } => {
+            Expr::Call {
+                callee, args, span, ..
+            } => {
                 let name = match callee.as_ref() {
                     Expr::Ident(n, _) => n.clone(),
                     _ => {
@@ -408,9 +417,11 @@ impl<'a> Interp<'a> {
                         ));
                     }
                 };
-                let Some((target_module, target_name)) = self.resolutions.functions[self.module]
-                    .get(name.as_str())
-                    .cloned()
+                // Calls resolve through the checker's per-site table
+                // (ADR 0035) — generic calls point at their instance;
+                // an absent span means a builtin.
+                let Some((target_module, target_name)) =
+                    self.resolutions.call_targets.get(span).cloned()
                 else {
                     // Builtins run only when no user definition shadows them
                     // — mirrors the checker's resolution order. Shape errors
@@ -603,30 +614,39 @@ impl<'a> Interp<'a> {
             }
             // The checker has already verified literals are complete and
             // fields exist, so the error arms here are defensive only.
-            Expr::StructLit { name, fields, span } => {
+            Expr::StructLit { fields, span, .. } => {
+                // The checker resolved the literal's type — engines
+                // never re-derive one. The display name strips module
+                // qualifiers off instance names (ADR 0035).
+                let Some(crate::types::Type::Struct(dm, dn)) =
+                    self.resolutions.expr_types.get(span)
+                else {
+                    return Err(Diagnostic::error("unresolved struct literal", *span));
+                };
+                let by_ref = self.resolutions.structs[&(*dm, dn.clone())].by_ref;
+                let display = crate::types::pretty(dn);
                 // Evaluate in written order (side effects), store sorted.
                 let mut vals = Vec::with_capacity(fields.len());
                 for (fname, fexpr) in fields {
                     vals.push((fname.clone(), self.eval(fexpr)?));
                 }
                 vals.sort_by(|a, b| a.0.cmp(&b.0));
-                let value = Value::Struct {
-                    name: name.clone(),
-                    fields: vals,
-                };
                 // A refstruct literal allocates one shared heap object;
                 // everyone who copies the handle aliases it.
-                if self.resolutions.ref_structs[self.module].contains(name.as_str()) {
-                    let Value::Struct { name, fields } = value else {
-                        unreachable!("struct literals evaluate to structs")
-                    };
+                if by_ref {
                     self.check_heap(*span)?;
                     Ok(Value::Ref({
-                        self.heap.structs.push(StructObj { name, fields });
+                        self.heap.structs.push(StructObj {
+                            name: display,
+                            fields: vals,
+                        });
                         self.heap.structs.len() - 1
                     }))
                 } else {
-                    Ok(value)
+                    Ok(Value::Struct {
+                        name: display,
+                        fields: vals,
+                    })
                 }
             }
             Expr::Field {

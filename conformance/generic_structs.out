@@ -1,0 +1,8 @@
+Pair<int, string> { a: 1, b: one }
+Pair<string, int> { a: one, b: 1 }
+true
+Box<int> { value: 42 }
+deep
+Node<int> { next: Node<int> { next: Node<int> { next: null, value: 3 }, value: 2 }, value: 1 }
+[Pair<int, int> { a: 1, b: 2 }, Pair<int, int> { a: 3, b: 4 }]
+=> Int(3)

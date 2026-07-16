@@ -755,3 +755,88 @@ fn operator_budget_resets_between_functions() {
         assert!(budget_diags(&src).is_empty());
     });
 }
+
+// --- Generics (ADR 0035) ---
+
+#[test]
+fn explicit_type_arguments_on_calls() {
+    assert_eq!(expr("f<int>(x)").sexpr(), "(call f<int> x)");
+    assert_eq!(
+        expr("g<int, string?>(a, b)").sexpr(),
+        "(call g<int, string?> a b)"
+    );
+    assert_eq!(expr("h<Box<int>>(x)").sexpr(), "(call h<Box<int>> x)");
+    // Chains keep working on the committed call.
+    assert_eq!(expr("f<int>(x).y").sexpr(), "(. (call f<int> x) y)");
+}
+
+#[test]
+fn type_arguments_on_struct_literals() {
+    assert_eq!(
+        expr("Pair<int, string> { a: 1 }").sexpr(),
+        "(struct Pair<int, string> a=1)"
+    );
+}
+
+#[test]
+fn less_than_still_parses_as_comparison() {
+    // No commit without `>` landing on `(` or `{`.
+    assert_eq!(expr("a < b").sexpr(), "(< a b)");
+    assert_eq!(expr("a < b > c").sexpr(), "(> (< a b) c)");
+    assert_eq!(expr("a < b && c > d").sexpr(), "(&& (< a b) (> c d))");
+    assert_eq!(expr("f < int(3)").sexpr(), "(< f (int 3))");
+    // `(c)` after `>` commits to the call reading (the TS answer).
+    assert_eq!(expr("a<b>(c)").sexpr(), "(call a<b> c)");
+}
+
+#[test]
+fn generic_declarations_carry_type_params() {
+    let (tokens, _) = lex("fun max<T, U>(a: T, b: U): T { return a; }");
+    let (items, diags) = parse(&tokens);
+    assert!(diags.is_empty(), "{diags:?}");
+    let Item::Function(f) = &items[0] else {
+        panic!("expected a function")
+    };
+    let names: Vec<&str> = f.type_params.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["T", "U"]);
+    assert_eq!(f.params[0].ty.show(), "T");
+
+    let (tokens, _) = lex("struct Pair<T, U> { a: T, b: U }");
+    let (items, diags) = parse(&tokens);
+    assert!(diags.is_empty(), "{diags:?}");
+    let Item::Struct(s) = &items[0] else {
+        panic!("expected a struct")
+    };
+    assert_eq!(s.type_params.len(), 2);
+}
+
+#[test]
+fn applied_types_in_annotations_split_greater_eq() {
+    // `>=` closing an annotation splits into `>` `=` (ADR 0035).
+    let (tokens, _) = lex("fun f() { var b: Box<int>= x; const c: Box<Box<int>>= y; }");
+    let (items, diags) = parse(&tokens);
+    assert!(diags.is_empty(), "{diags:?}");
+    let Item::Function(f) = &items[0] else {
+        panic!("expected a function")
+    };
+    let Stmt::Let { ty: Some(ty), .. } = &f.body[0] else {
+        panic!("expected an annotated let")
+    };
+    assert_eq!(ty.show(), "Box<int>");
+    let Stmt::Let { ty: Some(ty), .. } = &f.body[1] else {
+        panic!("expected an annotated let")
+    };
+    assert_eq!(ty.show(), "Box<Box<int>>");
+}
+
+#[test]
+fn condition_position_never_commits_to_a_struct_literal() {
+    // `if a < b > { … }` could only be a (nonsense) comparison — but the
+    // speculative parse must not swallow the block as a literal body.
+    let (tokens, _) = lex("fun f(x: bool) { if a < b { g(); } }");
+    let (items, _) = parse(&tokens);
+    let Item::Function(f) = &items[0] else {
+        panic!("expected a function")
+    };
+    assert!(matches!(&f.body[0], Stmt::If { .. }));
+}

@@ -76,6 +76,10 @@ pub(super) fn emit(ir: FunctionIr) -> String {
         floats,
         insts,
     } = ir;
+    // Instance names carry mangle characters (ADR 0035); local jump
+    // labels embed the name, so sanitize once here — idempotent with
+    // `label_of`'s own pass.
+    let name = crate::codegen::sanitize(&name);
     let ivs = intervals(&insts, vregs);
     let save_base = -8 * CALLEE_SAVED.len() as i64;
     let (loc, used_callee, spill_floor) = allocate(&ivs, &floats, save_base);

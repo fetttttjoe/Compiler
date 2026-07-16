@@ -40,6 +40,10 @@ pub struct ImportDecl {
 pub struct Function {
     pub exported: bool,
     pub name: String,
+    /// `fun max<T, U>(…)` — generic type parameters (ADR 0035). Each
+    /// keeps its span so shadowing/duplicate diagnostics point at it.
+    /// Empty for ordinary functions.
+    pub type_params: Vec<(String, Span)>,
     pub params: Vec<Param>,
     pub return_type: Option<TypeAnn>,
     pub body: Vec<Stmt>,
@@ -59,6 +63,8 @@ pub struct Struct {
     /// of the default value semantics (copied).
     pub by_ref: bool,
     pub name: String,
+    /// `struct Pair<T, U> { … }` — generic type parameters (ADR 0035).
+    pub type_params: Vec<(String, Span)>,
     pub fields: Vec<Field>,
     pub span: Span,
 }
@@ -77,6 +83,13 @@ pub enum TypeAnn {
     Str,
     File,
     Named(String),
+    /// `Pair<int, string>` — a generic type applied to arguments
+    /// (ADR 0035).
+    Applied(String, Vec<TypeAnn>),
+    /// A pre-resolved type — the monomorphizer's substitution carrier
+    /// (ADR 0035): `T := int[]` or a foreign struct survives cloning
+    /// with module identity intact. Never produced by the parser.
+    Resolved(crate::types::Type),
     /// `error` — the one-word error-code type (ADR 0034).
     ErrCode,
     /// `T!` — T or a declared error code (ADR 0034).
@@ -204,6 +217,9 @@ pub enum Expr {
     },
     Call {
         callee: Box<Expr>,
+        /// Explicit type arguments — `max<int>(a, b)` (ADR 0035).
+        /// Empty when inference is left to do the work.
+        type_args: Vec<TypeAnn>,
         args: Vec<Expr>,
         span: Span,
     },
@@ -216,6 +232,8 @@ pub enum Expr {
     },
     StructLit {
         name: String,
+        /// Explicit type arguments — `Pair<int, string> { … }` (ADR 0035).
+        type_args: Vec<TypeAnn>,
         fields: Vec<(String, Expr)>,
         span: Span,
     },
@@ -374,9 +392,19 @@ impl Expr {
             Expr::Binary { op, lhs, rhs, .. } => {
                 format!("({} {} {})", op.symbol(), lhs.sexpr(), rhs.sexpr())
             }
-            Expr::Call { callee, args, .. } => {
+            Expr::Call {
+                callee,
+                type_args,
+                args,
+                ..
+            } => {
                 let args: Vec<String> = args.iter().map(Expr::sexpr).collect();
-                format!("(call {} {})", callee.sexpr(), args.join(" "))
+                format!(
+                    "(call {}{} {})",
+                    callee.sexpr(),
+                    show_type_args(type_args),
+                    args.join(" ")
+                )
             }
             Expr::Field {
                 base,
@@ -387,12 +415,22 @@ impl Expr {
                 let op = if *optional { "?." } else { "." };
                 format!("({op} {} {})", base.sexpr(), name)
             }
-            Expr::StructLit { name, fields, .. } => {
+            Expr::StructLit {
+                name,
+                type_args,
+                fields,
+                ..
+            } => {
                 let fs: Vec<String> = fields
                     .iter()
                     .map(|(k, v)| format!("{}={}", k, v.sexpr()))
                     .collect();
-                format!("(struct {} {})", name, fs.join(" "))
+                format!(
+                    "(struct {}{} {})",
+                    name,
+                    show_type_args(type_args),
+                    fs.join(" ")
+                )
             }
             Expr::ArrayLit { elements, .. } => {
                 let es: Vec<String> = elements.iter().map(Expr::sexpr).collect();
@@ -401,6 +439,38 @@ impl Expr {
             Expr::Index { base, index, .. } => {
                 format!("(idx {} {})", base.sexpr(), index.sexpr())
             }
+        }
+    }
+}
+
+/// `<a, b>` when present, empty when not — sexpr rendering of type
+/// arguments.
+#[cfg(test)]
+fn show_type_args(args: &[TypeAnn]) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = args.iter().map(TypeAnn::show).collect();
+    format!("<{}>", parts.join(", "))
+}
+
+impl TypeAnn {
+    /// The annotation as written — shape assertions in tests.
+    #[cfg(test)]
+    pub fn show(&self) -> String {
+        match self {
+            TypeAnn::Int => "int".to_string(),
+            TypeAnn::Float => "float".to_string(),
+            TypeAnn::Bool => "bool".to_string(),
+            TypeAnn::Str => "string".to_string(),
+            TypeAnn::File => "file".to_string(),
+            TypeAnn::Named(n) => n.clone(),
+            TypeAnn::Applied(n, args) => format!("{n}{}", show_type_args(args)),
+            TypeAnn::Resolved(t) => t.name(),
+            TypeAnn::ErrCode => "error".to_string(),
+            TypeAnn::ErrUnion(inner) => format!("{}!", inner.show()),
+            TypeAnn::Optional(inner) => format!("{}?", inner.show()),
+            TypeAnn::Array(inner) => format!("{}[]", inner.show()),
         }
     }
 }

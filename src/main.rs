@@ -87,7 +87,7 @@ fn run() {
     };
     exit_on_errors(&diags, &map);
 
-    let (resolutions, check_diags) = check::check(&graph);
+    let (resolutions, check_diags) = check::check(&graph, &mut map);
     exit_on_errors(&check_diags, &map);
 
     let entry_main = graph.modules[0].ast.iter().find_map(|item| match item {

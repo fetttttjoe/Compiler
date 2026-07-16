@@ -9,6 +9,8 @@ fn run(src: &str) -> Result<Value, Diagnostic> {
 
 /// Like `run`, but keeps the heap for rendering assertions.
 fn run_full(src: &str) -> Result<(Value, Heap), Diagnostic> {
+    let mut map = SourceMap::new();
+    map.add("test.ys", src);
     let (tokens, ld) = lex(src);
     assert!(ld.is_empty(), "lex: {ld:?}");
     let (ast, pd) = parse(&tokens);
@@ -20,7 +22,7 @@ fn run_full(src: &str) -> Result<(Value, Heap), Diagnostic> {
             imports: Vec::new(),
         }],
     };
-    let (res, cd) = check(&graph);
+    let (res, cd) = check(&graph, &mut map);
     assert!(cd.is_empty(), "check: {cd:?}");
     interpret(&graph, &res, &[])
 }
@@ -40,7 +42,7 @@ fn run_multi(files: &[(&str, &str)]) -> Result<Value, Diagnostic> {
     let mut map = SourceMap::new();
     let (graph, fd) = load_program(files[0].0, &mut read, &mut map).unwrap();
     assert!(fd.is_empty(), "front-end: {fd:?}");
-    let (res, cd) = check(&graph);
+    let (res, cd) = check(&graph, &mut map);
     assert!(cd.is_empty(), "check: {cd:?}");
     interpret(&graph, &res, &[]).map(|(value, _)| value)
 }

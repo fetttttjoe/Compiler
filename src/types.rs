@@ -60,6 +60,45 @@ pub(crate) fn unconstrained(t: &Type) -> bool {
     }
 }
 
+/// The canonical rendering of a type inside instance names (ADR 0035):
+/// like `name()`, but struct arguments carry their defining module
+/// (`P#2`) so same-named structs from different modules never collide
+/// — in instance keys or in `Type::Struct` equality.
+pub(crate) fn canon_name(t: &Type) -> String {
+    match t {
+        Type::Struct(m, n) => format!("{n}#{m}"),
+        Type::Optional(inner) => format!("{}?", canon_name(inner)),
+        Type::Array(inner) => format!("{}[]", canon_name(inner)),
+        Type::ErrUnion(inner) => format!("{}!", canon_name(inner)),
+        other => other.name(),
+    }
+}
+
+/// The canonical instance name for a template applied to `args` — the
+/// identity both engines key on (ADR 0035).
+pub(crate) fn instance_name(base: &str, args: &[Type]) -> String {
+    let parts: Vec<String> = args.iter().map(canon_name).collect();
+    format!("{base}<{}>", parts.join(", "))
+}
+
+/// Strips the `#N` module qualifiers out of a canonical name for
+/// display — `Pair<int, P#2>` renders as `Pair<int, P>`. `#` cannot
+/// appear in identifiers, so stripping is unambiguous.
+pub(crate) fn pretty(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '#' {
+            while chars.peek().is_some_and(char::is_ascii_digit) {
+                chars.next();
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 impl Type {
     pub fn name(&self) -> String {
         match self {
@@ -68,6 +107,9 @@ impl Type {
             Type::Bool => "bool".to_string(),
             Type::Str => "string".to_string(),
             Type::File => "file".to_string(),
+            // Instances store canonical names; display strips the
+            // module qualifiers (ADR 0035).
+            Type::Struct(_, n) if n.contains('#') => pretty(n),
             Type::Struct(_, n) => n.clone(),
             Type::Optional(inner) => format!("{}?", inner.name()),
             Type::Array(inner) if unconstrained(inner) => "[]".to_string(),

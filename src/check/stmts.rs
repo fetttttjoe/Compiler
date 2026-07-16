@@ -6,7 +6,7 @@
 
 use super::*;
 
-impl Checker<'_> {
+impl Checker<'_, '_> {
     pub(super) fn check_function(&mut self, f: &Function) {
         let sig = self.sigs[&(self.module, f.name.clone())].clone();
         self.ret = sig.ret;
@@ -25,8 +25,13 @@ impl Checker<'_> {
         self.scopes.pop();
 
         if self.ret != Type::Unit && !poisoned(&self.ret) && !always_returns(&f.body) {
+            // `pretty` is the identity for source names; instances
+            // (ADR 0035) drop their module qualifiers.
             self.error(
-                format!("not all paths in function '{}' return a value", f.name),
+                format!(
+                    "not all paths in function '{}' return a value",
+                    crate::types::pretty(&f.name)
+                ),
                 f.span,
             );
         }
@@ -161,7 +166,7 @@ impl Checker<'_> {
             } => {
                 let ty = match ty {
                     Some(ann) => {
-                        let declared = resolve_type(ann, self.ty_alias, *span, self.diagnostics);
+                        let declared = self.resolve(ann, *span);
                         // Codegen gates bindings on this resolved type —
                         // never on the raw annotation.
                         self.let_types.insert(*span, declared.clone());

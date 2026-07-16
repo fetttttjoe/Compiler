@@ -1,0 +1,35 @@
+fun max<T>(a: T, b: T): T {
+    if a > b { return a; }
+    return b;
+}
+
+fun first<T>(xs: T[]): T {
+    return xs[0];
+}
+
+fun orElse<T>(v: T?, fallback: T): T {
+    if v != null { return v; }
+    return fallback;
+}
+
+fun sum(xs: int[]): int {
+    var total: int = 0;
+    for x in xs { total = total + x; }
+    return total;
+}
+
+fun map2<T>(xs: T[], ys: T[]): T[] {
+    return [first(xs), first(ys)];
+}
+
+fun main(): int {
+    print(max(3, 7));
+    print(max(2.5, 1.5));
+    print(max<int>(10, 4));
+    print(first(["a", "b"]));
+    print(orElse<int>(null, 9));
+    print(orElse("x", "y"));
+    print(sum(map2([1, 2], [3, 4])));
+    print(`max is ${max(5, 6)}`);
+    return max(40, 2);
+}

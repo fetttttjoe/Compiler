@@ -103,8 +103,34 @@ pub(crate) fn label_of(module: usize, name: &str) -> String {
     if module == 0 && name == syntax::ENTRY_FN {
         name.to_string()
     } else {
-        format!("{name}_{module}")
+        format!("{}_{module}", sanitize(name))
     }
+}
+
+/// Assembler-safe instance names (ADR 0035): the canonical mangle's
+/// specials map injectively onto `$`-codes (`$` never appears in user
+/// identifiers, so distinct canonicals stay distinct labels). Source
+/// names pass through untouched.
+pub(crate) fn sanitize(name: &str) -> String {
+    if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return name.to_string();
+    }
+    let mut out = String::with_capacity(name.len() + 8);
+    for c in name.chars() {
+        match c {
+            '<' => out.push_str("$l"),
+            '>' => out.push_str("$g"),
+            ',' => out.push_str("$c"),
+            '#' => out.push_str("$h"),
+            '?' => out.push_str("$q"),
+            '!' => out.push_str("$e"),
+            '[' => out.push_str("$b"),
+            ']' => out.push_str("$d"),
+            ' ' => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// The program's interned string literals: raw bytes in .rodata (no
@@ -195,7 +221,10 @@ pub fn compile(
     let mut printers = crate::ir::show::Printers::default();
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
-            if let Item::Function(f) = item {
+            // Generic templates compile per instance, below (ADR 0035).
+            if let Item::Function(f) = item
+                && f.type_params.is_empty()
+            {
                 // The int!-returning entry moves aside (sret convention);
                 // the C `main` below adapts (ADR 0034 decision 8).
                 if entry_errs && mi == 0 && f.name == syntax::ENTRY_FN {
@@ -220,6 +249,21 @@ pub fn compile(
                 )?);
             }
         }
+    }
+    // Monomorphized instances, in sorted order — assembly output stays
+    // deterministic (ADR 0035).
+    let mut instance_keys: Vec<&(usize, String)> = res.instances.keys().collect();
+    instance_keys.sort();
+    for key in instance_keys {
+        let f = &res.instances[key];
+        asm.push_str(&crate::ir::function(
+            f,
+            key.0,
+            res,
+            &mut strings,
+            &mut printers,
+            map,
+        )?);
     }
     if entry_errs {
         // The wrapper: forward argc/argv behind the sret pointer, then
@@ -270,7 +314,9 @@ pub fn dump_ir(
     let mut printers = crate::ir::show::Printers::default();
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
-            if let Item::Function(f) = item {
+            if let Item::Function(f) = item
+                && f.type_params.is_empty()
+            {
                 let ir = crate::ir::lower_function(f, mi, res, &mut strings, &mut printers, map)?;
                 if !output.is_empty() {
                     output.push('\n');
@@ -278,6 +324,16 @@ pub fn dump_ir(
                 let _ = writeln!(output, "{ir}");
             }
         }
+    }
+    let mut instance_keys: Vec<&(usize, String)> = res.instances.keys().collect();
+    instance_keys.sort();
+    for key in instance_keys {
+        let f = &res.instances[key];
+        let ir = crate::ir::lower_function(f, key.0, res, &mut strings, &mut printers, map)?;
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        let _ = writeln!(output, "{ir}");
     }
     for ir in printers.build(res, &mut strings) {
         if !output.is_empty() {

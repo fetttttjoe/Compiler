@@ -1,0 +1,43 @@
+struct Pair<T, U> { a: T, b: U }
+refstruct Box<T> { value: T }
+refstruct Node<T> { value: T, next: Node<T>? }
+
+fun swap<T, U>(p: Pair<T, U>): Pair<U, T> {
+    return Pair<U, T> { a: p.b, b: p.a };
+}
+
+fun push_front<T>(head: Node<T>?, value: T): Node<T> {
+    return Node<T> { value: value, next: head };
+}
+
+fun length<T>(head: Node<T>?): int {
+    var n: int = 0;
+    var cur: Node<T>? = head;
+    while cur != null {
+        n = n + 1;
+        cur = cur.next;
+    }
+    return n;
+}
+
+fun main(): int {
+    const p: Pair<int, string> = Pair<int, string> { a: 1, b: "one" };
+    print(p);
+    print(swap(p));
+    print(p == Pair<int, string> { a: 1, b: "one" });
+
+    var b: Box<int>= Box<int> { value: 41 };
+    b.value = b.value + 1;
+    print(b);
+
+    const nested: Box<Box<string>> = Box<Box<string>> { value: Box<string> { value: "deep" } };
+    print(nested.value.value);
+
+    var list: Node<int>? = null;
+    list = push_front(list, 3);
+    list = push_front(list, 2);
+    list = push_front(list, 1);
+    print(list);
+    print([Pair<int, int> { a: 1, b: 2 }, Pair<int, int> { a: 3, b: 4 }]);
+    return length(list);
+}

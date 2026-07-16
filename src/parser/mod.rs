@@ -6,8 +6,10 @@ use crate::diagnostic::Diagnostic;
 use crate::span::Span;
 use crate::token::{Token, TokenKind};
 
-pub struct Parser<'a> {
-    pub tokens: &'a [Token],
+pub struct Parser {
+    /// Owned so the type-argument closer can split a `>=` token into
+    /// `>` `=` in place (`var b: Box<int>= x`, ADR 0035).
+    pub tokens: Vec<Token>,
     pub pos: usize,
     pub diagnostics: Vec<Diagnostic>,
     /// False while parsing an `if`/`while` condition, where `x { … }` must
@@ -47,11 +49,11 @@ mod tests;
 /// The cursor and error machinery every grammar layer shares: peeking,
 /// consuming, expecting tokens, and the two safety budgets (recursion
 /// nesting, per-function operator count).
-impl<'a> Parser<'a> {
+impl Parser {
     /// Creates a parser over a token stream (which must end in `Eof`).
-    pub fn new(tokens: &'a [Token]) -> Parser<'a> {
+    pub fn new(tokens: &[Token]) -> Parser {
         Parser {
-            tokens,
+            tokens: tokens.to_vec(),
             pos: 0,
             diagnostics: Vec::new(),
             struct_literals_allowed: true,

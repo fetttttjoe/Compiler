@@ -6,7 +6,7 @@
 
 use super::*;
 
-impl Checker<'_> {
+impl Checker<'_, '_> {
     // Recursion here (and in every later pass) is stack-safe because the
     // parser bounds AST height at construction (`MAX_FN_OPS`), and the
     // pipeline runs on a worker stack sized for that bound (main.rs).
@@ -209,8 +209,13 @@ impl Checker<'_> {
                 };
                 self.check_binary(*op, lt, rt, *span)
             }
-            Expr::Call { callee, args, span } => {
-                let ty = self.check_call(callee, args, *span);
+            Expr::Call {
+                callee,
+                type_args,
+                args,
+                span,
+            } => {
+                let ty = self.check_call(callee, type_args, args, *span);
                 // The callee can mutate any shared refstruct it can reach,
                 // so field-path narrowing doesn't survive a call.
                 self.unnarrow_field_paths();
@@ -222,7 +227,12 @@ impl Checker<'_> {
                 optional,
                 span,
             } => self.check_field(base, name, *optional, *span),
-            Expr::StructLit { name, fields, span } => self.check_struct_lit(name, fields, *span),
+            Expr::StructLit {
+                name,
+                type_args,
+                fields,
+                span,
+            } => self.check_struct_lit(name, type_args, fields, *span),
             Expr::ArrayLit { elements, .. } => {
                 // The first element names the type; a later `null` widens
                 // it to optional; `[]` is unconstrained and fits any array
@@ -354,7 +364,13 @@ impl Checker<'_> {
         result
     }
 
-    fn check_call(&mut self, callee: &Expr, args: &[Expr], span: Span) -> Type {
+    fn check_call(
+        &mut self,
+        callee: &Expr,
+        type_args: &[TypeAnn],
+        args: &[Expr],
+        span: Span,
+    ) -> Type {
         let name = match callee {
             Expr::Ident(n, _) => n.clone(),
             _ => {
@@ -468,6 +484,14 @@ impl Checker<'_> {
             }
             return Type::Error;
         };
+        if self.mono.fn_templates.contains_key(target) {
+            let target = target.clone();
+            return self.check_generic_call(&name, target, type_args, args, span);
+        }
+        if !type_args.is_empty() {
+            self.error(format!("'{name}' takes no type arguments"), span);
+        }
+        self.call_targets.insert(span, target.clone());
         let sig = &sigs[target];
         if args.len() != sig.params.len() {
             self.error(
@@ -497,6 +521,175 @@ impl Checker<'_> {
             }
         }
         sig.ret.clone()
+    }
+
+    /// A call to a generic template (ADR 0035): pin the type parameters
+    /// — explicitly, or by unifying parameter annotations against the
+    /// argument types — then check arguments against the substituted
+    /// signature, record the call target, and enqueue the instance.
+    fn check_generic_call(
+        &mut self,
+        name: &str,
+        tkey: (usize, String),
+        type_args: &[TypeAnn],
+        args: &[Expr],
+        span: Span,
+    ) -> Type {
+        let tmpl = self.mono.fn_templates[&tkey];
+        let tparams: Vec<&str> = tmpl.type_params.iter().map(|(n, _)| n.as_str()).collect();
+        let (tmpl_params, tmpl_ret, tmpl_span) = (&tmpl.params, &tmpl.return_type, tmpl.span);
+        // Arguments type first — inference needs them, and their own
+        // errors must not vanish behind inference noise.
+        let arg_tys: Vec<Type> = args.iter().map(|a| self.type_of_expr(a)).collect();
+        if args.len() != tmpl_params.len() {
+            self.error(
+                format!(
+                    "function '{}' expects {} argument(s), found {}",
+                    name,
+                    tmpl_params.len(),
+                    args.len()
+                ),
+                span,
+            );
+            return Type::Error;
+        }
+        let bind: HashMap<String, Type> = if !type_args.is_empty() {
+            if type_args.len() != tparams.len() {
+                self.error(
+                    format!(
+                        "'{}' expects {} type argument(s), found {}",
+                        name,
+                        tparams.len(),
+                        type_args.len()
+                    ),
+                    span,
+                );
+                return Type::Error;
+            }
+            // Explicit arguments resolve in the caller's view — they
+            // were written here.
+            let resolved: Vec<Type> = type_args.iter().map(|a| self.resolve(a, span)).collect();
+            if resolved.iter().any(poisoned) {
+                return Type::Error; // the argument already reported
+            }
+            tparams
+                .iter()
+                .map(|n| n.to_string())
+                .zip(resolved)
+                .collect()
+        } else {
+            let mut bind = HashMap::new();
+            let tset: std::collections::HashSet<&str> = tparams.iter().copied().collect();
+            for (p, at) in tmpl_params.iter().zip(&arg_tys) {
+                if let Err((tp, a, b)) = super::generics::unify(
+                    &p.ty,
+                    at,
+                    &tset,
+                    &mut bind,
+                    &self.mono.struct_args,
+                    self.ty_alias,
+                ) {
+                    self.error(
+                        format!(
+                            "conflicting types for '{tp}': {} vs {}",
+                            self.type_name(&a),
+                            self.type_name(&b)
+                        ),
+                        span,
+                    );
+                    return Type::Error;
+                }
+            }
+            if arg_tys.iter().any(poisoned) && bind.len() != tparams.len() {
+                return Type::Error; // broken arguments already reported
+            }
+            for tp in &tparams {
+                if !bind.contains_key(*tp) {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!("cannot infer '{tp}' from the arguments"), span)
+                            .with_help(format!("write the type argument: '{name}<…>(…)'")),
+                    );
+                    return Type::Error;
+                }
+            }
+            bind
+        };
+        // The instance signature: template annotations substituted,
+        // resolved in the template's own module (ADR 0035 decision 7).
+        let mut params = Vec::with_capacity(tmpl_params.len());
+        for p in tmpl_params {
+            let ann = super::generics::substitute_ann(&p.ty, &bind);
+            let mut cx = TypeCx {
+                module: tkey.0,
+                ty_aliases: self.ty_aliases,
+                mono: self.mono,
+                diags: self.diagnostics,
+            };
+            let ty = resolve_type(&ann, &mut cx, span);
+            if matches!(ty, Type::ErrUnion(_)) {
+                self.error(
+                    "error unions in parameters are not yet supported".to_string(),
+                    tmpl_span,
+                );
+            }
+            params.push(ty);
+        }
+        let ret = match tmpl_ret {
+            Some(t) => {
+                let ann = super::generics::substitute_ann(t, &bind);
+                let mut cx = TypeCx {
+                    module: tkey.0,
+                    ty_aliases: self.ty_aliases,
+                    mono: self.mono,
+                    diags: self.diagnostics,
+                };
+                resolve_type(&ann, &mut cx, span)
+            }
+            None => Type::Unit,
+        };
+        // Argument fit against the substituted parameters; literal
+        // re-recording keeps the type table concrete for the engines.
+        for ((arg, at), expected) in args.iter().zip(&arg_tys).zip(&params) {
+            if poisoned(at) {
+                continue;
+            }
+            if matches!(arg, Expr::ArrayLit { .. }) && self.check_literal_against(arg, expected) {
+                continue;
+            }
+            if !fits(at, expected) {
+                self.error(
+                    format!(
+                        "expected argument of type {}, found {}",
+                        self.type_name(expected),
+                        self.type_name(at)
+                    ),
+                    arg.span(),
+                );
+            }
+        }
+        // Register the instance and resolve this call site to it.
+        let ordered: Vec<Type> = tparams.iter().map(|n| bind[*n].clone()).collect();
+        let ikey = super::generics::fn_instance_key(&tkey, &ordered);
+        self.call_targets.insert(span, ikey.clone());
+        if self.mono.requested.insert(ikey) {
+            if self.inst_depth >= super::generics::DEPTH_CAP {
+                self.error(
+                    format!(
+                        "generic instantiation exceeds depth {} — is '{name}' expanding forever?",
+                        super::generics::DEPTH_CAP
+                    ),
+                    span,
+                );
+            } else {
+                let depth = self.inst_depth + 1;
+                self.mono.work.push(super::generics::FnWork {
+                    template: tkey,
+                    args: ordered,
+                    depth,
+                });
+            }
+        }
+        ret
     }
 
     /// Bidirectional check for array literals at declared positions: the
@@ -583,6 +776,7 @@ impl Checker<'_> {
             return Type::Error;
         };
         let field_ty = self
+            .mono
             .structs
             .get(&(*sm, struct_name.clone()))
             .and_then(|st| {
@@ -631,9 +825,14 @@ impl Checker<'_> {
         }
     }
 
-    fn check_struct_lit(&mut self, name: &str, fields: &[(String, Expr)], span: Span) -> Type {
-        let structs = self.structs;
-        let Some(key) = self.ty_alias.get(name) else {
+    fn check_struct_lit(
+        &mut self,
+        name: &str,
+        type_args: &[TypeAnn],
+        fields: &[(String, Expr)],
+        span: Span,
+    ) -> Type {
+        let Some(key) = self.ty_alias.get(name).cloned() else {
             self.diagnostics.push(
                 Diagnostic::error(format!("unknown struct '{name}'"), span)
                     .suggest(name, self.ty_alias.keys().map(String::as_str)),
@@ -643,7 +842,42 @@ impl Checker<'_> {
             }
             return Type::Error;
         };
-        let decl = &structs[key];
+        // A generic literal instantiates its template (ADR 0035);
+        // explicit arguments only — fields never drive inference.
+        let key = if self.mono.struct_templates.contains_key(&key) {
+            if type_args.is_empty() {
+                self.error(
+                    format!("struct '{name}' is generic — write '{name}<…> {{ … }}'"),
+                    span,
+                );
+                for (_, value) in fields {
+                    self.type_of_expr(value);
+                }
+                return Type::Error;
+            }
+            let args: Vec<Type> = type_args.iter().map(|a| self.resolve(a, span)).collect();
+            let mut cx = TypeCx {
+                module: self.module,
+                ty_aliases: self.ty_aliases,
+                mono: self.mono,
+                diags: self.diagnostics,
+            };
+            match instantiate_struct(&key, args, &mut cx, span) {
+                Type::Struct(m, n) => (m, n),
+                _ => {
+                    for (_, value) in fields {
+                        self.type_of_expr(value);
+                    }
+                    return Type::Error;
+                }
+            }
+        } else {
+            if !type_args.is_empty() {
+                self.error(format!("'{name}' takes no type arguments"), span);
+            }
+            key
+        };
+        let decl = self.mono.structs[&key].clone();
         let mut seen = HashSet::new();
         for (fname, value) in fields {
             if !seen.insert(fname.clone()) {
@@ -659,6 +893,8 @@ impl Checker<'_> {
             }
             let got = self.type_of_expr(value);
             match decl.fields.iter().find(|(dn, _)| dn == fname) {
+                // (decl is a clone — the layout table can grow while
+                // field values type-check.)
                 Some((_, expected)) => {
                     if !fits(&got, expected) {
                         self.error(
@@ -703,7 +939,11 @@ impl Checker<'_> {
 
     fn is_by_ref(&self, t: &Type) -> bool {
         match t {
-            Type::Struct(m, n) => self.structs.get(&(*m, n.clone())).is_some_and(|s| s.by_ref),
+            Type::Struct(m, n) => self
+                .mono
+                .structs
+                .get(&(*m, n.clone()))
+                .is_some_and(|s| s.by_ref),
             _ => false,
         }
     }

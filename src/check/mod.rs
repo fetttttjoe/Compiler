@@ -4,11 +4,15 @@ use crate::ast::{BinOp, Conv, Expr, Function, Item, Stmt, TypeAnn, UnOp};
 use crate::diagnostic::Diagnostic;
 use crate::modules::ModuleGraph;
 use crate::narrow::{Fact, NarrowFrame, body_effects, condition_facts, covers, diverges};
+use crate::source::SourceMap;
 use crate::span::Span;
 use crate::syntax;
 use crate::types::{
-    FnSig, StructType, Type, eq_comparable, fits, is_numeric, poisoned, unconstrained,
+    FnSig, StructType, Type, eq_comparable, fits, instance_name, is_numeric, poisoned, pretty,
+    unconstrained,
 };
+
+use generics::{DEPTH_CAP, FnWork, Mono, instantiate_fn, substitute_ann};
 
 /// A per-module view: visible name → the (module, name) that defines it.
 pub type Alias = HashMap<String, (usize, String)>;
@@ -17,14 +21,19 @@ pub type Alias = HashMap<String, (usize, String)>;
 /// each callable name maps to its defining (module, name), locals and imports
 /// alike. Consumed by the interpreter (and later codegen).
 pub struct Resolutions {
-    pub functions: Vec<Alias>,
-    /// Per module: the visible type names that denote `refstruct`s, so the
-    /// interpreter (and later codegen) knows which literals allocate a
-    /// shared object instead of a value.
-    pub ref_structs: Vec<HashSet<String>>,
     /// Every struct definition by (defining module, name) — the type
     /// exports ADR 0009 reserved for codegen (field layout and by_ref).
+    /// Generic instances live here under their canonical names
+    /// (ADR 0035); templates never do.
     pub structs: HashMap<(usize, String), StructType>,
+    /// Every resolved user-function call, keyed by the call's span —
+    /// total, like the type table (ADR 0035). Both engines resolve
+    /// calls through it; an absent span means a builtin.
+    pub call_targets: HashMap<Span, (usize, String)>,
+    /// Monomorphized function bodies by instance key (ADR 0035):
+    /// substituted, respanned clones the engines run/lower after the
+    /// module ASTs. Templates themselves are never executable.
+    pub instances: HashMap<(usize, String), Function>,
     /// Field-access resolution for codegen: each `Field` expr's span maps
     /// to its base struct, field index, and field type. Spans are
     /// file-global offsets, so they key uniquely across the whole program.
@@ -63,8 +72,10 @@ struct ModuleNames {
 }
 
 /// Static type checking over the whole module graph. Empty diagnostics =
-/// well-typed program.
-pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
+/// well-typed program. `map` is the span authority: generic instances
+/// re-register their defining file to claim fresh span ranges
+/// (ADR 0035).
+pub fn check(graph: &ModuleGraph, map: &mut SourceMap) -> (Resolutions, Vec<Diagnostic>) {
     let mut diags = Vec::new();
 
     // Pass A: every module's own names + intra-file duplicate detection.
@@ -159,22 +170,54 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
         err_aliases.push(err_alias);
     }
 
-    // Pass C: resolve signatures and struct layouts through the alias maps;
-    // intern error codes deterministically (module index, then declaration
-    // order) — codes start at 2 (ADR 0034 tag space).
+    // Pass C: resolve signatures and struct layouts through the alias
+    // maps; intern error codes deterministically (module index, then
+    // declaration order) — codes start at 2 (ADR 0034 tag space).
+    // Generic declarations register as templates instead (ADR 0035):
+    // their annotations reference type parameters, so signatures and
+    // layouts exist only per instance.
     let mut sigs: HashMap<(usize, String), FnSig> = HashMap::new();
-    let mut structs: HashMap<(usize, String), StructType> = HashMap::new();
+    let mut mono = Mono::new();
     let mut error_codes: HashMap<(usize, String), u32> = HashMap::new();
     let mut error_names: Vec<String> = Vec::new();
+    // Templates first: a monomorphic signature may apply a generic
+    // struct declared anywhere in the graph.
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             match item {
-                Item::Struct(s) => {
+                Item::Struct(s) if !s.type_params.is_empty() => {
+                    check_type_params(&s.type_params, &ty_aliases[mi], &mut diags);
+                    mono.struct_templates.insert((mi, s.name.clone()), s);
+                }
+                Item::Function(f) if !f.type_params.is_empty() => {
+                    check_type_params(&f.type_params, &ty_aliases[mi], &mut diags);
+                    if f.name == syntax::ENTRY_FN && mi == 0 {
+                        diags.push(Diagnostic::error(
+                            format!("'{}' cannot be generic", syntax::ENTRY_FN),
+                            f.span,
+                        ));
+                    }
+                    mono.fn_templates.insert((mi, f.name.clone()), f);
+                }
+                _ => {}
+            }
+        }
+    }
+    for (mi, module) in graph.modules.iter().enumerate() {
+        for item in &module.ast {
+            match item {
+                Item::Struct(s) if s.type_params.is_empty() => {
                     let fields = s
                         .fields
                         .iter()
                         .map(|f| {
-                            let ty = resolve_type(&f.ty, &ty_aliases[mi], s.span, &mut diags);
+                            let mut cx = TypeCx {
+                                module: mi,
+                                ty_aliases: &ty_aliases,
+                                mono: &mut mono,
+                                diags: &mut diags,
+                            };
+                            let ty = resolve_type(&f.ty, &mut cx, s.span);
                             if matches!(ty, Type::ErrUnion(_)) {
                                 diags.push(Diagnostic::error(
                                     "error unions in struct fields are not yet supported"
@@ -185,7 +228,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                             (f.name.clone(), ty)
                         })
                         .collect();
-                    structs.insert(
+                    mono.structs.insert(
                         (mi, s.name.clone()),
                         StructType {
                             fields,
@@ -193,28 +236,11 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                         },
                     );
                 }
-                Item::Function(f) => {
-                    let params = f
-                        .params
-                        .iter()
-                        .map(|p| {
-                            let ty = resolve_type(&p.ty, &ty_aliases[mi], f.span, &mut diags);
-                            if matches!(ty, Type::ErrUnion(_)) {
-                                diags.push(Diagnostic::error(
-                                    "error unions in parameters are not yet supported".to_string(),
-                                    f.span,
-                                ));
-                            }
-                            ty
-                        })
-                        .collect();
-                    let ret = match &f.return_type {
-                        Some(t) => resolve_type(t, &ty_aliases[mi], f.span, &mut diags),
-                        None => Type::Unit,
-                    };
-                    sigs.insert((mi, f.name.clone()), FnSig { params, ret });
+                Item::Function(f) if f.type_params.is_empty() => {
+                    let sig = resolve_signature(f, mi, &ty_aliases, &mut mono, &mut diags);
+                    sigs.insert((mi, f.name.clone()), sig);
                 }
-                Item::Import(_) => {}
+                Item::Struct(_) | Item::Function(_) | Item::Import(_) => {}
                 Item::Error(e) => {
                     for (name, _) in &e.names {
                         // Duplicates were diagnosed in collect_names; the
@@ -231,45 +257,155 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
         }
     }
 
-    // Pass D: check every function body against its module's view.
+    // Pass D: check every monomorphic function body against its
+    // module's view. Generic bodies are checked per instance (pass E).
     let paths: Vec<&str> = graph.modules.iter().map(|m| m.path.as_str()).collect();
     let mut field_slots = HashMap::new();
     let mut expr_types = HashMap::new();
     let mut let_types = HashMap::new();
     let mut error_lits = HashMap::new();
+    let mut call_targets = HashMap::new();
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
-            if let Item::Function(f) = item {
+            if let Item::Function(f) = item
+                && f.type_params.is_empty()
+            {
                 let mut checker = Checker {
                     module: mi,
                     paths: &paths,
                     fn_alias: &fn_aliases[mi],
                     ty_alias: &ty_aliases[mi],
+                    ty_aliases: &ty_aliases,
                     err_alias: &err_aliases[mi],
                     error_codes: &error_codes,
                     sigs: &sigs,
-                    structs: &structs,
+                    mono: &mut mono,
                     diagnostics: &mut diags,
                     scopes: Vec::new(),
                     nonnull: Vec::new(),
                     loop_depth: 0,
                     ret: Type::Unit,
                     try_ok: false,
+                    inst_depth: 0,
                     field_slots: &mut field_slots,
                     expr_types: &mut expr_types,
                     let_types: &mut let_types,
                     error_lits: &mut error_lits,
+                    call_targets: &mut call_targets,
                 };
                 checker.check_function(f);
             }
         }
     }
 
+    // Pass E: drain the monomorphization worklist (ADR 0035). Each
+    // instance re-registers its defining file for a fresh span range,
+    // clones the template with parameters substituted, and checks the
+    // clone like any function — which may enqueue more work.
+    let mut instances: HashMap<(usize, String), Function> = HashMap::new();
+    while let Some(FnWork {
+        template,
+        args,
+        depth,
+    }) = mono.work.pop()
+    {
+        let tmpl = mono.fn_templates[&template];
+        let ikey = generics::fn_instance_key(&template, &args);
+        let bind: HashMap<String, Type> = tmpl
+            .type_params
+            .iter()
+            .map(|(n, _)| n.clone())
+            .zip(args.iter().cloned())
+            .collect();
+        // The instance signature: template annotations substituted,
+        // then resolved in the template's own module (decision 7).
+        let mi = template.0;
+        let params = tmpl
+            .params
+            .iter()
+            .map(|p| {
+                let ann = substitute_ann(&p.ty, &bind);
+                let mut cx = TypeCx {
+                    module: mi,
+                    ty_aliases: &ty_aliases,
+                    mono: &mut mono,
+                    diags: &mut diags,
+                };
+                let ty = resolve_type(&ann, &mut cx, tmpl.span);
+                if matches!(ty, Type::ErrUnion(_)) {
+                    diags.push(Diagnostic::error(
+                        "error unions in parameters are not yet supported".to_string(),
+                        tmpl.span,
+                    ));
+                }
+                ty
+            })
+            .collect();
+        let ret = match &tmpl.return_type {
+            Some(t) => {
+                let ann = substitute_ann(t, &bind);
+                let mut cx = TypeCx {
+                    module: mi,
+                    ty_aliases: &ty_aliases,
+                    mono: &mut mono,
+                    diags: &mut diags,
+                };
+                resolve_type(&ann, &mut cx, tmpl.span)
+            }
+            None => Type::Unit,
+        };
+        sigs.insert(ikey.clone(), FnSig { params, ret });
+        // The respan: re-register the defining file, shift by the
+        // delta. A module whose file never loaded already has its own
+        // diagnostic — skip quietly.
+        let Some((fname, ftext, fbase)) = map
+            .files()
+            .iter()
+            .find(|f| f.name() == graph.modules[mi].path)
+            .map(|f| (f.name().to_string(), f.text().to_string(), f.base()))
+        else {
+            continue;
+        };
+        let delta = map.add(fname, ftext) - fbase;
+        let inst = instantiate_fn(tmpl, ikey.1.clone(), &bind, delta);
+        let before = diags.len();
+        let mut checker = Checker {
+            module: mi,
+            paths: &paths,
+            fn_alias: &fn_aliases[mi],
+            ty_alias: &ty_aliases[mi],
+            ty_aliases: &ty_aliases,
+            err_alias: &err_aliases[mi],
+            error_codes: &error_codes,
+            sigs: &sigs,
+            mono: &mut mono,
+            diagnostics: &mut diags,
+            scopes: Vec::new(),
+            nonnull: Vec::new(),
+            loop_depth: 0,
+            ret: Type::Unit,
+            try_ok: false,
+            inst_depth: depth,
+            field_slots: &mut field_slots,
+            expr_types: &mut expr_types,
+            let_types: &mut let_types,
+            error_lits: &mut error_lits,
+            call_targets: &mut call_targets,
+        };
+        checker.check_function(&inst);
+        // Instance errors point at the template's true source line;
+        // the prefix names which instantiation tripped them.
+        for d in diags[before..].iter_mut() {
+            d.message = format!("in '{}': {}", pretty(&ikey.1), d.message);
+        }
+        instances.insert(ikey, inst);
+    }
+
     // Entry rule, owned by the checker so every entry path agrees:
     // `main()` or `main(args: string[])` (ADR 0031) — the interpreter
     // passes the program arguments, compiled main materializes argv.
     if let Some(f) = graph.modules[0].ast.iter().find_map(|item| match item {
-        Item::Function(f) if f.name == syntax::ENTRY_FN => Some(f),
+        Item::Function(f) if f.name == syntax::ENTRY_FN && f.type_params.is_empty() => Some(f),
         _ => None,
     }) {
         let ok = match f.params.as_slice() {
@@ -288,22 +424,11 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
         }
     }
 
-    let ref_structs = ty_aliases
-        .iter()
-        .map(|alias| {
-            alias
-                .iter()
-                .filter(|(_, key)| structs.get(*key).is_some_and(|s| s.by_ref))
-                .map(|(name, _)| name.clone())
-                .collect()
-        })
-        .collect();
-
     (
         Resolutions {
-            functions: fn_aliases,
-            ref_structs,
-            structs,
+            structs: mono.structs,
+            call_targets,
+            instances,
             field_slots,
             sigs,
             expr_types,
@@ -313,6 +438,68 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
         },
         diags,
     )
+}
+
+/// A monomorphic function's signature, resolved in its own module.
+fn resolve_signature(
+    f: &Function,
+    module: usize,
+    ty_aliases: &[Alias],
+    mono: &mut Mono,
+    diags: &mut Vec<Diagnostic>,
+) -> FnSig {
+    let params = f
+        .params
+        .iter()
+        .map(|p| {
+            let mut cx = TypeCx {
+                module,
+                ty_aliases,
+                mono,
+                diags,
+            };
+            let ty = resolve_type(&p.ty, &mut cx, f.span);
+            if matches!(ty, Type::ErrUnion(_)) {
+                diags.push(Diagnostic::error(
+                    "error unions in parameters are not yet supported".to_string(),
+                    f.span,
+                ));
+            }
+            ty
+        })
+        .collect();
+    let ret = match &f.return_type {
+        Some(t) => {
+            let mut cx = TypeCx {
+                module,
+                ty_aliases,
+                mono,
+                diags,
+            };
+            resolve_type(t, &mut cx, f.span)
+        }
+        None => Type::Unit,
+    };
+    FnSig { params, ret }
+}
+
+/// Duplicate and shadowing rules for `<T, U>` lists (ADR 0035): names
+/// must be distinct and must not shadow a visible type.
+fn check_type_params(params: &[(String, Span)], ty_alias: &Alias, diags: &mut Vec<Diagnostic>) {
+    for (i, (name, span)) in params.iter().enumerate() {
+        if params[..i].iter().any(|(n, _)| n == name) {
+            diags.push(Diagnostic::error(
+                format!("duplicate type parameter '{name}'"),
+                *span,
+            ));
+        }
+        if ty_alias.contains_key(name) {
+            diags.push(Diagnostic::error(
+                format!("type parameter '{name}' shadows the type '{name}'"),
+                *span,
+            ));
+        }
+    }
 }
 
 fn collect_names(ast: &[Item], diags: &mut Vec<Diagnostic>) -> ModuleNames {
@@ -355,7 +542,17 @@ fn collect_names(ast: &[Item], diags: &mut Vec<Diagnostic>) -> ModuleNames {
     names
 }
 
-fn resolve_type(ann: &TypeAnn, ty_alias: &Alias, span: Span, diags: &mut Vec<Diagnostic>) -> Type {
+/// Everything annotation resolution needs, bundled: the resolving
+/// module, every module's type view, the grow-only generic state, and
+/// the diagnostics sink (ADR 0035).
+struct TypeCx<'a, 'g> {
+    module: usize,
+    ty_aliases: &'a [Alias],
+    mono: &'a mut Mono<'g>,
+    diags: &'a mut Vec<Diagnostic>,
+}
+
+fn resolve_type(ann: &TypeAnn, cx: &mut TypeCx, span: Span) -> Type {
     match ann {
         TypeAnn::Int => Type::Int,
         TypeAnn::Float => Type::Float,
@@ -364,9 +561,9 @@ fn resolve_type(ann: &TypeAnn, ty_alias: &Alias, span: Span, diags: &mut Vec<Dia
         TypeAnn::File => Type::File,
         TypeAnn::ErrCode => Type::ErrCode,
         TypeAnn::ErrUnion(inner) => {
-            let inner = resolve_type(inner, ty_alias, span, diags);
+            let inner = resolve_type(inner, cx, span);
             if inner == Type::ErrCode {
-                diags.push(Diagnostic::error(
+                cx.diags.push(Diagnostic::error(
                     "'error!' is redundant — 'error' is already the code type".to_string(),
                     span,
                 ));
@@ -374,13 +571,11 @@ fn resolve_type(ann: &TypeAnn, ty_alias: &Alias, span: Span, diags: &mut Vec<Dia
             }
             Type::ErrUnion(Box::new(inner))
         }
-        TypeAnn::Optional(inner) => {
-            Type::Optional(Box::new(resolve_type(inner, ty_alias, span, diags)))
-        }
+        TypeAnn::Optional(inner) => Type::Optional(Box::new(resolve_type(inner, cx, span))),
         TypeAnn::Array(inner) => {
-            let inner = resolve_type(inner, ty_alias, span, diags);
+            let inner = resolve_type(inner, cx, span);
             if matches!(inner, Type::ErrUnion(_)) {
-                diags.push(Diagnostic::error(
+                cx.diags.push(Diagnostic::error(
                     "arrays of error unions are not yet supported".to_string(),
                     span,
                 ));
@@ -388,32 +583,144 @@ fn resolve_type(ann: &TypeAnn, ty_alias: &Alias, span: Span, diags: &mut Vec<Dia
             }
             Type::Array(Box::new(inner))
         }
-        TypeAnn::Named(name) => match ty_alias.get(name) {
-            Some((m, n)) => Type::Struct(*m, n.clone()),
-            None => {
-                diags.push(
-                    Diagnostic::error(format!("unknown type '{name}'"), span)
-                        .suggest(name, ty_alias.keys().map(String::as_str)),
-                );
-                Type::Error // recovery: already reported
+        // The monomorphizer's substitution carrier (ADR 0035).
+        TypeAnn::Resolved(t) => t.clone(),
+        // `Pair<int, string>` — instantiate the template (ADR 0035).
+        TypeAnn::Applied(name, args) => {
+            let Some(key) = cx.ty_aliases[cx.module].get(name).cloned() else {
+                return unknown_type(name, cx, span);
+            };
+            let args: Vec<Type> = args.iter().map(|a| resolve_type(a, cx, span)).collect();
+            instantiate_struct(&key, args, cx, span)
+        }
+        TypeAnn::Named(name) => match cx.ty_aliases[cx.module].get(name) {
+            Some(key) if cx.mono.struct_templates.contains_key(key) => {
+                cx.diags.push(Diagnostic::error(
+                    format!("struct '{name}' is generic — write '{name}<…>'"),
+                    span,
+                ));
+                Type::Error
             }
+            Some((m, n)) => Type::Struct(*m, n.clone()),
+            None => unknown_type(name, cx, span),
         },
     }
+}
+
+fn unknown_type(name: &str, cx: &mut TypeCx, span: Span) -> Type {
+    cx.diags.push(
+        Diagnostic::error(format!("unknown type '{name}'"), span)
+            .suggest(name, cx.ty_aliases[cx.module].keys().map(String::as_str)),
+    );
+    Type::Error // recovery: already reported
+}
+
+/// Instantiates a struct template at `args` (ADR 0035): the canonical
+/// key gets a layout entry with substituted field types, resolved in
+/// the template's own module. Self-referential templates terminate on
+/// the in-progress marker; diverging families (`A<T>` embedding
+/// `A<T[]>`) exhaust the depth fuel and diagnose.
+fn instantiate_struct(
+    tkey: &(usize, String),
+    args: Vec<Type>,
+    cx: &mut TypeCx,
+    span: Span,
+) -> Type {
+    let Some(tmpl) = cx.mono.struct_templates.get(tkey).copied() else {
+        // A monomorphic struct took type arguments.
+        cx.diags.push(Diagnostic::error(
+            format!("'{}' takes no type arguments", tkey.1),
+            span,
+        ));
+        return Type::Error;
+    };
+    if args.len() != tmpl.type_params.len() {
+        cx.diags.push(Diagnostic::error(
+            format!(
+                "'{}' expects {} type argument(s), found {}",
+                tkey.1,
+                tmpl.type_params.len(),
+                args.len()
+            ),
+            span,
+        ));
+        return Type::Error;
+    }
+    if args.iter().any(poisoned) {
+        return Type::Error; // the argument already reported
+    }
+    let ikey = (tkey.0, instance_name(&tkey.1, &args));
+    if !cx.mono.structs.contains_key(&ikey) {
+        if cx.mono.struct_depth >= DEPTH_CAP {
+            cx.diags.push(Diagnostic::error(
+                format!(
+                    "generic instantiation exceeds depth {DEPTH_CAP} — is '{}' expanding forever?",
+                    tkey.1
+                ),
+                span,
+            ));
+            return Type::Error;
+        }
+        // In-progress marker before field resolution: self-reference
+        // (`Node<T>` holding `Node<T>?`) must find the key and stop.
+        cx.mono.structs.insert(
+            ikey.clone(),
+            StructType {
+                fields: Vec::new(),
+                by_ref: tmpl.by_ref,
+            },
+        );
+        cx.mono
+            .struct_args
+            .insert(ikey.clone(), (tkey.clone(), args.clone()));
+        let bind: HashMap<String, Type> = tmpl
+            .type_params
+            .iter()
+            .map(|(n, _)| n.clone())
+            .zip(args)
+            .collect();
+        cx.mono.struct_depth += 1;
+        let outer_module = std::mem::replace(&mut cx.module, tkey.0);
+        let fields: Vec<(String, Type)> = tmpl
+            .fields
+            .iter()
+            .map(|f| {
+                let ann = substitute_ann(&f.ty, &bind);
+                let ty = resolve_type(&ann, cx, tmpl.span);
+                if matches!(ty, Type::ErrUnion(_)) {
+                    cx.diags.push(Diagnostic::error(
+                        "error unions in struct fields are not yet supported".to_string(),
+                        tmpl.span,
+                    ));
+                }
+                (f.name.clone(), ty)
+            })
+            .collect();
+        cx.module = outer_module;
+        cx.mono.struct_depth -= 1;
+        cx.mono.structs.get_mut(&ikey).expect("marker above").fields = fields;
+    }
+    Type::Struct(ikey.0, ikey.1)
 }
 struct VarInfo {
     ty: Type,
     mutable: bool,
 }
 
-struct Checker<'a> {
+struct Checker<'a, 'g> {
     module: usize,
     paths: &'a [&'a str],
     fn_alias: &'a Alias,
     ty_alias: &'a Alias,
+    /// Every module's type view — annotation resolution instantiates
+    /// generic structs in their defining module (ADR 0035).
+    ty_aliases: &'a [Alias],
     err_alias: &'a Alias,
     error_codes: &'a HashMap<(usize, String), u32>,
     sigs: &'a HashMap<(usize, String), FnSig>,
-    structs: &'a HashMap<(usize, String), StructType>,
+    /// Generic templates, instantiation state, and the struct-layout
+    /// table (grow-only, ADR 0035).
+    mono: &'a mut Mono<'g>,
     diagnostics: &'a mut Vec<Diagnostic>,
     scopes: Vec<HashMap<String, VarInfo>>,
     /// Narrowing stack: place paths (`cur`, `cur.left`) proven non-null by
@@ -431,23 +738,41 @@ struct Checker<'a> {
     /// ONLY by `type_of_rhs`; taken (and reset) at every
     /// `type_of_expr` entry, so operands never inherit it.
     try_ok: bool,
+    /// Instantiation-chain depth of the body being checked — 0 for
+    /// source functions; instances carry their chain depth so
+    /// transitive requests can hit the cap (ADR 0035).
+    inst_depth: u32,
     /// Codegen resolution tables filled in as expressions type (see
-    /// `Resolutions::field_slots` / `struct_lits`).
+    /// `Resolutions::field_slots` / `call_targets`).
     field_slots: &'a mut HashMap<Span, FieldSlot>,
     expr_types: &'a mut HashMap<Span, Type>,
     let_types: &'a mut HashMap<Span, Type>,
     error_lits: &'a mut HashMap<Span, u32>,
+    call_targets: &'a mut HashMap<Span, (usize, String)>,
 }
 
 mod exprs;
+mod generics;
 mod stmts;
 #[cfg(test)]
 mod tests;
 
 /// Shared plumbing: diagnostics, name rendering, and scope helpers.
-impl<'a> Checker<'a> {
+impl Checker<'_, '_> {
     fn error(&mut self, message: String, span: Span) {
         self.diagnostics.push(Diagnostic::error(message, span));
+    }
+
+    /// Annotation resolution from inside body checking — the checker's
+    /// parts, bundled into the shared context (ADR 0035).
+    fn resolve(&mut self, ann: &TypeAnn, span: Span) -> Type {
+        let mut cx = TypeCx {
+            module: self.module,
+            ty_aliases: self.ty_aliases,
+            mono: self.mono,
+            diags: self.diagnostics,
+        };
+        resolve_type(ann, &mut cx, span)
     }
 
     /// A type name for messages: structs from *other* modules carry their

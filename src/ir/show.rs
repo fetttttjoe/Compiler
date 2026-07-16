@@ -368,7 +368,9 @@ fn routine(
             // order (ADR 0009 layout).
             let mut order: Vec<usize> = (0..def.fields.len()).collect();
             order.sort_by_key(|i| def.fields[*i].0.clone());
-            b.piece(&format!("{sname} {{ "));
+            // Instance names display without module qualifiers
+            // (ADR 0035) — the oracle's text, byte for byte.
+            b.piece(&format!("{} {{ ", crate::types::pretty(sname)));
             for (k, idx) in order.iter().enumerate() {
                 let (fname, ft) = &def.fields[*idx];
                 let sep = if k == 0 {
