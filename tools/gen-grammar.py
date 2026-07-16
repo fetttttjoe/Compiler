@@ -62,15 +62,25 @@ def keyword_patterns(spellings):
 def build_grammar():
     keywords = keywords_from_syntax()
     kw_rules = keyword_patterns(set(keywords.values()))
-    # The definition rule tracks KW_FUN's spelling, not a hardcoded "fun".
+    # The definition rules track the KW_* spellings, not hardcoded words.
     kw_fun = keywords["FUN"]
+    kw_struct = keywords["STRUCT"]
+    kw_refstruct = keywords["REFSTRUCT"]
+    # `<T, U>` guts — idents inside a parameter/argument list color as
+    # types (ADR 0035); punctuation stays plain.
+    type_params = {
+        "patterns": [
+            {"name": "entity.name.type.parameter.ys", "match": r"[A-Za-z_][A-Za-z0-9_]*"}
+        ]
+    }
     return {
         "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
         "name": "Ys",
         "scopeName": "source.ys",
         "patterns": [{"include": f"#{n}"} for n in (
             "comments", "strings", "templates", "function-definition",
-            "keywords", "numbers", "function-call", "operators",
+            "type-definition", "keywords", "numbers", "function-call",
+            "type-application", "operators",
         )],
         "repository": {
             "comments": {"name": "comment.line.double-slash.ys", "match": r"//.*$"},
@@ -99,17 +109,35 @@ def build_grammar():
                 ],
             },
             "function-definition": {
-                "match": rf"\b({kw_fun})\s+([A-Za-z_][A-Za-z0-9_]*)",
+                "match": rf"\b({kw_fun})\s+([A-Za-z_][A-Za-z0-9_]*)\s*(<[^<>]*>)?",
                 "captures": {
                     "1": {"name": "storage.type.function.ys"},
                     "2": {"name": "entity.name.function.ys"},
+                    "3": type_params,
+                },
+            },
+            "type-definition": {
+                "match": rf"\b({kw_struct}|{kw_refstruct})\s+([A-Za-z_][A-Za-z0-9_]*)\s*(<[^<>]*>)?",
+                "captures": {
+                    "1": {"name": "storage.type.ys"},
+                    "2": {"name": "entity.name.type.ys"},
+                    "3": type_params,
                 },
             },
             "keywords": {"patterns": kw_rules},
             "numbers": {"name": "constant.numeric.ys", "match": r"\b[0-9]+(\.[0-9]+)?\b"},
             "function-call": {
-                "match": r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()",
+                # A plain call, or one with explicit type arguments —
+                # `max<int>(x)` keeps its call color (ADR 0035).
+                "match": r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?=\(|<[A-Za-z_][\w\[\]?!, <>]*>\s*\()",
                 "name": "entity.name.function.call.ys",
+            },
+            "type-application": {
+                # `Pair<int, string>` in annotations and literals. The
+                # argument-list shape (type-ish characters only) keeps
+                # comparisons like `a < b && c > d` uncolored.
+                "match": r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?=<[A-Za-z_][\w\[\]?!, <>]*>)",
+                "name": "entity.name.type.ys",
             },
             "operators": {
                 "name": "keyword.operator.ys",

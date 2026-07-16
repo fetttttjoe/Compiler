@@ -16,6 +16,9 @@
       "include": "#function-definition"
     },
     {
+      "include": "#type-definition"
+    },
+    {
       "include": "#keywords"
     },
     {
@@ -23,6 +26,9 @@
     },
     {
       "include": "#function-call"
+    },
+    {
+      "include": "#type-application"
     },
     {
       "include": "#operators"
@@ -76,13 +82,40 @@
       ]
     },
     "function-definition": {
-      "match": "\\b(fun)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "match": "\\b(fun)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(<[^<>]*>)?",
       "captures": {
         "1": {
           "name": "storage.type.function.ys"
         },
         "2": {
           "name": "entity.name.function.ys"
+        },
+        "3": {
+          "patterns": [
+            {
+              "name": "entity.name.type.parameter.ys",
+              "match": "[A-Za-z_][A-Za-z0-9_]*"
+            }
+          ]
+        }
+      }
+    },
+    "type-definition": {
+      "match": "\\b(struct|refstruct)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(<[^<>]*>)?",
+      "captures": {
+        "1": {
+          "name": "storage.type.ys"
+        },
+        "2": {
+          "name": "entity.name.type.ys"
+        },
+        "3": {
+          "patterns": [
+            {
+              "name": "entity.name.type.parameter.ys",
+              "match": "[A-Za-z_][A-Za-z0-9_]*"
+            }
+          ]
         }
       }
     },
@@ -111,8 +144,12 @@
       "match": "\\b[0-9]+(\\.[0-9]+)?\\b"
     },
     "function-call": {
-      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\(|<[A-Za-z_][\\w\\[\\]?!, <>]*>\\s*\\()",
       "name": "entity.name.function.call.ys"
+    },
+    "type-application": {
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=<[A-Za-z_][\\w\\[\\]?!, <>]*>)",
+      "name": "entity.name.type.ys"
     },
     "operators": {
       "name": "keyword.operator.ys",
