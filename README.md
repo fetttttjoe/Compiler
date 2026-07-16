@@ -24,6 +24,8 @@ export fun sum(tree: Tree?): int {
 - optionals — `T?`, `null`, `?.`, `??` — with flow-sensitive narrowing
 - growable arrays with `len`, `push`, and live `for` loops
 - loop control with `break` and `continue`
+- declared error codes, `T!` unions, and `try` propagation — failure
+  is a value, never an exception
 - template literals and explicit `string(x)` conversion
 - a world interface — `main(args: string[])`, stdin, and file handles
 - modules with explicit `import` / `export`

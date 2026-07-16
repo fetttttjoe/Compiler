@@ -8,10 +8,12 @@ The generator covers ints, bools, floats, strings, the conversions
 (int()/float()/string()), template literals, int arrays with for-in
 and push, control flow, int->int helper calls, int? optionals (null
 tests, ??, guard narrowing incl. the ADR 0033 guard-return-on-locals
-shape), and value structs (literals, field reads/writes, copy
-semantics, structural equality, aggregate printing). Refstructs,
-files, and errors are NOT generated yet - cover those manually (or
-extend the generator) when touching their lowering. A program whose
+shape), value structs (literals, field reads/writes, copy
+semantics, structural equality, aggregate printing), and error unions
+(ADR 0034: int! helpers, try chains, == error narrowing on both
+branches, whole-union printing). Refstructs and files are NOT
+generated yet - cover those manually (or extend the generator) when
+touching their lowering. A program whose
 float path traps int() at runtime is skipped like any other
 oracle-diagnosed run. A divergence saves the program next to this
 script and exits nonzero.
@@ -302,6 +304,30 @@ class Gen:
             f"print({n}({', '.join(str(r.randint(-9, 9)) for _ in range(arity))}));"
             for n, arity in names
         )
+        # Error unions (ADR 0034): an int! helper that may err, a try
+        # chain through a second helper, and a main-side narrowing test
+        # of both branches. Self-contained — e* names never enter the
+        # general pool, so no narrowing state needs modeling.
+        err_part = ""
+        if r.random() < 0.7:
+            k = r.randint(-3, 3)
+            a, b = r.randint(-6, 6), r.randint(-6, 6)
+            err_part = (
+                f"var e1: int! = tryboth({a}, {b}); "
+                f"print(e1); "
+                f"if e1 == error {{ print(e1 == error.Efuzz); }} "
+                f"else {{ print(e1 + 1); }} "
+            )
+            helpers.append(
+                "fun mayerr(n: int): int! { "
+                f"if n < {k} {{ return error.Efuzz; }} "
+                f"if n > 4 {{ return error.Egro; }} "
+                "return n * 3; } "
+                "fun tryboth(a: int, b: int): int! { "
+                "const x: int = try mayerr(a); "
+                "const y: int = try mayerr(b); "
+                "return x + y; }"
+            )
         arr = self.name("xs")
         stop = f"if ix == {r.randint(3, 5)} {{ break; }} " if r.random() < 0.5 else ""
         arr_part = (
@@ -310,9 +336,12 @@ class Gen:
         )
         ret = self.int_expr([])
         return "\n".join(
-            ["struct Pt { x: int, y: int }"]
+            ["struct Pt { x: int, y: int }", "error Efuzz, Egro;"]
             + helpers
-            + [f"fun main(): int {{ {main_body} {calls} {arr_part} return ({ret}) % 251; }}"]
+            + [
+                f"fun main(): int {{ {main_body} {calls} {err_part}{arr_part} "
+                f"return ({ret}) % 251; }}"
+            ]
         )
 
 
