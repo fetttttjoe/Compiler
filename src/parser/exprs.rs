@@ -147,19 +147,26 @@ impl Parser<'_> {
             TokenKind::True => Expr::Bool(true, tok.span),
             TokenKind::False => Expr::Bool(false, tok.span),
             TokenKind::Null => Expr::Null(tok.span),
-            // `error.Name` — an error-code literal (ADR 0034). Bare
-            // `error` in expression position arrives with `T!` tests.
+            // `error.Name` — an error-code literal; bare `error` is the
+            // state marker for `==`/`!=` tests (ADR 0034) — the checker
+            // rejects it anywhere else.
             TokenKind::ErrorKw => {
                 if self.eat(&TokenKind::Dot) {
                     let name_span = self.peek().span;
                     let name = self.expect_identifier();
                     Expr::ErrorLit(name, tok.span.to(name_span))
                 } else {
-                    self.error(
-                        "expected '.' and an error name after 'error'".to_string(),
-                        tok.span,
-                    );
-                    Expr::Null(tok.span) // recovery: already reported
+                    Expr::ErrorKind(tok.span)
+                }
+            }
+            // `try e` — loose binding: the operand is the whole rest of
+            // the expression, Zig-style (ADR 0034).
+            TokenKind::Try => {
+                let operand = self.parse_expr(0);
+                let span = tok.span.to(operand.span());
+                Expr::Try {
+                    expr: Box::new(operand),
+                    span,
                 }
             }
             TokenKind::StringLiteral(s) => Expr::Str(s, tok.span),

@@ -248,25 +248,23 @@ fn routine(
         // never match the oracle.
         Type::File => b.piece("file"),
         // A declared error code (ADR 0034): `error.Name` selected by
-        // code — codes start at 2, in declaration order.
-        // ponytail: linear compare chain; a code-indexed .rodata table
-        // if programs ever declare enough errors to feel it.
-        Type::ErrCode => {
+        // code.
+        Type::ErrCode => err_chain(&mut b, res, X),
+        // `T!` (ADR 0034): the tag decides — 0 renders the payload at
+        // the same depth (stored unwrapped in the oracle, like
+        // optionals), ≥2 renders the code's name.
+        Type::ErrUnion(inner) => {
+            let tag = b.load(X, 0);
+            let is_value = b.label();
             let end = b.label();
-            for (i, ename) in res.error_names.iter().enumerate() {
-                let c = b.fresh();
-                b.insts.push(Inst::BinImm {
-                    op: BinOp::Eq,
-                    dst: c,
-                    lhs: X,
-                    imm: (i + 2) as i64,
-                });
-                let next = b.label();
-                b.insts.push(Inst::BrZero(c, next));
-                b.piece(&format!("error.{ename}"));
-                b.insts.push(Inst::Jmp(end));
-                b.insts.push(Inst::Label(next));
-            }
+            b.insts.push(Inst::BrZero(tag, is_value));
+            err_chain(&mut b, res, tag);
+            b.insts.push(Inst::Jmp(end));
+            b.insts.push(Inst::Label(is_value));
+            let k = kind_of(inner, res, FUEL).expect("printable payload");
+            let v = b.child(X, 8, k);
+            let child = printers.request(inner, res);
+            b.show(&child, v, D);
             b.insts.push(Inst::Label(end));
         }
         // Value-shaped optional (request normalized the ref-shaped
@@ -390,6 +388,35 @@ fn routine(
         other => unreachable!("no show routine for {other:?}"),
     }
     b.ret();
+    finish(b, name)
+}
+
+/// Appends `error.Name` for the code in `v` — a linear compare chain
+/// over the declared errors, codes from 2 in declaration order
+/// (ADR 0034). Shared by the bare `error` routine and the `T!` error
+/// branch.
+// ponytail: linear chain; a code-indexed .rodata table if programs
+// ever declare enough errors to feel it.
+fn err_chain(b: &mut B, res: &Resolutions, v: V) {
+    let end = b.label();
+    for (i, ename) in res.error_names.iter().enumerate() {
+        let c = b.fresh();
+        b.insts.push(Inst::BinImm {
+            op: BinOp::Eq,
+            dst: c,
+            lhs: v,
+            imm: (i + 2) as i64,
+        });
+        let next = b.label();
+        b.insts.push(Inst::BrZero(c, next));
+        b.piece(&format!("error.{ename}"));
+        b.insts.push(Inst::Jmp(end));
+        b.insts.push(Inst::Label(next));
+    }
+    b.insts.push(Inst::Label(end));
+}
+
+fn finish(b: B, name: String) -> FunctionIr {
     let B { insts, vregs, .. } = b;
     FunctionIr {
         name,

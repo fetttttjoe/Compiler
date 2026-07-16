@@ -11,6 +11,18 @@ impl Checker<'_> {
     // parser bounds AST height at construction (`MAX_FN_OPS`), and the
     // pipeline runs on a worker stack sized for that bound (main.rs).
     pub(super) fn type_of_expr(&mut self, expr: &Expr) -> Type {
+        // `try` is statement-positioned (ADR 0034): the flag is taken at
+        // every entry, so operands never inherit it.
+        let try_allowed = std::mem::take(&mut self.try_ok);
+        if let Expr::Try { span, .. } = expr
+            && !try_allowed
+        {
+            self.error(
+                "'try' is only supported as the direct right-hand side of a binding, assignment, or return"
+                    .to_string(),
+                *span,
+            );
+        }
         let ty = self.type_of_expr_inner(expr);
         // The per-expression type table (Resolutions::expr_types) — the
         // one choke point every typing pass flows through.
@@ -29,6 +41,38 @@ impl Checker<'_> {
             // `error.Name` resolves through the module's error view; the
             // interned code lands span-keyed so the engines never resolve
             // a name themselves (ADR 0034).
+            Expr::ErrorKind(span) => {
+                self.error(
+                    "bare 'error' is only usable in '==' / '!=' tests against an error union"
+                        .to_string(),
+                    *span,
+                );
+                Type::Error
+            }
+            // `try e` — yields the value; the error returns from the
+            // enclosing function, whose type must be able to carry it
+            // (ADR 0034). Position was enforced at `type_of_expr`.
+            Expr::Try { expr, span } => {
+                let ty = self.type_of_expr(expr);
+                if poisoned(&ty) {
+                    return Type::Error;
+                }
+                let Type::ErrUnion(inner) = ty else {
+                    self.error(
+                        format!("'try' needs an error union, found {}", self.type_name(&ty)),
+                        *span,
+                    );
+                    return Type::Error;
+                };
+                if !matches!(self.ret, Type::ErrUnion(_)) {
+                    self.error(
+                        "'try' propagates an error, so the enclosing function must return 'T!'"
+                            .to_string(),
+                        *span,
+                    );
+                }
+                (*inner).clone()
+            }
             Expr::ErrorLit(name, span) => match self.err_alias.get(name) {
                 Some(key) => {
                     self.error_lits.insert(*span, self.error_codes[key]);
@@ -125,6 +169,32 @@ impl Checker<'_> {
                 }
             }
             Expr::Binary { op, lhs, rhs, span } => {
+                // `x == error` / `x != error` — the state test on an
+                // error union (ADR 0034). The marker never evaluates; it
+                // records unit for type-table totality.
+                if matches!(op, BinOp::Eq | BinOp::Ne)
+                    && (matches!(lhs.as_ref(), Expr::ErrorKind(_))
+                        || matches!(rhs.as_ref(), Expr::ErrorKind(_)))
+                {
+                    let (marker, place) = if matches!(lhs.as_ref(), Expr::ErrorKind(_)) {
+                        (lhs, rhs)
+                    } else {
+                        (rhs, lhs)
+                    };
+                    self.expr_types.insert(marker.span(), Type::Unit);
+                    let ty = self.type_of_expr(place);
+                    if !matches!(ty, Type::ErrUnion(_)) && !poisoned(&ty) {
+                        self.error(
+                            format!(
+                                "'{}' against 'error' tests an error union, found {}",
+                                if *op == BinOp::Eq { "==" } else { "!=" },
+                                self.type_name(&ty)
+                            ),
+                            *span,
+                        );
+                    }
+                    return Type::Bool;
+                }
                 let lt = self.type_of_expr(lhs);
                 // `x != null && …` — the null check guards the right side.
                 let rt = if *op == BinOp::And {
@@ -648,7 +718,7 @@ impl Checker<'_> {
             .unwrap()
             .insert(name.to_string(), VarInfo { ty, mutable });
         if let Some(frame) = self.nonnull.last_mut() {
-            frame.facts.retain(|f| !covers(name, f));
+            frame.facts.retain(|f, _| !covers(name, f));
             frame.shadowed.insert(name.to_string());
         }
     }
@@ -693,11 +763,13 @@ impl Checker<'_> {
 
     pub(super) fn lookup(&mut self, name: &str, span: Span) -> Type {
         if let Some(info) = self.find_var(name) {
-            // A narrowed optional reads as its inner type.
-            if self.is_nonnull(name)
-                && let Type::Optional(inner) = &info.ty
-            {
-                return (**inner).clone();
+            // A narrowed optional reads as its inner type; a narrowed
+            // error union as its value type or as `error` (ADR 0034).
+            match (self.fact_of(name), &info.ty) {
+                (Some(Fact::NonNull), Type::Optional(inner)) => return (**inner).clone(),
+                (Some(Fact::NoErr), Type::ErrUnion(inner)) => return (**inner).clone(),
+                (Some(Fact::IsErr), Type::ErrUnion(_)) => return Type::ErrCode,
+                _ => {}
             }
             return info.ty.clone();
         }

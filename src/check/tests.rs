@@ -838,6 +838,107 @@ fn errors_export_and_import_with_distinct_codes() {
 }
 
 #[test]
+fn error_unions_narrow_and_try_propagates() {
+    let d = diags(
+        "error Neg;\n\
+         fun half(n: int): int! {\n\
+             if n < 0 { return error.Neg; }\n\
+             return n / 2;\n\
+         }\n\
+         fun sum(a: int, b: int): int! {\n\
+             const x: int = try half(a);\n\
+             var y: int = 0;\n\
+             y = try half(b);\n\
+             return x + y;\n\
+         }\n\
+         fun use_it(): int {\n\
+             var r: int! = sum(1, 2);\n\
+             if r == error {\n\
+                 if r == error.Neg { return -1; }\n\
+                 return -2;\n\
+             }\n\
+             return r + 1;\n\
+         }",
+    );
+    assert!(d.is_empty(), "unexpected: {d:?}");
+}
+
+#[test]
+fn try_position_and_context_are_enforced() {
+    // Nested position: not the direct RHS.
+    let d = diags(
+        "error E;\n\
+         fun f(): int! { return 1; }\n\
+         fun g(): int! { return f(); }\n\
+         fun h(): int! {\n\
+             const x: int = (try f()) + 1;\n\
+             return x;\n\
+         }",
+    );
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("direct right-hand side")),
+        "{d:?}"
+    );
+    // Enclosing function must return an error union.
+    let d = diags(
+        "error E;\n\
+         fun f(): int! { return 1; }\n\
+         fun g(): int { const x: int = try f(); return x; }",
+    );
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("enclosing function must return")),
+        "{d:?}"
+    );
+    // try needs an error union operand.
+    let d = diags("fun f(): int! { const x: int = try 5; return x; }");
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("'try' needs an error union")),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn error_union_positions_are_restricted() {
+    let d = diags("fun f(x: int!): int { return 0; }");
+    assert!(d.iter().any(|e| e.message.contains("parameters")), "{d:?}");
+    let d = diags("struct S { x: int! }\nfun f(): int { return 0; }");
+    assert!(
+        d.iter().any(|e| e.message.contains("struct fields")),
+        "{d:?}"
+    );
+    let d = diags("fun f(): int { var xs: int![] = []; return 0; }");
+    assert!(d.iter().any(|e| e.message.contains("arrays")), "{d:?}");
+    let d = diags("fun f(): error! { return error.E; }");
+    assert!(d.iter().any(|e| e.message.contains("redundant")), "{d:?}");
+}
+
+#[test]
+fn error_union_misuse_is_rejected() {
+    // No direct comparison — narrow first.
+    let d = diags(
+        "error E;\n\
+         fun f(): int! { return 1; }\n\
+         fun g(): int { var r: int! = f(); if r == error.E { return 1; } return 0; }",
+    );
+    assert!(!d.is_empty(), "union == code must be rejected: {d:?}");
+    // Bare error outside a test.
+    let d = diags("fun f(): int { const e: int = error; return e; }");
+    assert!(
+        d.iter().any(|e| e.message.contains("bare 'error'")),
+        "{d:?}"
+    );
+    // == error against a non-union.
+    let d = diags("fun f(): int { if 1 == error { return 1; } return 0; }");
+    assert!(
+        d.iter().any(|e| e.message.contains("tests an error union")),
+        "{d:?}"
+    );
+}
+
+#[test]
 fn imported_functions_and_structs_are_usable() {
     let (_, d) = multi(&[
         (

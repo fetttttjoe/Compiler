@@ -51,7 +51,15 @@ later without conflict. Errors get the optional treatment.
    otherwise). Visible control flow at the exact site — the same
    standing `?.` already has under ADR 0005. No `catch`/default
    operator in v1: the narrowed `if` covers it; the operator can
-   arrive additively (the `??` precedent).
+   arrive additively (the `??` precedent). **As built, `try` is
+   statement-positioned**: the direct right-hand side of a binding,
+   assignment, or `return`, or a bare expression statement —
+   `f(try g())` is a pointed diagnostic. The restriction is the
+   interpreter's: expressions cannot early-return without threading a
+   stop channel through every eval path; the lift is named (widen
+   `Result`'s error side to `Diag | Propagate`) and purely additive.
+   The backend has no such limit — compiled `try` is an inline tag
+   test wherever it appears.
 6. **Representation** (the ADR 0021 pattern): `T!` is
    `{tag, payload}`, tag first, `1 + words(T)` words. Tag 0 = value,
    tag 1 = **reserved** (null — the future `T?!`), tag ≥ 2 = the
@@ -61,9 +69,12 @@ later without conflict. Errors get the optional treatment.
    ref-shaped `T!` still carries the tag word. Bare `error` is one
    word.
 7. **Rendering.** `print`/`string()` of an `error` value produces
-   `error.Name` — a show routine over an interned name table in
-   .rodata (ADR 0029's static-descriptor trick). Whole-`T!` printing
-   is not in v1; narrow first.
+   `error.Name` — a show routine over interned name strings, selected
+   by a compare chain (ADR 0029's pattern). **Whole-`T!` printing
+   ships** (revised from the draft): the interpreter renders the
+   unwrapped payload or the error name for free, and the compiled
+   routine is one tag test over the existing optional pattern —
+   gating it would have cost more than building it.
 8. **`fun main(): int!` is legal** (with or without `args`). An
    escaping error prints `error: error.Name` on stderr and exits 1 —
    the trap shape (ADR 0022) minus the location line: a bare code

@@ -53,6 +53,26 @@ pub(crate) fn kind_of(t: &Type, res: &Resolutions, fuel: usize) -> Option<Kind> 
         // tag word (ADR 0021). Canonical zeroed nulls keep int?/bool?
         // memcmp-comparable; float (IEEE), str (content equality), and
         // no-memcmp struct payloads are not.
+        // `T!` is always tagged — even ref-shaped payloads: a handle
+        // cannot encode which error (ADR 0034). Same words math as the
+        // value optional; tag 0 = value, ≥2 = the code, 1 reserved.
+        Type::ErrUnion(inner) => {
+            let k = kind_of(inner, res, fuel.checked_sub(1)?)?;
+            let no_memcmp = matches!(inner.as_ref(), Type::Float)
+                || matches!(
+                    k,
+                    Kind::Str
+                        | Kind::Struct {
+                            no_memcmp: true,
+                            ..
+                        }
+                        | Kind::Opt { .. }
+                );
+            Some(Kind::Opt {
+                words: 1 + k.words(),
+                no_memcmp,
+            })
+        }
         Type::Optional(inner) => {
             let k = kind_of(inner, res, fuel.checked_sub(1)?)?;
             if ref_shaped(inner, res) {

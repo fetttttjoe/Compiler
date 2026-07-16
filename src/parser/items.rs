@@ -5,15 +5,49 @@
 use super::*;
 
 impl Parser<'_> {
-    /// A base type with postfix suffixes: `?` (optional) and `[]` (array),
-    /// composable left to right — `int?[]` is an array of optional ints,
-    /// `int[]?` an optional array. Doubling the optional is rejected with a
-    /// dedicated message (the lexer reads `??` greedily as one token).
+    /// A base type with postfix suffixes: `?` (optional), `!` (error
+    /// union, ADR 0034), and `[]` (array), composable left to right —
+    /// `int?[]` is an array of optional ints, `int[]?` an optional
+    /// array, `int[]!` an array-or-error. Doubling the optional is
+    /// rejected with a dedicated message (the lexer reads `??` greedily
+    /// as one token), and optionals and error unions do not mix
+    /// (`T?!`/`T!?` — the ADR 0034 reserved seat).
     pub(super) fn parse_type(&mut self) -> TypeAnn {
         let mut ty = self.parse_base_type();
         loop {
             match self.peek().kind {
+                TokenKind::Bang => {
+                    let span = self.peek().span;
+                    self.bump();
+                    match &ty {
+                        TypeAnn::ErrUnion(_) => {
+                            self.error(
+                                "nested error unions are not allowed — 'T!!' is just 'T!'"
+                                    .to_string(),
+                                span,
+                            );
+                        }
+                        TypeAnn::Optional(_) => {
+                            self.error(
+                                "optionals and error unions do not mix — 'T?!' is not yet supported"
+                                    .to_string(),
+                                span,
+                            );
+                        }
+                        _ => ty = TypeAnn::ErrUnion(Box::new(ty)),
+                    }
+                }
                 TokenKind::Question | TokenKind::QuestionQuestion => {
+                    if matches!(ty, TypeAnn::ErrUnion(_)) {
+                        let span = self.peek().span;
+                        self.bump();
+                        self.error(
+                            "optionals and error unions do not mix — 'T!?' is not yet supported"
+                                .to_string(),
+                            span,
+                        );
+                        continue;
+                    }
                     let mut doubled = self.peek().kind == TokenKind::QuestionQuestion
                         || matches!(ty, TypeAnn::Optional(_));
                     let span = self.peek().span;

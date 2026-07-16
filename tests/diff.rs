@@ -2297,6 +2297,83 @@ fn error_codes_agree_across_engines() {
 }
 
 #[test]
+fn try_chains_agree_across_engines() {
+    // ADR 0034: try propagation order is observable via prints — the
+    // second step must not run after the first errs.
+    diff(
+        "trychain",
+        r#"error Neg;
+        fun step(n: int): int! {
+            print(n);
+            if n < 0 { return error.Neg; }
+            return n * 2;
+        }
+        fun run(a: int, b: int): int! {
+            const x: int = try step(a);
+            const y: int = try step(b);
+            print("both");
+            return x + y;
+        }
+        fun main(): int {
+            var r: int! = run(3, 4);
+            if r == error { return 1; }
+            print(r);
+            r = run(5, -1);
+            if r != error { return 2; }
+            print(r == error.Neg);
+            return 40 + 2;
+        }"#,
+    );
+}
+
+#[test]
+fn ref_shaped_error_unions_stay_tagged() {
+    // ADR 0034 decision 6: a handle cannot encode a code, so Node!
+    // carries the tag word even for ref-shaped payloads.
+    diff(
+        "errref",
+        r#"error Missing;
+        refstruct Node { v: int }
+        fun find(flag: bool): Node! {
+            if flag { return Node { v: 7 }; }
+            return error.Missing;
+        }
+        fun main(): int {
+            var n: Node! = find(true);
+            if n == error { return 1; }
+            print(n.v);
+            var m: Node! = find(false);
+            if m == error {
+                print(m == error.Missing);
+                return n.v + 3;
+            }
+            return 99;
+        }"#,
+    );
+}
+
+#[test]
+fn try_payload_wraps_into_optional_slots() {
+    // ADR 0034 × 0021: try yields T; the slot's declared type wraps it.
+    diff(
+        "tryopt",
+        r#"error E;
+        fun f(): int! { return 5; }
+        fun h(): int! {
+            var x: int? = try f();
+            print(x ?? 0);
+            if x == null { return error.E; }
+            return x;
+        }
+        fun main(): int {
+            var r: int! = h();
+            if r == error { return 1; }
+            return r;
+        }"#,
+    );
+}
+
+#[test]
 fn long_operator_chain_within_the_depth_budget() {
     // Left-associative chains parse at constant depth but build an AST as
     // tall as the chain is long; 6000 terms used to overflow the checker's

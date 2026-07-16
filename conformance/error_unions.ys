@@ -1,0 +1,32 @@
+error Neg, Huge;
+
+fun half(n: int): int! {
+    if n < 0 { return error.Neg; }
+    if n > 100 { return error.Huge; }
+    return n / 2;
+}
+
+fun sum_halves(a: int, b: int): int! {
+    const x: int = try half(a);
+    const y: int = try half(b);
+    return x + y;
+}
+
+fun main(): int {
+    var ok: int! = sum_halves(10, 20);
+    print(ok);
+    if ok == error { return -1; }
+    print(ok + 1);
+
+    var bad: int! = sum_halves(4, -2);
+    print(bad);
+    if bad != error { return -2; }
+    print(bad == error.Neg);
+    print(bad == error.Huge);
+    print(string(bad));
+    print(`got ${bad}`);
+
+    bad = sum_halves(500, 1);
+    if bad == error { print(bad); }
+    return ok + 27;
+}

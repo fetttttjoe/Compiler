@@ -17,7 +17,7 @@ impl Checker<'_> {
         self.scopes.push(scope);
         // The base narrowing frame: guard facts at the function's top level
         // live here, and top-level rebinds shadow into it (ADR 0020).
-        self.nonnull.push(NarrowFrame::new(HashSet::new()));
+        self.nonnull.push(NarrowFrame::new(HashMap::new()));
         for stmt in &f.body {
             self.check_stmt(stmt);
         }
@@ -37,7 +37,11 @@ impl Checker<'_> {
     /// its duration. Returns the facts still standing at the block's end —
     /// the survivors a divergence-aware join may carry past an `if`
     /// (writes inside the block already subtracted themselves, ADR 0020).
-    fn check_block_narrowed(&mut self, stmts: &[Stmt], facts: HashSet<String>) -> HashSet<String> {
+    fn check_block_narrowed(
+        &mut self,
+        stmts: &[Stmt],
+        facts: HashMap<String, Fact>,
+    ) -> HashMap<String, Fact> {
         self.nonnull.push(NarrowFrame::new(facts));
         self.scopes.push(HashMap::new());
         for stmt in stmts {
@@ -64,7 +68,7 @@ impl Checker<'_> {
     /// Grants the code after a divergence-aware join its proven facts;
     /// they live in the innermost frame and expire with the enclosing
     /// block. A frame always exists (`check_function` pushes the base).
-    fn add_facts(&mut self, facts: HashSet<String>) {
+    fn add_facts(&mut self, facts: HashMap<String, Fact>) {
         if let Some(frame) = self.nonnull.last_mut() {
             frame.facts.extend(facts);
         }
@@ -77,27 +81,31 @@ impl Checker<'_> {
     }
 
     pub(super) fn is_nonnull(&self, path: &str) -> bool {
-        // Innermost first: a shadow hides outer facts for its own region.
-        // Within a frame, facts outrank the shadow — a fact can only enter
-        // after the frame's shadow exists, so it is about the shadowing
-        // binding itself (`bind` killed any stale same-frame fact,
-        // ADR 0033).
+        self.fact_of(path) == Some(Fact::NonNull)
+    }
+
+    /// The innermost standing fact for `path`, if any. Innermost first: a
+    /// shadow hides outer facts for its own region. Within a frame, facts
+    /// outrank the shadow — a fact can only enter after the frame's shadow
+    /// exists, so it is about the shadowing binding itself (`bind` killed
+    /// any stale same-frame fact, ADR 0033).
+    pub(super) fn fact_of(&self, path: &str) -> Option<Fact> {
         for frame in self.nonnull.iter().rev() {
-            if frame.facts.contains(path) {
-                return true;
+            if let Some(fact) = frame.facts.get(path) {
+                return Some(*fact);
             }
             if frame.shadowed.iter().any(|s| covers(s, path)) {
-                return false;
+                return None;
             }
         }
-        false
+        None
     }
 
     /// Permanently drops a place path — and everything reached through it —
     /// from every narrowing frame. Used when the place is reassigned.
     pub(super) fn unnarrow(&mut self, path: &str) {
         for frame in &mut self.nonnull {
-            frame.facts.retain(|q| !covers(path, q));
+            frame.facts.retain(|q, _| !covers(path, q));
         }
     }
 
@@ -125,7 +133,7 @@ impl Checker<'_> {
     /// variable facts do survive: a callee can't rebind the caller's locals.
     pub(super) fn unnarrow_field_paths(&mut self) {
         for frame in &mut self.nonnull {
-            frame.facts.retain(|q| !q.contains('.'));
+            frame.facts.retain(|q, _| !q.contains('.'));
         }
     }
 
@@ -158,6 +166,7 @@ impl Checker<'_> {
                         // never on the raw annotation.
                         self.let_types.insert(*span, declared.clone());
                         if !self.check_literal_against(value, &declared) {
+                            self.try_ok = true;
                             let init_ty = self.type_of_expr(value);
                             if !fits(&init_ty, &declared) {
                                 self.error(
@@ -185,6 +194,7 @@ impl Checker<'_> {
                                 "every binding declares its type: 'var {name}: <type> = …;'"
                             )),
                         );
+                        self.try_ok = true;
                         let init_ty = self.type_of_expr(value);
                         if init_ty == Type::Null || unconstrained(&init_ty) {
                             Type::Error // recovery: nothing usable to bind
@@ -203,7 +213,10 @@ impl Checker<'_> {
                     return;
                 }
                 let ty = match value {
-                    Some(e) => self.type_of_expr(e),
+                    Some(e) => {
+                        self.try_ok = true;
+                        self.type_of_expr(e)
+                    }
                     None => Type::Unit,
                 };
                 if !fits(&ty, &self.ret) {
@@ -302,7 +315,7 @@ impl Checker<'_> {
                 self.drop_loop_invalidated_facts(body);
                 // Body scope with the loop bindings: const element (and
                 // optional const int index).
-                self.nonnull.push(NarrowFrame::new(HashSet::new()));
+                self.nonnull.push(NarrowFrame::new(HashMap::new()));
                 self.scopes.push(HashMap::new());
                 self.bind(name, elem, false);
                 if let Some(index) = index {
@@ -317,6 +330,7 @@ impl Checker<'_> {
                 self.nonnull.pop();
             }
             Stmt::Expr(e) => {
+                self.try_ok = true;
                 self.type_of_expr(e);
             }
             Stmt::Break { span } | Stmt::Continue { span } => {
@@ -340,6 +354,7 @@ impl Checker<'_> {
                 let value_ty = if matches!(value, Expr::ArrayLit { .. }) {
                     None
                 } else {
+                    self.try_ok = true;
                     Some(self.type_of_expr(value))
                 };
                 // The parser only builds place targets, so a root always exists.

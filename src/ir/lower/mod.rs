@@ -51,6 +51,9 @@ pub(super) struct Lowerer<'a> {
 pub(super) struct Binding {
     v: V,
     opt_inner: Option<Type>,
+    /// The payload type when the slot is a `T!` (ADR 0034): narrowed
+    /// reads unwrap through the tag; `error`-narrowed reads ARE the tag.
+    err_inner: Option<Type>,
 }
 
 /// Lowers one checked function into owned virtual-register IR.
@@ -111,6 +114,7 @@ pub(super) fn lower(
             Binding {
                 v: handle,
                 opt_inner: None,
+                err_inner: None,
             },
         );
     } else {
@@ -118,7 +122,14 @@ pub(super) fn lower(
             kind_of(ty, res, FUEL).ok_or_else(|| unsupported("parameters of this type", f.span))?;
             let v = lo.fresh(*ty == Type::Float);
             let opt_inner = lo.opt_inner_of(ty);
-            lo.scopes[0].insert(p.name.clone(), Binding { v, opt_inner });
+            lo.scopes[0].insert(
+                p.name.clone(),
+                Binding {
+                    v,
+                    opt_inner,
+                    err_inner: None, // T! params are checker-rejected
+                },
+            );
         }
     }
     let nparams = if entry_args { 2 } else { lo.vregs };
@@ -191,6 +202,13 @@ impl Lowerer<'_> {
         }
     }
 
+    fn err_inner_of(&self, ty: &Type) -> Option<Type> {
+        match ty {
+            Type::ErrUnion(inner) => Some((**inner).clone()),
+            _ => None,
+        }
+    }
+
     fn ty(&self, span: &Span) -> Option<&Type> {
         self.res.expr_types.get(span)
     }
@@ -256,15 +274,17 @@ impl Lowerer<'_> {
         t
     }
 
-    /// Wraps a present payload into a fresh `{1, payload}` temp.
-    fn wrap_present(&mut self, payload: V, payload_kind: Kind, words: usize) -> V {
+    /// Wraps a payload into a fresh `{tag, payload}` temp — tag 1 for
+    /// an optional's present state, 0 for an error union's value state
+    /// (ADR 0021/0034).
+    fn wrap_present(&mut self, tag: i64, payload: V, payload_kind: Kind, words: usize) -> V {
         let t = self.fresh(false);
         self.insts.push(Inst::Temp { dst: t, words });
-        let one = self.const_word(1);
+        let tag = self.const_word(tag);
         self.insts.push(Inst::StoreAt {
             base: t,
             off: 0,
-            val: one,
+            val: tag,
         });
         if payload_kind == Kind::Word {
             self.insts.push(Inst::StoreAt {
@@ -289,30 +309,72 @@ impl Lowerer<'_> {
     }
 
     /// Lowers `e` as a value for a slot of type `target`, wrapping at
-    /// the fits() points (ADR 0021 decision 4): `null` and payload-typed
-    /// values become tagged optionals; everything else is unchanged.
+    /// the fits() points (ADR 0021 decision 4 / ADR 0034): `null`,
+    /// codes, and payload-typed values become tagged unions; everything
+    /// else is unchanged.
     fn expr_into(&mut self, e: &Expr, target: &Type) -> Result<V, Diagnostic> {
-        let Type::Optional(inner) = target else {
-            return self.expr(e);
-        };
-        if ref_shaped(inner, self.res) {
-            return self.expr(e);
-        }
-        let total = kind_of(target, self.res, FUEL)
-            .ok_or_else(|| unsupported("values of this type", e.span()))?
-            .words();
-        match self.ty(&e.span()) {
-            // The null literal itself — nothing to evaluate.
-            None | Some(Type::Null) => Ok(self.null_optional(total)),
-            // Already optional-shaped: pass the pointer through.
-            Some(Type::Optional(_)) => self.expr(e),
-            Some(_) => {
-                let k = kind_of(inner, self.res, FUEL)
-                    .ok_or_else(|| unsupported("values of this type", e.span()))?;
-                let v = self.expr(e)?;
-                Ok(self.wrap_present(v, k, total))
+        match target {
+            Type::Optional(inner) if !ref_shaped(inner, self.res) => {
+                let total = kind_of(target, self.res, FUEL)
+                    .ok_or_else(|| unsupported("values of this type", e.span()))?
+                    .words();
+                match self.ty(&e.span()) {
+                    // The null literal itself — nothing to evaluate.
+                    None | Some(Type::Null) => Ok(self.null_optional(total)),
+                    // Already optional-shaped: pass the pointer through.
+                    Some(Type::Optional(_)) => self.expr(e),
+                    Some(_) => {
+                        let k = kind_of(inner, self.res, FUEL)
+                            .ok_or_else(|| unsupported("values of this type", e.span()))?;
+                        let v = self.expr(e)?;
+                        Ok(self.wrap_present(1, v, k, total))
+                    }
+                }
             }
+            // `T` and codes flow into `T!` slots (ADR 0034): a value
+            // wraps as {0, payload}, a code as {code, zeroed payload}.
+            Type::ErrUnion(inner) => {
+                let total = kind_of(target, self.res, FUEL)
+                    .ok_or_else(|| unsupported("values of this type", e.span()))?
+                    .words();
+                match self.ty(&e.span()) {
+                    Some(Type::ErrCode) => {
+                        let code = self.expr(e)?;
+                        Ok(self.wrap_err(code, total))
+                    }
+                    Some(Type::ErrUnion(_)) | None => self.expr(e),
+                    Some(_) => {
+                        let k = kind_of(inner, self.res, FUEL)
+                            .ok_or_else(|| unsupported("values of this type", e.span()))?;
+                        let v = self.expr(e)?;
+                        Ok(self.wrap_present(0, v, k, total))
+                    }
+                }
+            }
+            _ => self.expr(e),
         }
+    }
+
+    /// The error state of a `T!` temp: the code in the tag word,
+    /// payload words zeroed — canonical like the optional null
+    /// (ADR 0034).
+    fn wrap_err(&mut self, code: V, words: usize) -> V {
+        let t = self.fresh(false);
+        self.insts.push(Inst::Temp { dst: t, words });
+        let zero = self.const_word(0);
+        for i in 1..words {
+            self.insts.push(Inst::StoreAt {
+                base: t,
+                off: 8 * i as i64,
+                val: zero,
+            });
+        }
+        self.insts.push(Inst::StoreAt {
+            base: t,
+            off: 0,
+            val: code,
+        });
+        t
     }
 
     /// Reads the payload of a proven-present optional (the recorded type
@@ -374,19 +436,31 @@ impl Lowerer<'_> {
                     self.snapshot(v, kind.words())
                 };
                 let opt_inner = self.opt_inner_of(&slot_ty);
+                let err_inner = self.err_inner_of(&slot_ty);
                 self.scopes
                     .last_mut()
                     .expect("a scope is always open")
-                    .insert(name.clone(), Binding { v: slot, opt_inner });
+                    .insert(
+                        name.clone(),
+                        Binding {
+                            v: slot,
+                            opt_inner,
+                            err_inner,
+                        },
+                    );
             }
             Stmt::Assign { target, value, .. } => match target {
                 Expr::Ident(name, span) => {
                     let b = self
                         .lookup(name)
                         .ok_or_else(|| unsupported("this assignment target", *span))?;
-                    if let Some(inner) = b.opt_inner {
-                        // Opt-shaped slot: wrap the value in place.
-                        let target = Type::Optional(Box::new(inner));
+                    let union_slot = match (&b.opt_inner, &b.err_inner) {
+                        (Some(inner), _) => Some(Type::Optional(Box::new(inner.clone()))),
+                        (_, Some(inner)) => Some(Type::ErrUnion(Box::new(inner.clone()))),
+                        _ => None,
+                    };
+                    if let Some(target) = union_slot {
+                        // Union-shaped slot: wrap the value in place.
                         let words = kind_of(&target, self.res, FUEL)
                             .ok_or_else(|| unsupported("this assignment target", *span))?
                             .words();
@@ -602,6 +676,7 @@ impl Lowerer<'_> {
                     Binding {
                         v: x,
                         opt_inner: self.opt_inner_of(&elem),
+                        err_inner: None, // T! array elements are checker-rejected
                     },
                 );
                 if let Some(ix) = index {
@@ -610,6 +685,7 @@ impl Lowerer<'_> {
                         Binding {
                             v: i,
                             opt_inner: None,
+                            err_inner: None,
                         },
                     );
                 }
@@ -650,6 +726,49 @@ impl Lowerer<'_> {
             Expr::Null(_) => Ok(self.const_word(0)),
             // The checker interned the code (ADR 0034): a constant word.
             Expr::ErrorLit(_, span) => Ok(self.const_word(self.res.error_lits[span] as i64)),
+            // The equality intercept consumes the marker; it never
+            // reaches plain evaluation (ADR 0034).
+            Expr::ErrorKind(_) => unreachable!("checker restricts bare 'error' to tests"),
+            // `try e` (ADR 0034): the value continues, the error returns
+            // from the enclosing function — a mid-expression epilogue;
+            // the checker guaranteed a T! return, so sret exists.
+            Expr::Try {
+                expr: operand,
+                span,
+            } => {
+                let u = self.expr(operand)?;
+                let tag = self.load_at(u, 0);
+                let is_err = self.fresh(false);
+                self.insts.push(Inst::BinImm {
+                    op: BinOp::Ge,
+                    dst: is_err,
+                    lhs: tag,
+                    imm: 2,
+                });
+                let cont = self.fresh_label();
+                self.insts.push(Inst::BrZero(is_err, cont));
+                let sret = self.sret.expect("checker: try requires a T! return");
+                let zero = self.const_word(0);
+                for i in 1..self.ret_words {
+                    self.insts.push(Inst::StoreAt {
+                        base: sret,
+                        off: 8 * i as i64,
+                        val: zero,
+                    });
+                }
+                self.insts.push(Inst::StoreAt {
+                    base: sret,
+                    off: 0,
+                    val: tag,
+                });
+                self.insts.push(Inst::Ret(sret));
+                self.insts.push(Inst::Label(cont));
+                let inner = match self.ty(&operand.span()) {
+                    Some(Type::ErrUnion(i)) => (**i).clone(),
+                    _ => return Err(unsupported("'try' on this operand", *span)),
+                };
+                self.payload_read(u, &inner, *span)
+            }
             // A literal's descriptor and bytes are both static — strings
             // are immutable, so every use shares one rodata object.
             Expr::Str(text, _) => {
@@ -666,6 +785,16 @@ impl Lowerer<'_> {
                     && !matches!(self.ty(span), Some(Type::Optional(_)))
                 {
                     return self.payload_read(b.v, &inner.clone(), *span);
+                }
+                // T! narrowing (ADR 0034): proven-value reads unwrap the
+                // payload; proven-error reads load the tag — it IS the
+                // code.
+                if let Some(inner) = &b.err_inner {
+                    return match self.ty(span) {
+                        Some(Type::ErrUnion(_)) | None => Ok(b.v),
+                        Some(Type::ErrCode) => Ok(self.load_at(b.v, 0)),
+                        Some(_) => self.payload_read(b.v, &inner.clone(), *span),
+                    };
                 }
                 Ok(b.v)
             }
@@ -950,6 +1079,32 @@ impl Lowerer<'_> {
     /// string `+` concatenates, aggregate `==`/`!=` compares content or
     /// structure, everything else is scalar arithmetic.
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span) -> Result<V, Diagnostic> {
+        // `x == error` / `x != error` (ADR 0034): a tag test — codes
+        // start at 2, and the reserved tag 1 stays false here by
+        // construction (Ge/Lt against 2, not a zero test).
+        if matches!(op, BinOp::Eq | BinOp::Ne)
+            && (matches!(lhs, Expr::ErrorKind(_)) || matches!(rhs, Expr::ErrorKind(_)))
+        {
+            let place = if matches!(lhs, Expr::ErrorKind(_)) {
+                rhs
+            } else {
+                lhs
+            };
+            let u = self.expr(place)?;
+            let tag = self.load_at(u, 0);
+            let dst = self.fresh(false);
+            self.insts.push(Inst::BinImm {
+                op: if matches!(op, BinOp::Eq) {
+                    BinOp::Ge
+                } else {
+                    BinOp::Lt
+                },
+                dst,
+                lhs: tag,
+                imm: 2,
+            });
+            return Ok(dst);
+        }
         let kind = self.kind(lhs, span)?;
         if kind == Kind::Str && matches!(op, BinOp::Add) {
             return self.concat(lhs, rhs);

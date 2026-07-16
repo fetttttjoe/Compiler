@@ -125,13 +125,19 @@ impl<'a> Interp<'a> {
     fn exec_stmt_inner(&mut self, stmt: &'a Stmt) -> Result<Flow, Diagnostic> {
         match stmt {
             Stmt::Let { name, value, .. } => {
-                let v = self.eval(value)?;
+                let v = match self.eval_rhs(value)? {
+                    Ok(v) => v,
+                    Err(flow) => return Ok(flow),
+                };
                 self.scopes.last_mut().unwrap().insert(name.clone(), v);
                 Ok(Flow::Normal)
             }
             Stmt::Return { value, .. } => {
                 let v = match value {
-                    Some(e) => self.eval(e)?,
+                    Some(e) => match self.eval_rhs(e)? {
+                        Ok(v) => v,
+                        Err(flow) => return Ok(flow),
+                    },
                     None => Value::Unit,
                 };
                 Ok(Flow::Return(v))
@@ -203,15 +209,35 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal)
             }
             Stmt::Expr(e) => {
-                self.eval(e)?;
+                if let Err(flow) = self.eval_rhs(e)? {
+                    return Ok(flow);
+                }
                 Ok(Flow::Normal)
             }
             Stmt::Assign { target, value, .. } => {
-                let v = self.eval(value)?;
+                let v = match self.eval_rhs(value)? {
+                    Ok(v) => v,
+                    Err(flow) => return Ok(flow),
+                };
                 self.assign_place(target, v)?;
                 Ok(Flow::Normal)
             }
         }
+    }
+
+    /// Evaluates a statement's right-hand side, honoring `try`
+    /// (ADR 0034): an error value becomes the enclosing function's
+    /// return (`Err(Flow::Return)`), a payload continues the normal
+    /// path. The checker restricts `try` to exactly these positions.
+    fn eval_rhs(&mut self, e: &'a Expr) -> Result<Result<Value, Flow>, Diagnostic> {
+        if let Expr::Try { expr, .. } = e {
+            let v = self.eval(expr)?;
+            if matches!(v, Value::Err(_)) {
+                return Ok(Err(Flow::Return(v)));
+            }
+            return Ok(Ok(v));
+        }
+        Ok(Ok(self.eval(e)?))
     }
 
     /// Runs a nested block in its own scope: bindings made inside die at the
@@ -315,6 +341,8 @@ impl<'a> Interp<'a> {
             Expr::Null(_) => Ok(Value::Null),
             // The checker interned the code (or rejected the program).
             Expr::ErrorLit(_, span) => Ok(Value::Err(self.resolutions.error_lits[span])),
+            Expr::ErrorKind(_) => unreachable!("checker rejects bare 'error' outside tests"),
+            Expr::Try { .. } => unreachable!("checker restricts 'try' to statement positions"),
             Expr::Unary { op, rhs, span } => {
                 let v = self.eval(rhs)?;
                 eval_unary(*op, v, *span)
@@ -336,6 +364,20 @@ impl<'a> Interp<'a> {
                 _ => unreachable!("checker enforced the operand type"),
             },
             Expr::Binary { op, lhs, rhs, span } => match op {
+                // `x == error` / `x != error` — the state test on an
+                // error union (ADR 0034); the marker never evaluates.
+                BinOp::Eq | BinOp::Ne
+                    if matches!(lhs.as_ref(), Expr::ErrorKind(_))
+                        || matches!(rhs.as_ref(), Expr::ErrorKind(_)) =>
+                {
+                    let place = if matches!(lhs.as_ref(), Expr::ErrorKind(_)) {
+                        rhs
+                    } else {
+                        lhs
+                    };
+                    let is_err = matches!(self.eval(place)?, Value::Err(_));
+                    Ok(Value::Bool(is_err == (*op == BinOp::Eq)))
+                }
                 BinOp::And | BinOp::Or => self.eval_logical(*op, lhs, rhs),
                 // `??` is lazy: the fallback runs only when the left is null.
                 BinOp::Coalesce => match self.eval(lhs)? {

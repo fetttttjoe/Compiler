@@ -435,14 +435,10 @@ fn parses_error_literals_and_the_error_type() {
 }
 
 #[test]
-fn bare_error_in_expression_position_is_reported() {
-    let (tokens, _) = lex("fun f(): int { const x: int = error; return x; }");
-    let (_, pd) = parse(&tokens);
-    assert!(
-        pd.iter()
-            .any(|d| d.message.contains("expected '.' and an error name")),
-        "{pd:?}"
-    );
+fn bare_error_parses_as_the_state_marker() {
+    // The checker owns rejecting it outside ==/!= tests (ADR 0034).
+    assert_eq!(expr("e == error").sexpr(), "(== e error)");
+    assert_eq!(expr("try f()").sexpr(), "(try (call f ))");
 }
 
 #[test]

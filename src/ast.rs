@@ -79,6 +79,8 @@ pub enum TypeAnn {
     Named(String),
     /// `error` — the one-word error-code type (ADR 0034).
     ErrCode,
+    /// `T!` — T or a declared error code (ADR 0034).
+    ErrUnion(Box<TypeAnn>),
     /// `T?` — T or null.
     Optional(Box<TypeAnn>),
     /// `T[]` — a growable array of T, reference semantics like refstruct.
@@ -170,6 +172,14 @@ pub enum Expr {
     Null(Span),
     /// `error.Name` — an error-code literal (ADR 0034).
     ErrorLit(String, Span),
+    /// Bare `error` — the state marker, legal only as an `==`/`!=`
+    /// operand against an error union (ADR 0034).
+    ErrorKind(Span),
+    /// `try e` — yield the value or return the error (ADR 0034).
+    Try {
+        expr: Box<Expr>,
+        span: Span,
+    },
     Unary {
         op: UnOp,
         rhs: Box<Expr>,
@@ -330,7 +340,9 @@ impl Expr {
             | Expr::Str(_, s)
             | Expr::Ident(_, s)
             | Expr::Null(s)
-            | Expr::ErrorLit(_, s) => *s,
+            | Expr::ErrorLit(_, s)
+            | Expr::ErrorKind(s) => *s,
+            Expr::Try { span, .. } => *span,
             Expr::Unary { span, .. }
             | Expr::Convert { span, .. }
             | Expr::Binary { span, .. }
@@ -353,6 +365,8 @@ impl Expr {
             Expr::Ident(name, _) => name.clone(),
             Expr::Null(_) => "null".to_string(),
             Expr::ErrorLit(n, _) => format!("error.{n}"),
+            Expr::ErrorKind(_) => "error".to_string(),
+            Expr::Try { expr, .. } => format!("(try {})", expr.sexpr()),
             Expr::Unary { op, rhs, .. } => format!("({} {})", op.symbol(), rhs.sexpr()),
             Expr::Convert { to, arg, .. } => {
                 format!("({} {})", to.keyword(), arg.sexpr())

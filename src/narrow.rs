@@ -1,23 +1,33 @@
-//! Null-narrowing analysis over the AST: which place paths a condition
-//! proves non-null, and what a loop body or call can invalidate. Pure
-//! syntax — this module never sees `Type`; the checker owns the stateful
-//! fact stack and consumes these primitives.
+//! Narrowing analysis over the AST: which place paths a condition
+//! proves non-null or (not) in the error state, and what a loop body or
+//! call can invalidate. Pure syntax — this module never sees `Type`;
+//! the checker owns the stateful fact stack and consumes these
+//! primitives.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{BinOp, Expr, Stmt};
 
-/// One narrowing region: facts proven non-null on entry, plus places whose
+/// What a condition proved about a place path (ADR 0007/0034): `T?`
+/// proven present, `T!` proven a value, or `T!` proven an error.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Fact {
+    NonNull,
+    NoErr,
+    IsErr,
+}
+
+/// One narrowing region: facts proven on entry, plus places whose
 /// facts are hidden for the region's duration because a new binding shadows
 /// the name — hiding ends automatically when the frame pops.
 #[derive(Clone)]
 pub(crate) struct NarrowFrame {
-    pub(crate) facts: HashSet<String>,
+    pub(crate) facts: HashMap<String, Fact>,
     pub(crate) shadowed: HashSet<String>,
 }
 
 impl NarrowFrame {
-    pub(crate) fn new(facts: HashSet<String>) -> NarrowFrame {
+    pub(crate) fn new(facts: HashMap<String, Fact>) -> NarrowFrame {
         NarrowFrame {
             facts,
             shadowed: HashSet::new(),
@@ -31,15 +41,33 @@ pub(crate) fn covers(prefix: &str, path: &str) -> bool {
     path == prefix || (path.starts_with(prefix) && path[prefix.len()..].starts_with('.'))
 }
 
-/// The place paths a condition proves non-null: `(if_true, if_false)`.
-/// `x != null` (or `x.f != null`) proves the path in the true branch,
-/// `== null` in the false branch; `&&` accumulates its sides' true-facts.
-pub(crate) fn null_checks(cond: &Expr) -> (HashSet<String>, HashSet<String>) {
-    let (mut if_true, mut if_false) = (HashSet::new(), HashSet::new());
+/// The facts a condition proves: `(if_true, if_false)`. `x != null`
+/// proves NonNull in the true branch, `== null` in the false branch;
+/// `x == error` proves IsErr true / NoErr false (`!=` the inverse —
+/// unlike null, both error branches carry a fact); `&&` accumulates
+/// its sides' true-facts.
+pub(crate) fn null_checks(cond: &Expr) -> (HashMap<String, Fact>, HashMap<String, Fact>) {
+    let (mut if_true, mut if_false) = (HashMap::new(), HashMap::new());
     if let Expr::Binary { op, lhs, rhs, .. } = cond {
         match op {
-            BinOp::Ne => if_true.extend(place_vs_null(lhs, rhs)),
-            BinOp::Eq => if_false.extend(place_vs_null(lhs, rhs)),
+            BinOp::Ne => {
+                if let Some(p) = place_vs_null(lhs, rhs) {
+                    if_true.insert(p, Fact::NonNull);
+                }
+                if let Some(p) = place_vs_error(lhs, rhs) {
+                    if_true.insert(p.clone(), Fact::NoErr);
+                    if_false.insert(p, Fact::IsErr);
+                }
+            }
+            BinOp::Eq => {
+                if let Some(p) = place_vs_null(lhs, rhs) {
+                    if_false.insert(p, Fact::NonNull);
+                }
+                if let Some(p) = place_vs_error(lhs, rhs) {
+                    if_true.insert(p.clone(), Fact::IsErr);
+                    if_false.insert(p, Fact::NoErr);
+                }
+            }
             BinOp::And => {
                 let (mut lhs_true, _) = null_checks(lhs);
                 // The right side runs after the left's checks — a call in
@@ -47,7 +75,7 @@ pub(crate) fn null_checks(cond: &Expr) -> (HashSet<String>, HashSet<String>) {
                 // facts don't cross it. (Bare-variable facts survive; a
                 // callee can't rebind the caller's locals.)
                 if contains_call(rhs) {
-                    lhs_true.retain(|p| !p.contains('.'));
+                    lhs_true.retain(|p, _| !p.contains('.'));
                 }
                 if_true.extend(lhs_true);
                 if_true.extend(null_checks(rhs).0);
@@ -86,13 +114,15 @@ pub(crate) fn contains_call(e: &Expr) -> bool {
         Expr::StructLit { fields, .. } => fields.iter().any(|(_, v)| contains_call(v)),
         Expr::ArrayLit { elements, .. } => elements.iter().any(contains_call),
         Expr::Index { base, index, .. } => contains_call(base) || contains_call(index),
+        Expr::Try { expr, .. } => contains_call(expr),
         Expr::Int(..)
         | Expr::Float(..)
         | Expr::Bool(..)
         | Expr::Str(..)
         | Expr::Ident(..)
         | Expr::Null(_)
-        | Expr::ErrorLit(..) => false,
+        | Expr::ErrorLit(..)
+        | Expr::ErrorKind(_) => false,
     }
 }
 
@@ -159,6 +189,15 @@ pub(crate) fn body_effects(
 pub(crate) fn place_vs_null(a: &Expr, b: &Expr) -> Option<String> {
     match (a, b) {
         (Expr::Null(_), e) | (e, Expr::Null(_)) => e.place_path(),
+        _ => None,
+    }
+}
+
+/// `x == error` / `x != error` — the bare `error` marker against a
+/// place path (ADR 0034).
+pub(crate) fn place_vs_error(a: &Expr, b: &Expr) -> Option<String> {
+    match (a, b) {
+        (Expr::ErrorKind(_), e) | (e, Expr::ErrorKind(_)) => e.place_path(),
         _ => None,
     }
 }

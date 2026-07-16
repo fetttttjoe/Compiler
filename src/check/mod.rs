@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{BinOp, Conv, Expr, Function, Item, Stmt, TypeAnn, UnOp};
 use crate::diagnostic::Diagnostic;
 use crate::modules::ModuleGraph;
-use crate::narrow::{NarrowFrame, body_effects, covers, diverges, null_checks};
+use crate::narrow::{Fact, NarrowFrame, body_effects, covers, diverges, null_checks};
 use crate::span::Span;
 use crate::syntax;
 use crate::types::{
@@ -174,10 +174,15 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                         .fields
                         .iter()
                         .map(|f| {
-                            (
-                                f.name.clone(),
-                                resolve_type(&f.ty, &ty_aliases[mi], s.span, &mut diags),
-                            )
+                            let ty = resolve_type(&f.ty, &ty_aliases[mi], s.span, &mut diags);
+                            if matches!(ty, Type::ErrUnion(_)) {
+                                diags.push(Diagnostic::error(
+                                    "error unions in struct fields are not yet supported"
+                                        .to_string(),
+                                    s.span,
+                                ));
+                            }
+                            (f.name.clone(), ty)
                         })
                         .collect();
                     structs.insert(
@@ -192,7 +197,16 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                     let params = f
                         .params
                         .iter()
-                        .map(|p| resolve_type(&p.ty, &ty_aliases[mi], f.span, &mut diags))
+                        .map(|p| {
+                            let ty = resolve_type(&p.ty, &ty_aliases[mi], f.span, &mut diags);
+                            if matches!(ty, Type::ErrUnion(_)) {
+                                diags.push(Diagnostic::error(
+                                    "error unions in parameters are not yet supported".to_string(),
+                                    f.span,
+                                ));
+                            }
+                            ty
+                        })
                         .collect();
                     let ret = match &f.return_type {
                         Some(t) => resolve_type(t, &ty_aliases[mi], f.span, &mut diags),
@@ -240,6 +254,7 @@ pub fn check(graph: &ModuleGraph) -> (Resolutions, Vec<Diagnostic>) {
                     nonnull: Vec::new(),
                     loop_depth: 0,
                     ret: Type::Unit,
+                    try_ok: false,
                     field_slots: &mut field_slots,
                     expr_types: &mut expr_types,
                     let_types: &mut let_types,
@@ -348,10 +363,31 @@ fn resolve_type(ann: &TypeAnn, ty_alias: &Alias, span: Span, diags: &mut Vec<Dia
         TypeAnn::Str => Type::Str,
         TypeAnn::File => Type::File,
         TypeAnn::ErrCode => Type::ErrCode,
+        TypeAnn::ErrUnion(inner) => {
+            let inner = resolve_type(inner, ty_alias, span, diags);
+            if inner == Type::ErrCode {
+                diags.push(Diagnostic::error(
+                    "'error!' is redundant — 'error' is already the code type".to_string(),
+                    span,
+                ));
+                return Type::Error;
+            }
+            Type::ErrUnion(Box::new(inner))
+        }
         TypeAnn::Optional(inner) => {
             Type::Optional(Box::new(resolve_type(inner, ty_alias, span, diags)))
         }
-        TypeAnn::Array(inner) => Type::Array(Box::new(resolve_type(inner, ty_alias, span, diags))),
+        TypeAnn::Array(inner) => {
+            let inner = resolve_type(inner, ty_alias, span, diags);
+            if matches!(inner, Type::ErrUnion(_)) {
+                diags.push(Diagnostic::error(
+                    "arrays of error unions are not yet supported".to_string(),
+                    span,
+                ));
+                return Type::Error;
+            }
+            Type::Array(Box::new(inner))
+        }
         TypeAnn::Named(name) => match ty_alias.get(name) {
             Some((m, n)) => Type::Struct(*m, n.clone()),
             None => {
@@ -390,6 +426,11 @@ struct Checker<'a> {
     /// `continue` are rejected at depth 0 (ADR 0019).
     loop_depth: usize,
     ret: Type,
+    /// True exactly while typing a statement's direct right-hand side —
+    /// the only positions where `try` is supported (ADR 0034). Taken
+    /// (and reset) at every `type_of_expr` entry, so operands never
+    /// inherit it.
+    try_ok: bool,
     /// Codegen resolution tables filled in as expressions type (see
     /// `Resolutions::field_slots` / `struct_lits`).
     field_slots: &'a mut HashMap<Span, FieldSlot>,

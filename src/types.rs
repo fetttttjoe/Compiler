@@ -23,6 +23,9 @@ pub enum Type {
     /// `error` — a declared error code (ADR 0034): one word, identity
     /// equality, module-scoped names.
     ErrCode,
+    /// `T!` — T or a declared error code (ADR 0034): tag word first
+    /// (0 = value, 1 = reserved, ≥2 = the code), payload after.
+    ErrUnion(Box<Type>),
     /// The type of the `null` literal; fits only into `T?` slots.
     Null,
     Unit,
@@ -42,7 +45,7 @@ pub enum Type {
 pub(crate) fn poisoned(t: &Type) -> bool {
     match t {
         Type::Error => true,
-        Type::Optional(inner) | Type::Array(inner) => poisoned(inner),
+        Type::Optional(inner) | Type::Array(inner) | Type::ErrUnion(inner) => poisoned(inner),
         _ => false,
     }
 }
@@ -70,6 +73,7 @@ impl Type {
             Type::Array(inner) if unconstrained(inner) => "[]".to_string(),
             Type::Array(inner) => format!("{}[]", inner.name()),
             Type::ErrCode => "error".to_string(),
+            Type::ErrUnion(inner) => format!("{}!", inner.name()),
             Type::Null => "null".to_string(),
             Type::Unit => "unit".to_string(),
             Type::Error => "<error>".to_string(),
@@ -91,6 +95,9 @@ pub(crate) fn fits(value: &Type, target: &Type) -> bool {
         // binding can't keep `unknown` (annotation required at `let`).
         (_, Type::Unknown) => true,
         (_, Type::Optional(inner)) => matches!(value, Type::Null) || fits(value, inner),
+        // A value or a code flows into `T!` (ADR 0034); `T!` itself only
+        // matched exactly above — unions never silently unwrap.
+        (_, Type::ErrUnion(inner)) => matches!(value, Type::ErrCode) || fits(value, inner),
         // Arrays are invariant — int[] into int?[] would let an alias push
         // null into the int[] — except unconstrained elements on either
         // side: `[]` fits any array slot and accepts any element type.
@@ -113,9 +120,15 @@ pub struct StructType {
 }
 
 /// Comparability for `==`/`!=`: two non-unit types compare when either fits
-/// the other — same type, `null` vs `T?`, or `T` vs `T?`.
+/// the other — same type, `null` vs `T?`, or `T` vs `T?`. Error unions
+/// never compare directly — only against the bare `error` marker, which
+/// is handled before this (ADR 0034: narrow first).
 pub(crate) fn eq_comparable(lt: &Type, rt: &Type) -> bool {
-    *lt != Type::Unit && *rt != Type::Unit && (fits(lt, rt) || fits(rt, lt))
+    !matches!(lt, Type::ErrUnion(_))
+        && !matches!(rt, Type::ErrUnion(_))
+        && *lt != Type::Unit
+        && *rt != Type::Unit
+        && (fits(lt, rt) || fits(rt, lt))
 }
 
 pub(crate) fn is_numeric(t: &Type) -> bool {
