@@ -159,6 +159,15 @@ pub(super) fn substitute_ann(ann: &TypeAnn, bind: &HashMap<String, Type>) -> Typ
     }
 }
 
+/// Type-parameter names zipped with their bound arguments — the bind
+/// map every instantiation path builds.
+pub(super) fn bind_params(
+    params: &[(String, Span)],
+    args: impl IntoIterator<Item = Type>,
+) -> HashMap<String, Type> {
+    params.iter().map(|(n, _)| n.clone()).zip(args).collect()
+}
+
 /// The instance key for a function template applied to `args`.
 pub(super) fn fn_instance_key(template: &(usize, String), args: &[Type]) -> (usize, String) {
     (template.0, instance_name(&template.1, args))

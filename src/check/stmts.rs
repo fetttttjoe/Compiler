@@ -178,7 +178,7 @@ impl Checker<'_, '_> {
                                 arm.variant_span,
                             );
                         }
-                        self.variant_tags.insert(arm.variant_span, tag as u32);
+                        self.out.variant_tags.insert(arm.variant_span, tag as u32);
                         let payloads = def.variants[tag].1.clone();
                         if arm.bindings.len() != payloads.len() {
                             self.error(
@@ -280,7 +280,7 @@ impl Checker<'_, '_> {
                         let declared = self.resolve(ann, *span);
                         // Codegen gates bindings on this resolved type —
                         // never on the raw annotation.
-                        self.let_types.insert(*span, declared.clone());
+                        self.out.let_types.insert(*span, declared.clone());
                         if !self.check_literal_against(value, &declared) {
                             let init_ty = self.type_of_rhs(value);
                             if !fits(&init_ty, &declared) {

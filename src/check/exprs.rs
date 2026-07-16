@@ -27,7 +27,7 @@ impl Checker<'_, '_> {
         let ty = self.type_of_expr_inner(expr);
         // The per-expression type table (Resolutions::expr_types) — the
         // one choke point every typing pass flows through.
-        self.expr_types.insert(expr.span(), ty.clone());
+        self.out.expr_types.insert(expr.span(), ty.clone());
         ty
     }
 
@@ -76,7 +76,7 @@ impl Checker<'_, '_> {
             }
             Expr::ErrorLit(name, span) => match self.err_alias.get(name) {
                 Some(key) => {
-                    self.error_lits.insert(*span, self.error_codes[key]);
+                    self.out.error_lits.insert(*span, self.error_codes[key]);
                     Type::ErrCode
                 }
                 None => {
@@ -182,7 +182,7 @@ impl Checker<'_, '_> {
                     } else {
                         (rhs, lhs)
                     };
-                    self.expr_types.insert(marker.span(), Type::Unit);
+                    self.out.expr_types.insert(marker.span(), Type::Unit);
                     let ty = self.type_of_expr(place);
                     if !matches!(ty, Type::ErrUnion(_)) && !poisoned(&ty) {
                         self.error(
@@ -498,7 +498,7 @@ impl Checker<'_, '_> {
         if !type_args.is_empty() {
             self.error(format!("'{name}' takes no type arguments"), span);
         }
-        self.call_targets.insert(span, target.clone());
+        self.out.call_targets.insert(span, target.clone());
         let sig = &sigs[target];
         if args.len() != sig.params.len() {
             self.error(
@@ -559,80 +559,33 @@ impl Checker<'_, '_> {
         };
         // Pin the instance: monomorphic key, or template + arguments.
         let ikey = if let Some(tmpl) = self.mono.enum_templates.get(&key).copied() {
-            let tparams: Vec<&str> = tmpl.type_params.iter().map(|(n, _)| n.as_str()).collect();
-            let bind: HashMap<String, Type> = if !type_args.is_empty() {
-                if type_args.len() != tparams.len() {
-                    self.error(
-                        format!(
-                            "'{}' expects {} type argument(s), found {}",
-                            name,
-                            tparams.len(),
-                            type_args.len()
-                        ),
-                        span,
-                    );
-                    return Type::Error;
-                }
-                let resolved: Vec<Type> = type_args.iter().map(|a| self.resolve(a, span)).collect();
-                if resolved.iter().any(poisoned) {
-                    return Type::Error;
-                }
-                tparams
-                    .iter()
-                    .map(|n| n.to_string())
-                    .zip(resolved)
-                    .collect()
-            } else {
+            // For inference, the named variant's payload annotations
+            // unify against the argument types.
+            let pairs: Vec<(&TypeAnn, &Type)> = if type_args.is_empty() {
                 let Some(vdecl) = tmpl.variants.iter().find(|v| v.name == variant) else {
                     self.unknown_variant(name, variant, span);
                     return Type::Error;
                 };
-                let mut bind = HashMap::new();
-                let tset: std::collections::HashSet<&str> = tparams.iter().copied().collect();
-                for (ann, at) in vdecl.payloads.iter().zip(&arg_tys) {
-                    if let Err((tp, a, b)) = super::generics::unify(
-                        ann,
-                        at,
-                        &tset,
-                        &mut bind,
-                        &self.mono.instance_args,
-                        self.ty_alias,
-                    ) {
-                        self.error(
-                            format!(
-                                "conflicting types for '{tp}': {} vs {}",
-                                self.type_name(&a),
-                                self.type_name(&b)
-                            ),
-                            span,
-                        );
-                        return Type::Error;
-                    }
-                }
-                for tp in &tparams {
-                    if !bind.contains_key(*tp) {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                format!("cannot infer '{tp}' from the arguments"),
-                                span,
-                            )
-                            .with_help(format!(
-                                "write the type arguments: '{name}<…>.{variant}(…)'"
-                            )),
-                        );
-                        return Type::Error;
-                    }
-                }
-                bind
+                vdecl.payloads.iter().zip(&arg_tys).collect()
+            } else {
+                Vec::new()
             };
-            let ordered: Vec<Type> = tparams.iter().map(|n| bind[*n].clone()).collect();
-            let mut cx = TypeCx {
-                module: self.module,
-                ty_aliases: self.ty_aliases,
-                mono: self.mono,
-                diags: self.diagnostics,
+            let Some(bind) = self.bind_type_params(
+                name,
+                &tmpl.type_params,
+                type_args,
+                &pairs,
+                format!("write the type arguments: '{name}<…>.{variant}(…)'"),
+                span,
+            ) else {
+                return Type::Error;
             };
-            match instantiate_enum(&key, ordered, &mut cx, span) {
+            let ordered: Vec<Type> = tmpl
+                .type_params
+                .iter()
+                .map(|(n, _)| bind[n].clone())
+                .collect();
+            match instantiate_enum(&key, ordered, &mut self.cx_in(self.module), span) {
                 Type::Enum(m, n) => (m, n),
                 _ => return Type::Error,
             }
@@ -681,12 +634,83 @@ impl Checker<'_, '_> {
                 );
             }
         }
-        self.variant_tags.insert(span, tag as u32);
+        self.out.variant_tags.insert(span, tag as u32);
         Type::Enum(ikey.0, ikey.1)
     }
 
     fn unknown_variant(&mut self, name: &str, variant: &str, span: Span) {
         self.error(format!("enum '{name}' has no variant '{variant}'"), span);
+    }
+
+    /// Pins a template's type parameters (ADR 0035): explicit
+    /// arguments resolve in the caller's view — they were written
+    /// here — and must match the parameter count; otherwise `pairs`
+    /// (template annotation, argument type) drive unification. `help`
+    /// names the explicit syntax for the cannot-infer diagnostic.
+    /// `None` = diagnosed.
+    fn bind_type_params(
+        &mut self,
+        name: &str,
+        tparams: &[(String, Span)],
+        type_args: &[TypeAnn],
+        pairs: &[(&TypeAnn, &Type)],
+        help: String,
+        span: Span,
+    ) -> Option<HashMap<String, Type>> {
+        if !type_args.is_empty() {
+            if type_args.len() != tparams.len() {
+                self.error(
+                    format!(
+                        "'{}' expects {} type argument(s), found {}",
+                        name,
+                        tparams.len(),
+                        type_args.len()
+                    ),
+                    span,
+                );
+                return None;
+            }
+            let resolved: Vec<Type> = type_args.iter().map(|a| self.resolve(a, span)).collect();
+            if resolved.iter().any(poisoned) {
+                return None; // the argument already reported
+            }
+            return Some(super::generics::bind_params(tparams, resolved));
+        }
+        let mut bind = HashMap::new();
+        let tset: HashSet<&str> = tparams.iter().map(|(n, _)| n.as_str()).collect();
+        for &(ann, at) in pairs {
+            if let Err((tp, a, b)) = super::generics::unify(
+                ann,
+                at,
+                &tset,
+                &mut bind,
+                &self.mono.instance_args,
+                self.ty_alias,
+            ) {
+                self.error(
+                    format!(
+                        "conflicting types for '{tp}': {} vs {}",
+                        self.type_name(&a),
+                        self.type_name(&b)
+                    ),
+                    span,
+                );
+                return None;
+            }
+        }
+        if pairs.iter().any(|(_, at)| poisoned(at)) && bind.len() != tparams.len() {
+            return None; // broken arguments already reported
+        }
+        for (tp, _) in tparams {
+            if !bind.contains_key(tp) {
+                self.diagnostics.push(
+                    Diagnostic::error(format!("cannot infer '{tp}' from the arguments"), span)
+                        .with_help(help),
+                );
+                return None;
+            }
+        }
+        Some(bind)
     }
 
     /// A call to a generic template (ADR 0035): pin the type parameters
@@ -702,117 +726,37 @@ impl Checker<'_, '_> {
         span: Span,
     ) -> Type {
         let tmpl = self.mono.fn_templates[&tkey];
-        let tparams: Vec<&str> = tmpl.type_params.iter().map(|(n, _)| n.as_str()).collect();
-        let (tmpl_params, tmpl_ret, tmpl_span) = (&tmpl.params, &tmpl.return_type, tmpl.span);
         // Arguments type first — inference needs them, and their own
         // errors must not vanish behind inference noise.
         let arg_tys: Vec<Type> = args.iter().map(|a| self.type_of_expr(a)).collect();
-        if args.len() != tmpl_params.len() {
+        if args.len() != tmpl.params.len() {
             self.error(
                 format!(
                     "function '{}' expects {} argument(s), found {}",
                     name,
-                    tmpl_params.len(),
+                    tmpl.params.len(),
                     args.len()
                 ),
                 span,
             );
             return Type::Error;
         }
-        let bind: HashMap<String, Type> = if !type_args.is_empty() {
-            if type_args.len() != tparams.len() {
-                self.error(
-                    format!(
-                        "'{}' expects {} type argument(s), found {}",
-                        name,
-                        tparams.len(),
-                        type_args.len()
-                    ),
-                    span,
-                );
-                return Type::Error;
-            }
-            // Explicit arguments resolve in the caller's view — they
-            // were written here.
-            let resolved: Vec<Type> = type_args.iter().map(|a| self.resolve(a, span)).collect();
-            if resolved.iter().any(poisoned) {
-                return Type::Error; // the argument already reported
-            }
-            tparams
-                .iter()
-                .map(|n| n.to_string())
-                .zip(resolved)
-                .collect()
-        } else {
-            let mut bind = HashMap::new();
-            let tset: std::collections::HashSet<&str> = tparams.iter().copied().collect();
-            for (p, at) in tmpl_params.iter().zip(&arg_tys) {
-                if let Err((tp, a, b)) = super::generics::unify(
-                    &p.ty,
-                    at,
-                    &tset,
-                    &mut bind,
-                    &self.mono.instance_args,
-                    self.ty_alias,
-                ) {
-                    self.error(
-                        format!(
-                            "conflicting types for '{tp}': {} vs {}",
-                            self.type_name(&a),
-                            self.type_name(&b)
-                        ),
-                        span,
-                    );
-                    return Type::Error;
-                }
-            }
-            if arg_tys.iter().any(poisoned) && bind.len() != tparams.len() {
-                return Type::Error; // broken arguments already reported
-            }
-            for tp in &tparams {
-                if !bind.contains_key(*tp) {
-                    self.diagnostics.push(
-                        Diagnostic::error(format!("cannot infer '{tp}' from the arguments"), span)
-                            .with_help(format!("write the type argument: '{name}<…>(…)'")),
-                    );
-                    return Type::Error;
-                }
-            }
-            bind
+        let pairs: Vec<(&TypeAnn, &Type)> =
+            tmpl.params.iter().map(|p| &p.ty).zip(&arg_tys).collect();
+        let Some(bind) = self.bind_type_params(
+            name,
+            &tmpl.type_params,
+            type_args,
+            &pairs,
+            format!("write the type argument: '{name}<…>(…)'"),
+            span,
+        ) else {
+            return Type::Error;
         };
         // The instance signature: template annotations substituted,
         // resolved in the template's own module (ADR 0035 decision 7).
-        let mut params = Vec::with_capacity(tmpl_params.len());
-        for p in tmpl_params {
-            let ann = super::generics::substitute_ann(&p.ty, &bind);
-            let mut cx = TypeCx {
-                module: tkey.0,
-                ty_aliases: self.ty_aliases,
-                mono: self.mono,
-                diags: self.diagnostics,
-            };
-            let ty = resolve_type(&ann, &mut cx, span);
-            if matches!(ty, Type::ErrUnion(_)) {
-                self.error(
-                    "error unions in parameters are not yet supported".to_string(),
-                    tmpl_span,
-                );
-            }
-            params.push(ty);
-        }
-        let ret = match tmpl_ret {
-            Some(t) => {
-                let ann = super::generics::substitute_ann(t, &bind);
-                let mut cx = TypeCx {
-                    module: tkey.0,
-                    ty_aliases: self.ty_aliases,
-                    mono: self.mono,
-                    diags: self.diagnostics,
-                };
-                resolve_type(&ann, &mut cx, span)
-            }
-            None => Type::Unit,
-        };
+        let FnSig { params, ret } =
+            instance_signature(tmpl, &bind, &mut self.cx_in(tkey.0), tmpl.span);
         // Argument fit against the substituted parameters; literal
         // re-recording keeps the type table concrete for the engines.
         for ((arg, at), expected) in args.iter().zip(&arg_tys).zip(&params) {
@@ -834,9 +778,13 @@ impl Checker<'_, '_> {
             }
         }
         // Register the instance and resolve this call site to it.
-        let ordered: Vec<Type> = tparams.iter().map(|n| bind[*n].clone()).collect();
+        let ordered: Vec<Type> = tmpl
+            .type_params
+            .iter()
+            .map(|(n, _)| bind[n].clone())
+            .collect();
         let ikey = super::generics::fn_instance_key(&tkey, &ordered);
-        self.call_targets.insert(span, ikey.clone());
+        self.out.call_targets.insert(span, ikey.clone());
         if self.mono.requested.insert(ikey) {
             if self.inst_depth >= super::generics::DEPTH_CAP {
                 self.error(
@@ -873,7 +821,7 @@ impl Checker<'_, '_> {
         };
         // This path bypasses type_of_expr, but the per-expression type
         // table must stay total: the literal's type IS the declared one.
-        self.expr_types.insert(value.span(), expected.clone());
+        self.out.expr_types.insert(value.span(), expected.clone());
         for element in elements {
             if self.check_literal_against(element, elem) {
                 continue;
@@ -954,7 +902,7 @@ impl Checker<'_, '_> {
             .map(|(i, ty)| {
                 // Codegen's layout table (field offsets are computed from
                 // the base def, since fields may be multi-word).
-                self.field_slots.insert(
+                self.out.field_slots.insert(
                     span,
                     FieldSlot {
                         base: (*sm, struct_name.clone()),
@@ -1022,13 +970,7 @@ impl Checker<'_, '_> {
                 return Type::Error;
             }
             let args: Vec<Type> = type_args.iter().map(|a| self.resolve(a, span)).collect();
-            let mut cx = TypeCx {
-                module: self.module,
-                ty_aliases: self.ty_aliases,
-                mono: self.mono,
-                diags: self.diagnostics,
-            };
-            match instantiate_struct(&key, args, &mut cx, span) {
+            match instantiate_struct(&key, args, &mut self.cx_in(self.module), span) {
                 Type::Struct(m, n) => (m, n),
                 _ => {
                     for (_, value) in fields {

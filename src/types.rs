@@ -111,9 +111,9 @@ impl Type {
             Type::Str => "string".to_string(),
             Type::File => "file".to_string(),
             // Instances store canonical names; display strips the
-            // module qualifiers (ADR 0035).
-            Type::Struct(_, n) | Type::Enum(_, n) if n.contains('#') => pretty(n),
-            Type::Struct(_, n) | Type::Enum(_, n) => n.clone(),
+            // module qualifiers (ADR 0035) — `pretty` is the identity
+            // for source names.
+            Type::Struct(_, n) | Type::Enum(_, n) => pretty(n),
             Type::Optional(inner) => format!("{}?", inner.name()),
             Type::Array(inner) if unconstrained(inner) => "[]".to_string(),
             Type::Array(inner) => format!("{}[]", inner.name()),
