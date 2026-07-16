@@ -1,6 +1,6 @@
 use crate::ast::{
-    Ast, BinOp, Conv, ErrorDecl, Expr, Field, Function, ImportDecl, Item, Param, Stmt, Struct,
-    TypeAnn, UnOp,
+    Ast, BinOp, Conv, EnumDecl, ErrorDecl, Expr, Field, Function, ImportDecl, Item, MatchArm,
+    Param, Stmt, Struct, TypeAnn, UnOp, Variant,
 };
 use crate::diagnostic::Diagnostic;
 use crate::span::Span;
@@ -285,6 +285,8 @@ pub(super) fn describe(kind: &TokenKind) -> &'static str {
         FileType => "'file'",
         ErrorKw => "'error'",
         Try => "'try'",
+        Enum => "'enum'",
+        Match => "'match'",
         Identifier(_) => "an identifier",
         IntLiteral(_) => "an integer",
         FloatLiteral(_) => "a float",
@@ -336,6 +338,7 @@ pub fn parse(tokens: &[Token]) -> (Ast, Vec<Diagnostic>) {
             TokenKind::Struct | TokenKind::RefStruct => {
                 items.push(Item::Struct(parser.parse_struct(false)))
             }
+            TokenKind::Enum => items.push(Item::Enum(parser.parse_enum(false))),
             TokenKind::Import => items.push(Item::Import(parser.parse_import())),
             TokenKind::ErrorKw => items.push(Item::Error(parser.parse_error_decl(false))),
             TokenKind::Export => {
@@ -345,12 +348,13 @@ pub fn parse(tokens: &[Token]) -> (Ast, Vec<Diagnostic>) {
                     TokenKind::Struct | TokenKind::RefStruct => {
                         items.push(Item::Struct(parser.parse_struct(true)))
                     }
+                    TokenKind::Enum => items.push(Item::Enum(parser.parse_enum(true))),
                     TokenKind::ErrorKw => items.push(Item::Error(parser.parse_error_decl(true))),
                     _ => {
                         let tok = parser.peek().clone();
                         parser.error(
                             format!(
-                                "expected 'fun', 'struct', or 'error' after 'export', found {}",
+                                "expected 'fun', 'struct', 'enum', or 'error' after 'export', found {}",
                                 describe(&tok.kind)
                             ),
                             tok.span,
@@ -363,7 +367,7 @@ pub fn parse(tokens: &[Token]) -> (Ast, Vec<Diagnostic>) {
                 let tok = parser.peek().clone();
                 parser.error(
                     format!(
-                        "expected 'fun', 'struct', or 'error', found {}",
+                        "expected 'fun', 'struct', 'enum', or 'error', found {}",
                         describe(&tok.kind)
                     ),
                     tok.span,

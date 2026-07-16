@@ -2538,3 +2538,106 @@ fn generic_string_conversion_and_templates() {
          }",
     );
 }
+
+// --- Payload enums (ADR 0036): construction, match, equality ---
+
+#[test]
+fn enum_construction_and_match_dispatch() {
+    diff(
+        "enum_basic",
+        "enum Shape { Circle(float), Square(float, float), Ready }\n\
+         fun area(s: Shape): float {\n\
+             match s {\n\
+                 Circle(r) { return 3.0 * r * r; }\n\
+                 Square(w, h) { return w * h; }\n\
+                 else { return 0.0; }\n\
+             }\n\
+         }\n\
+         fun main(): int {\n\
+             print(Shape.Circle(1.5));\n\
+             print(area(Shape.Square(2.0, 4.0)));\n\
+             print(area(Shape.Ready()));\n\
+             return int(area(Shape.Circle(2.0)));\n\
+         }",
+    );
+}
+
+#[test]
+fn enum_equality_memcmp_and_walk() {
+    // int payloads memcmp; float/string payloads take the per-variant
+    // walk (ADR 0036 layout story).
+    diff(
+        "enum_eq",
+        "enum W { A(int), B }\n\
+         enum N { C(float, string), D }\n\
+         fun main(): int {\n\
+             print(W.A(1) == W.A(1));\n\
+             print(W.A(1) == W.A(2));\n\
+             print(W.A(1) == W.B());\n\
+             print(N.C(1.5, \"x\") == N.C(1.5, \"x\"));\n\
+             print(N.C(1.5, \"x\") == N.C(1.5, \"y\"));\n\
+             print(N.D() == N.D());\n\
+             return 0;\n\
+         }",
+    );
+}
+
+#[test]
+fn generic_enums_flow_through_functions_and_arrays() {
+    diff(
+        "enum_generic",
+        "enum Result<T, E> { Ok(T), Err(E) }\n\
+         fun parse(s: string): Result<int, string> {\n\
+             if s == \"1\" { return Result<int, string>.Ok(1); }\n\
+             return Result<int, string>.Err(s);\n\
+         }\n\
+         fun unwrap<T>(r: Result<T, string>, fb: T): T {\n\
+             match r { Ok(v) { return v; } else { return fb; } }\n\
+         }\n\
+         fun main(): int {\n\
+             const rs: Result<int, string>[] = [parse(\"1\"), parse(\"no\")];\n\
+             print(rs);\n\
+             var sum: int = 0;\n\
+             for r in rs { sum = sum + unwrap(r, -5); }\n\
+             print(unwrap(Result<string, string>.Ok(\"s\"), \"f\"));\n\
+             return sum;\n\
+         }",
+    );
+}
+
+#[test]
+fn enums_nest_in_structs_and_mutate() {
+    diff(
+        "enum_nested",
+        "enum State { Idle, Run(int) }\n\
+         struct Machine { st: State, id: int }\n\
+         fun main(): int {\n\
+             var m: Machine = Machine { st: State.Idle(), id: 3 };\n\
+             print(m);\n\
+             m.st = State.Run(9);\n\
+             print(m);\n\
+             match m.st {\n\
+                 Run(n) { return n; }\n\
+                 else { return 0; }\n\
+             }\n\
+         }",
+    );
+}
+
+#[test]
+fn match_binding_copies_do_not_alias() {
+    // The binding copies out before the arm body runs; reassigning the
+    // scrutinee inside the arm must not change the binding.
+    diff(
+        "enum_copy",
+        "enum B { Box(int), E }\n\
+         fun main(): int {\n\
+             var b: B = B.Box(5);\n\
+             match b {\n\
+                 Box(v) { b = B.Box(99); print(v); print(b); }\n\
+                 else { }\n\
+             }\n\
+             return 0;\n\
+         }",
+    );
+}

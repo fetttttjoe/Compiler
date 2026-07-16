@@ -351,6 +351,45 @@ fn routine(
             b.insts.push(Inst::Label(end));
             b.piece("]");
         }
+        // `Circle(1.5)` / `Ready` (ADR 0036): a tag chain into the
+        // live variant's name and payloads, children one level deeper
+        // — the oracle's `display_variant`, byte for byte.
+        Type::Enum(m, ename) => {
+            let def = res.enums[&(*m, ename.clone())].clone();
+            let dm = b.sub(D, 1);
+            let tag = b.load(X, 0);
+            let end = b.label();
+            for (idx, (vname, payloads)) in def.variants.iter().enumerate() {
+                let c = b.fresh();
+                b.insts.push(Inst::BinImm {
+                    op: BinOp::Eq,
+                    dst: c,
+                    lhs: tag,
+                    imm: idx as i64,
+                });
+                let next = b.label();
+                b.insts.push(Inst::BrZero(c, next));
+                b.piece(vname);
+                if !payloads.is_empty() {
+                    b.piece("(");
+                    let mut off = 8i64;
+                    for (k, pt) in payloads.iter().enumerate() {
+                        if k > 0 {
+                            b.piece(", ");
+                        }
+                        let pk = kind_of(pt, res, FUEL).expect("printable payload");
+                        let v = b.child(X, off, pk);
+                        let child = printers.request(pt, res);
+                        b.show(&child, v, dm);
+                        off += 8 * pk.words() as i64;
+                    }
+                    b.piece(")");
+                }
+                b.insts.push(Inst::Jmp(end));
+                b.insts.push(Inst::Label(next));
+            }
+            b.insts.push(Inst::Label(end));
+        }
         Type::Struct(m, sname) => {
             let def = &res.structs[&(*m, sname.clone())];
             // A handle hop costs a level (render.rs): null absorb, the

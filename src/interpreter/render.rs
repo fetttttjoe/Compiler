@@ -52,6 +52,11 @@ impl Value {
             Value::Struct { name, fields } => {
                 display_struct(name, fields, |v| v.display_depth(heap, depth - 1))
             }
+            // `Circle(1.5)` / `Ready` — payloads at one level deeper,
+            // like struct fields (ADR 0036).
+            Value::Enum {
+                variant, payloads, ..
+            } => display_variant(variant, payloads, |v| v.display_depth(heap, depth - 1)),
         }
     }
 
@@ -83,6 +88,14 @@ impl Value {
             Value::Struct { name, fields } => {
                 render_struct(name, fields, |v| v.render_depth(heap, depth - 1))
             }
+            Value::Enum {
+                variant, payloads, ..
+            } => {
+                let shown = display_variant(variant, payloads, |v| {
+                    v.render_depth(heap, depth - 1).into_bytes()
+                });
+                String::from_utf8_lossy(&shown).into_owned()
+            }
             Value::Str(s) => format!("Str({:?})", String::from_utf8_lossy(s)),
             // The code stays unobservable in the result line too.
             Value::Err(code) => {
@@ -98,6 +111,7 @@ impl Value {
             Value::Bool(_) => "bool",
             Value::Str(_) => "string",
             Value::Struct { .. } => "struct",
+            Value::Enum { .. } => "enum",
             Value::Ref(_) => "refstruct",
             Value::Array(_) => "array",
             Value::File(_) => "file",
@@ -123,6 +137,27 @@ fn display_struct(
         out.extend_from_slice(&one(v));
     }
     out.extend_from_slice(b" }");
+    out
+}
+
+/// `Variant(p1, p2)`, or the bare name for nullary variants.
+fn display_variant(
+    variant: &str,
+    payloads: &[Value],
+    mut one: impl FnMut(&Value) -> Vec<u8>,
+) -> Vec<u8> {
+    let mut out = variant.as_bytes().to_vec();
+    if payloads.is_empty() {
+        return out;
+    }
+    out.push(b'(');
+    for (i, v) in payloads.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(b", ");
+        }
+        out.extend_from_slice(&one(v));
+    }
+    out.push(b')');
     out
 }
 

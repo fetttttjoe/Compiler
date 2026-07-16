@@ -8,8 +8,8 @@ use crate::source::SourceMap;
 use crate::span::Span;
 use crate::syntax;
 use crate::types::{
-    FnSig, StructType, Type, eq_comparable, fits, instance_name, is_numeric, poisoned, pretty,
-    unconstrained,
+    EnumType, FnSig, StructType, Type, eq_comparable, fits, instance_name, is_numeric, poisoned,
+    pretty, unconstrained,
 };
 
 use generics::{DEPTH_CAP, FnWork, Mono, instantiate_fn, substitute_ann};
@@ -26,6 +26,13 @@ pub struct Resolutions {
     /// Generic instances live here under their canonical names
     /// (ADR 0035); templates never do.
     pub structs: HashMap<(usize, String), StructType>,
+    /// Every enum definition, same keying and instance story
+    /// (ADR 0036).
+    pub enums: HashMap<(usize, String), EnumType>,
+    /// The variant tag behind every enum construction and every match
+    /// arm, keyed by the construction's span / the arm's variant span
+    /// (ADR 0036) — engines never resolve a variant name.
+    pub variant_tags: HashMap<Span, u32>,
     /// Every resolved user-function call, keyed by the call's span —
     /// total, like the type table (ADR 0035). Both engines resolve
     /// calls through it; an absent span means a builtin.
@@ -64,7 +71,10 @@ pub struct FieldSlot {
     pub ty: Type,
 }
 
-/// One module's declared names with their export flags.
+/// One module's declared names with their export flags. `structs` is
+/// the shared TYPE namespace — enums live in it too (ADR 0036), so a
+/// struct and an enum can't share a name and imports resolve through
+/// one bucket.
 struct ModuleNames {
     fns: HashMap<String, bool>,
     structs: HashMap<String, bool>,
@@ -181,13 +191,23 @@ pub fn check(graph: &ModuleGraph, map: &mut SourceMap) -> (Resolutions, Vec<Diag
     let mut error_codes: HashMap<(usize, String), u32> = HashMap::new();
     let mut error_names: Vec<String> = Vec::new();
     // Templates first: a monomorphic signature may apply a generic
-    // struct declared anywhere in the graph.
+    // struct or enum declared anywhere in the graph. Monomorphic enums
+    // leave a shell so `Named` resolution can classify enum-vs-struct
+    // before pass C fills the variants (declaration order is free).
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             match item {
                 Item::Struct(s) if !s.type_params.is_empty() => {
                     check_type_params(&s.type_params, &ty_aliases[mi], &mut diags);
                     mono.struct_templates.insert((mi, s.name.clone()), s);
+                }
+                Item::Enum(e) if !e.type_params.is_empty() => {
+                    check_type_params(&e.type_params, &ty_aliases[mi], &mut diags);
+                    mono.enum_templates.insert((mi, e.name.clone()), e);
+                }
+                Item::Enum(e) => {
+                    mono.enums
+                        .insert((mi, e.name.clone()), EnumType { variants: vec![] });
                 }
                 Item::Function(f) if !f.type_params.is_empty() => {
                     check_type_params(&f.type_params, &ty_aliases[mi], &mut diags);
@@ -236,11 +256,45 @@ pub fn check(graph: &ModuleGraph, map: &mut SourceMap) -> (Resolutions, Vec<Diag
                         },
                     );
                 }
+                Item::Enum(e) if e.type_params.is_empty() => {
+                    let variants = e
+                        .variants
+                        .iter()
+                        .map(|v| {
+                            let payloads = v
+                                .payloads
+                                .iter()
+                                .map(|ann| {
+                                    let mut cx = TypeCx {
+                                        module: mi,
+                                        ty_aliases: &ty_aliases,
+                                        mono: &mut mono,
+                                        diags: &mut diags,
+                                    };
+                                    let ty = resolve_type(ann, &mut cx, v.span);
+                                    if matches!(ty, Type::ErrUnion(_)) {
+                                        diags.push(Diagnostic::error(
+                                            "error unions in enum payloads are not yet supported"
+                                                .to_string(),
+                                            v.span,
+                                        ));
+                                    }
+                                    ty
+                                })
+                                .collect();
+                            (v.name.clone(), payloads)
+                        })
+                        .collect();
+                    mono.enums
+                        .get_mut(&(mi, e.name.clone()))
+                        .expect("shell inserted above")
+                        .variants = variants;
+                }
                 Item::Function(f) if f.type_params.is_empty() => {
                     let sig = resolve_signature(f, mi, &ty_aliases, &mut mono, &mut diags);
                     sigs.insert((mi, f.name.clone()), sig);
                 }
-                Item::Struct(_) | Item::Function(_) | Item::Import(_) => {}
+                Item::Struct(_) | Item::Function(_) | Item::Enum(_) | Item::Import(_) => {}
                 Item::Error(e) => {
                     for (name, _) in &e.names {
                         // Duplicates were diagnosed in collect_names; the
@@ -265,6 +319,7 @@ pub fn check(graph: &ModuleGraph, map: &mut SourceMap) -> (Resolutions, Vec<Diag
     let mut let_types = HashMap::new();
     let mut error_lits = HashMap::new();
     let mut call_targets = HashMap::new();
+    let mut variant_tags = HashMap::new();
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             if let Item::Function(f) = item
@@ -292,6 +347,7 @@ pub fn check(graph: &ModuleGraph, map: &mut SourceMap) -> (Resolutions, Vec<Diag
                     let_types: &mut let_types,
                     error_lits: &mut error_lits,
                     call_targets: &mut call_targets,
+                    variant_tags: &mut variant_tags,
                 };
                 checker.check_function(f);
             }
@@ -391,6 +447,7 @@ pub fn check(graph: &ModuleGraph, map: &mut SourceMap) -> (Resolutions, Vec<Diag
             let_types: &mut let_types,
             error_lits: &mut error_lits,
             call_targets: &mut call_targets,
+            variant_tags: &mut variant_tags,
         };
         checker.check_function(&inst);
         // Instance errors point at the template's true source line;
@@ -427,6 +484,8 @@ pub fn check(graph: &ModuleGraph, map: &mut SourceMap) -> (Resolutions, Vec<Diag
     (
         Resolutions {
             structs: mono.structs,
+            enums: mono.enums,
+            variant_tags,
             call_targets,
             instances,
             field_slots,
@@ -526,6 +585,14 @@ fn collect_names(ast: &[Item], diags: &mut Vec<Diagnostic>) -> ModuleNames {
                     ));
                 }
             }
+            Item::Enum(e) => {
+                if names.structs.insert(e.name.clone(), e.exported).is_some() {
+                    diags.push(Diagnostic::error(
+                        format!("enum '{}' is already defined", e.name),
+                        e.span,
+                    ));
+                }
+            }
             Item::Import(_) => {}
             Item::Error(e) => {
                 for (name, span) in &e.names {
@@ -585,22 +652,31 @@ fn resolve_type(ann: &TypeAnn, cx: &mut TypeCx, span: Span) -> Type {
         }
         // The monomorphizer's substitution carrier (ADR 0035).
         TypeAnn::Resolved(t) => t.clone(),
-        // `Pair<int, string>` — instantiate the template (ADR 0035).
+        // `Pair<int, string>` — instantiate the template (ADR
+        // 0035/0036); struct and enum templates share the dispatch.
         TypeAnn::Applied(name, args) => {
             let Some(key) = cx.ty_aliases[cx.module].get(name).cloned() else {
                 return unknown_type(name, cx, span);
             };
             let args: Vec<Type> = args.iter().map(|a| resolve_type(a, cx, span)).collect();
-            instantiate_struct(&key, args, cx, span)
+            if cx.mono.enum_templates.contains_key(&key) {
+                instantiate_enum(&key, args, cx, span)
+            } else {
+                instantiate_struct(&key, args, cx, span)
+            }
         }
         TypeAnn::Named(name) => match cx.ty_aliases[cx.module].get(name) {
-            Some(key) if cx.mono.struct_templates.contains_key(key) => {
+            Some(key)
+                if cx.mono.struct_templates.contains_key(key)
+                    || cx.mono.enum_templates.contains_key(key) =>
+            {
                 cx.diags.push(Diagnostic::error(
-                    format!("struct '{name}' is generic — write '{name}<…>'"),
+                    format!("'{name}' is generic — write '{name}<…>'"),
                     span,
                 ));
                 Type::Error
             }
+            Some(key) if cx.mono.enums.contains_key(key) => Type::Enum(key.0, key.1.clone()),
             Some((m, n)) => Type::Struct(*m, n.clone()),
             None => unknown_type(name, cx, span),
         },
@@ -671,7 +747,7 @@ fn instantiate_struct(
             },
         );
         cx.mono
-            .struct_args
+            .instance_args
             .insert(ikey.clone(), (tkey.clone(), args.clone()));
         let bind: HashMap<String, Type> = tmpl
             .type_params
@@ -701,6 +777,81 @@ fn instantiate_struct(
         cx.mono.structs.get_mut(&ikey).expect("marker above").fields = fields;
     }
     Type::Struct(ikey.0, ikey.1)
+}
+
+/// Instantiates an enum template at `args` (ADR 0036): the mirror of
+/// `instantiate_struct` — shell marker, substituted payload types
+/// resolved in the template's module, shared depth fuel.
+fn instantiate_enum(tkey: &(usize, String), args: Vec<Type>, cx: &mut TypeCx, span: Span) -> Type {
+    let tmpl = cx.mono.enum_templates[tkey];
+    if args.len() != tmpl.type_params.len() {
+        cx.diags.push(Diagnostic::error(
+            format!(
+                "'{}' expects {} type argument(s), found {}",
+                tkey.1,
+                tmpl.type_params.len(),
+                args.len()
+            ),
+            span,
+        ));
+        return Type::Error;
+    }
+    if args.iter().any(poisoned) {
+        return Type::Error; // the argument already reported
+    }
+    let ikey = (tkey.0, instance_name(&tkey.1, &args));
+    if !cx.mono.enums.contains_key(&ikey) {
+        if cx.mono.struct_depth >= DEPTH_CAP {
+            cx.diags.push(Diagnostic::error(
+                format!(
+                    "generic instantiation exceeds depth {DEPTH_CAP} — is '{}' expanding forever?",
+                    tkey.1
+                ),
+                span,
+            ));
+            return Type::Error;
+        }
+        cx.mono
+            .enums
+            .insert(ikey.clone(), EnumType { variants: vec![] });
+        cx.mono
+            .instance_args
+            .insert(ikey.clone(), (tkey.clone(), args.clone()));
+        let bind: HashMap<String, Type> = tmpl
+            .type_params
+            .iter()
+            .map(|(n, _)| n.clone())
+            .zip(args)
+            .collect();
+        cx.mono.struct_depth += 1;
+        let outer_module = std::mem::replace(&mut cx.module, tkey.0);
+        let variants: Vec<(String, Vec<Type>)> = tmpl
+            .variants
+            .iter()
+            .map(|v| {
+                let payloads = v
+                    .payloads
+                    .iter()
+                    .map(|ann| {
+                        let ann = substitute_ann(ann, &bind);
+                        let ty = resolve_type(&ann, cx, v.span);
+                        if matches!(ty, Type::ErrUnion(_)) {
+                            cx.diags.push(Diagnostic::error(
+                                "error unions in enum payloads are not yet supported".to_string(),
+                                v.span,
+                            ));
+                        }
+                        ty
+                    })
+                    .collect();
+                (v.name.clone(), payloads)
+            })
+            .collect();
+        cx.module = outer_module;
+        cx.mono.struct_depth -= 1;
+        cx.mono.enums.get_mut(&ikey).expect("shell above").variants = variants;
+    }
+    Type::Enum(ikey.0, ikey.1)
 }
 struct VarInfo {
     ty: Type,
@@ -749,6 +900,7 @@ struct Checker<'a, 'g> {
     let_types: &'a mut HashMap<Span, Type>,
     error_lits: &'a mut HashMap<Span, u32>,
     call_targets: &'a mut HashMap<Span, (usize, String)>,
+    variant_tags: &'a mut HashMap<Span, u32>,
 }
 
 mod exprs;
@@ -811,6 +963,13 @@ fn always_returns(stmts: &[Stmt]) -> bool {
             else_body: Some(else_body),
             ..
         } => always_returns(then_body) && always_returns(else_body),
+        // Syntax-only, so only an `else`-carrying match counts — the
+        // analysis can't prove exhaustiveness (ADR 0036).
+        Stmt::Match {
+            arms,
+            else_body: Some(else_body),
+            ..
+        } => arms.iter().all(|a| always_returns(&a.body)) && always_returns(else_body),
         _ => false,
     })
 }

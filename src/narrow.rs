@@ -98,6 +98,13 @@ pub(crate) fn diverges(stmts: &[Stmt]) -> bool {
             else_body: Some(else_body),
             ..
         } => diverges(then_body) && diverges(else_body),
+        // A match diverges only with an `else` — this analysis is pure
+        // syntax and cannot prove exhaustiveness (ADR 0036).
+        Stmt::Match {
+            arms,
+            else_body: Some(else_body),
+            ..
+        } => arms.iter().all(|a| diverges(&a.body)) && diverges(else_body),
         _ => false,
     })
 }
@@ -112,6 +119,8 @@ pub(crate) fn contains_call(e: &Expr) -> bool {
         Expr::Binary { lhs, rhs, .. } => contains_call(lhs) || contains_call(rhs),
         Expr::Field { base, .. } => contains_call(base),
         Expr::StructLit { fields, .. } => fields.iter().any(|(_, v)| contains_call(v)),
+        // Construction only evaluates its payloads — but they may call.
+        Expr::EnumLit { args, .. } => args.iter().any(contains_call),
         Expr::ArrayLit { elements, .. } => elements.iter().any(contains_call),
         Expr::Index { base, index, .. } => contains_call(base) || contains_call(index),
         Expr::Try { expr, .. } => contains_call(expr),
@@ -181,6 +190,22 @@ pub(crate) fn body_effects(
                     *kills_fields = true;
                 }
                 body_effects(body, assigned, kills_fields);
+            }
+            Stmt::Match {
+                scrutinee,
+                arms,
+                else_body,
+                ..
+            } => {
+                if contains_call(scrutinee) {
+                    *kills_fields = true;
+                }
+                for arm in arms {
+                    body_effects(&arm.body, assigned, kills_fields);
+                }
+                if let Some(else_body) = else_body {
+                    body_effects(else_body, assigned, kills_fields);
+                }
             }
         }
     }

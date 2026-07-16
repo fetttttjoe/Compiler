@@ -15,6 +15,9 @@ pub enum Type {
     /// A struct type identified by (defining module, name) — same-named
     /// structs in different modules are distinct types.
     Struct(usize, String),
+    /// A payload enum (ADR 0036), identified like structs; instances
+    /// carry canonical names (ADR 0035).
+    Enum(usize, String),
     /// `T?` — T or null.
     Optional(Box<Type>),
     /// `T[]` — growable array, reference semantics (aliased, identity
@@ -66,7 +69,7 @@ pub(crate) fn unconstrained(t: &Type) -> bool {
 /// — in instance keys or in `Type::Struct` equality.
 pub(crate) fn canon_name(t: &Type) -> String {
     match t {
-        Type::Struct(m, n) => format!("{n}#{m}"),
+        Type::Struct(m, n) | Type::Enum(m, n) => format!("{n}#{m}"),
         Type::Optional(inner) => format!("{}?", canon_name(inner)),
         Type::Array(inner) => format!("{}[]", canon_name(inner)),
         Type::ErrUnion(inner) => format!("{}!", canon_name(inner)),
@@ -109,8 +112,8 @@ impl Type {
             Type::File => "file".to_string(),
             // Instances store canonical names; display strips the
             // module qualifiers (ADR 0035).
-            Type::Struct(_, n) if n.contains('#') => pretty(n),
-            Type::Struct(_, n) => n.clone(),
+            Type::Struct(_, n) | Type::Enum(_, n) if n.contains('#') => pretty(n),
+            Type::Struct(_, n) | Type::Enum(_, n) => n.clone(),
             Type::Optional(inner) => format!("{}?", inner.name()),
             Type::Array(inner) if unconstrained(inner) => "[]".to_string(),
             Type::Array(inner) => format!("{}[]", inner.name()),
@@ -159,6 +162,13 @@ pub struct StructType {
     pub fields: Vec<(String, Type)>,
     /// True for `refstruct` declarations (reference semantics).
     pub by_ref: bool,
+}
+
+/// A resolved enum definition (ADR 0036): variants in declaration
+/// order — the tag IS the index — each with its payload types.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumType {
+    pub variants: Vec<(String, Vec<Type>)>,
 }
 
 /// Comparability for `==`/`!=`: two non-unit types compare when either fits

@@ -142,6 +142,117 @@ impl Checker<'_, '_> {
         }
     }
 
+    /// `match` (ADR 0036): the scrutinee must be an enum; every arm
+    /// names a distinct variant and binds its payloads (`_` skips);
+    /// coverage is all variants or an `else`. Arms mirror `if`
+    /// branches for narrowing — own frame and scope, divergence-aware
+    /// rollback.
+    fn check_match(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[crate::ast::MatchArm],
+        else_body: Option<&[Stmt]>,
+        span: Span,
+    ) {
+        let s_ty = self.type_of_expr(scrutinee);
+        self.unnarrow_field_paths(); // the scrutinee may call
+        let def = match &s_ty {
+            Type::Enum(m, n) => Some(self.mono.enums[&(*m, n.clone())].clone()),
+            t if poisoned(t) => None,
+            other => {
+                self.error(
+                    format!("match needs an enum, found {}", self.type_name(other)),
+                    scrutinee.span(),
+                );
+                None
+            }
+        };
+        let mut seen: HashSet<String> = HashSet::new();
+        for arm in arms {
+            let payloads = match &def {
+                Some(def) => match def.variants.iter().position(|(n, _)| n == &arm.variant) {
+                    Some(tag) => {
+                        if !seen.insert(arm.variant.clone()) {
+                            self.error(
+                                format!("duplicate arm for variant '{}'", arm.variant),
+                                arm.variant_span,
+                            );
+                        }
+                        self.variant_tags.insert(arm.variant_span, tag as u32);
+                        let payloads = def.variants[tag].1.clone();
+                        if arm.bindings.len() != payloads.len() {
+                            self.error(
+                                format!(
+                                    "variant '{}' has {} payload(s), found {} binding(s)",
+                                    arm.variant,
+                                    payloads.len(),
+                                    arm.bindings.len()
+                                ),
+                                arm.variant_span,
+                            );
+                        }
+                        payloads
+                    }
+                    None => {
+                        let names = def.variants.iter().map(|(n, _)| n.as_str());
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                format!("this enum has no variant '{}'", arm.variant),
+                                arm.variant_span,
+                            )
+                            .suggest(&arm.variant, names),
+                        );
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
+            };
+            // The arm body: its own frame and scope with the payload
+            // bindings; a diverging arm's narrowing side effects roll
+            // back, like an if branch (ADR 0020).
+            let saved = self.checkpoint(diverges(&arm.body));
+            self.nonnull.push(NarrowFrame::new(HashMap::new()));
+            self.scopes.push(HashMap::new());
+            for (i, (bname, _)) in arm.bindings.iter().enumerate() {
+                if bname != "_" {
+                    let ty = payloads.get(i).cloned().unwrap_or(Type::Error);
+                    self.bind(bname, ty, false);
+                }
+            }
+            for stmt in &arm.body {
+                self.check_stmt(stmt);
+            }
+            self.scopes.pop();
+            self.nonnull.pop();
+            self.rollback(saved);
+        }
+        if let Some(else_body) = else_body {
+            let saved = self.checkpoint(diverges(else_body));
+            self.check_block_narrowed(else_body, HashMap::new());
+            self.rollback(saved);
+        } else if let Some(def) = &def {
+            let missing: Vec<&str> = def
+                .variants
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .filter(|n| !seen.contains(*n))
+                .collect();
+            if !missing.is_empty() {
+                self.error(
+                    format!(
+                        "match does not cover variant(s) {} — add arms or 'else'",
+                        missing
+                            .iter()
+                            .map(|n| format!("'{n}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    span,
+                );
+            }
+        }
+    }
+
     pub(super) fn check_condition(&mut self, keyword: &str, cond: &Expr) {
         let ty = self.type_of_expr(cond);
         if !fits(&ty, &Type::Bool) {
@@ -329,6 +440,12 @@ impl Checker<'_, '_> {
                 self.scopes.pop();
                 self.nonnull.pop();
             }
+            Stmt::Match {
+                scrutinee,
+                arms,
+                else_body,
+                span,
+            } => self.check_match(scrutinee, arms, else_body.as_deref(), *span),
             Stmt::Expr(e) => {
                 self.type_of_rhs(e);
             }

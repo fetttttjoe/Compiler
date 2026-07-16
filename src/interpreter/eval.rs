@@ -223,6 +223,15 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Flow::Normal)
             }
+            // Variant dispatch (ADR 0036) — its own frame: the arm
+            // machinery must not fatten every statement's stack cost
+            // (the depth-budget policy in mod.rs is sized per unit).
+            Stmt::Match {
+                scrutinee,
+                arms,
+                else_body,
+                span,
+            } => self.exec_match(scrutinee, arms, else_body.as_deref(), *span),
             Stmt::Expr(e) => {
                 if let Rhs::Propagate(flow) = self.eval_rhs(e)? {
                     return Ok(flow);
@@ -238,6 +247,44 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal)
             }
         }
+    }
+
+    /// Variant dispatch (ADR 0036): find the live variant's arm, bind
+    /// its payloads (cloned out — value semantics), run the block;
+    /// `else` takes the rest.
+    fn exec_match(
+        &mut self,
+        scrutinee: &'a Expr,
+        arms: &'a [crate::ast::MatchArm],
+        else_body: Option<&'a [Stmt]>,
+        span: Span,
+    ) -> Result<Flow, Diagnostic> {
+        let v = self.eval(scrutinee)?;
+        let Value::Enum {
+            variant, payloads, ..
+        } = v
+        else {
+            return Err(Diagnostic::error(
+                format!("match needs an enum, found {}", v.type_name()),
+                span,
+            ));
+        };
+        if let Some(arm) = arms.iter().find(|a| a.variant == variant) {
+            let mut scope = HashMap::new();
+            for ((bname, _), value) in arm.bindings.iter().zip(payloads) {
+                if bname != "_" {
+                    scope.insert(bname.clone(), value);
+                }
+            }
+            self.scopes.push(scope);
+            let flow = self.exec_block(&arm.body);
+            self.scopes.pop();
+            return flow;
+        }
+        if let Some(else_body) = else_body {
+            return self.exec_block_scoped(else_body);
+        }
+        unreachable!("checker proves match coverage")
     }
 
     /// Evaluates a statement's right-hand side, honoring `try`
@@ -660,6 +707,14 @@ impl<'a> Interp<'a> {
                 Value::Null if *optional => Ok(Value::Null),
                 v => self.get_field(&v, name, *span),
             },
+            // Qualified construction (ADR 0036) — own frame, like
+            // exec_match.
+            Expr::EnumLit {
+                variant,
+                args,
+                span,
+                ..
+            } => self.eval_enum_lit(variant, args, *span),
             Expr::ArrayLit { elements, span } => {
                 let mut items = Vec::with_capacity(elements.len());
                 for element in elements {
@@ -676,6 +731,31 @@ impl<'a> Interp<'a> {
                 Ok(self.heap.arrays[id][i].clone())
             }
         }
+    }
+
+    /// Qualified construction (ADR 0036): the checker resolved the
+    /// enum type — the display name strips module qualifiers, payloads
+    /// evaluate in written order.
+    fn eval_enum_lit(
+        &mut self,
+        variant: &str,
+        args: &'a [Expr],
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        let Some(crate::types::Type::Enum(_, canon)) = self.resolutions.expr_types.get(&span)
+        else {
+            return Err(Diagnostic::error("unresolved enum construction", span));
+        };
+        let name = crate::types::pretty(canon);
+        let mut payloads = Vec::with_capacity(args.len());
+        for arg in args {
+            payloads.push(self.eval(arg)?);
+        }
+        Ok(Value::Enum {
+            name,
+            variant: variant.to_string(),
+            payloads,
+        })
     }
 
     /// Writes `v` into the storage a place expression names. Field chains

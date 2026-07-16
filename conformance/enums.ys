@@ -1,0 +1,51 @@
+enum Shape { Circle(float), Square(float, float), Ready }
+enum Result<T, E> { Ok(T), Err(E) }
+struct Wrap { s: Shape, tag: int }
+
+fun area(s: Shape): float {
+    match s {
+        Circle(r) { return 3.0 * r * r; }
+        Square(w, h) { return w * h; }
+        else { return 0.0; }
+    }
+}
+
+fun parse(text: string): Result<int, string> {
+    if text == "42" { return Result<int, string>.Ok(42); }
+    return Result<int, string>.Err(`bad: ${text}`);
+}
+
+fun total(rs: Result<int, string>[]): int {
+    var sum: int = 0;
+    for r in rs {
+        match r {
+            Ok(v) { sum = sum + v; }
+            Err(_) { sum = sum - 1; }
+        }
+    }
+    return sum;
+}
+
+fun main(): int {
+    print(Shape.Circle(1.5));
+    print(Shape.Square(2.0, 3.0));
+    print(Shape.Ready());
+    print(area(Shape.Circle(2.0)));
+    print(area(Shape.Ready()));
+
+    const a: Result<int, string> = parse("42");
+    const b: Result<int, string> = parse("nope");
+    print(a);
+    print(b);
+    print(a == parse("42"));
+    print(a == b);
+    print(Shape.Ready() == Shape.Ready());
+    print(Shape.Circle(1.0) == Shape.Circle(2.0));
+
+    const w: Wrap = Wrap { s: Shape.Square(1.0, 4.0), tag: 7 };
+    print(w);
+    print([Result<int, string>.Ok(1), Result<int, string>.Err("e")]);
+    print(string(Shape.Circle(0.5)) + "!");
+
+    return total([a, b, parse("42")]);
+}

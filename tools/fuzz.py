@@ -15,7 +15,10 @@ branches, whole-union printing), and generics (ADR 0035: fixed
 templates instantiated at int/float/string/struct call sites — word,
 XMM, and multi-word/sret shapes — optional wrapping through T? slots,
 generic struct literals, field writes, and instance printing).
-Refstructs and files are NOT
+Payload enums (ADR 0036) get the same treatment:
+a fixed monomorphic enum and a generic one, constructed at random
+variants and consumed by match arms with payload bindings, `_`, and
+`else`, plus enum equality. Refstructs and files are NOT
 generated yet - cover those manually (or extend the generator) when
 touching their lowering. A program whose
 float path traps int() at runtime is skipped like any other
@@ -376,6 +379,34 @@ class Gen:
                 f"{gb}.v = {gb}.v + {self.int_expr([])}; "
                 f"print({gb}); print({gb}.v);"
             )
+            # Enums (ADR 0036): construct a random variant, match on it
+            # (payload bindings, `_`, `else`), compare constructions.
+            ge = self.name("ge")
+            ctor = r.choice(
+                [
+                    f"GSt.GA({self.int_expr([])})",
+                    f"GSt.GB({self.float_expr([])}, {self.str_expr([])})",
+                    "GSt.GC()",
+                ]
+            )
+            arms = (
+                "GA(a) { print(a + 1); } "
+                + r.choice(["GB(f, s) { print(s); print(f); } ", "GB(_, s) { print(s); } "])
+                + r.choice(["GC { print(0); } ", "else { print(0); } "])
+            )
+            gcalls.append(
+                f"var {ge}: GSt = {ctor}; print({ge}); "
+                f"match {ge} {{ {arms}}} "
+                f"print({ge} == {ctor}); "
+                f"print({ge} == GSt.GA({r.randint(-9, 9)}));"
+            )
+            if r.random() < 0.6:
+                ok = r.choice(["true", "false"])
+                gcalls.append(
+                    f"print(gwrap({self.int_expr([])}, {ok})); "
+                    f"match gwrap({self.str_expr([])}, {ok}) "
+                    f"{{ GOk(v) {{ print(v); }} else {{ print(\"none\"); }} }}"
+                )
             g_part = " ".join(gcalls) + " "
         arr = self.name("xs")
         stop = f"if ix == {r.randint(3, 5)} {{ break; }} " if r.random() < 0.5 else ""
@@ -388,10 +419,14 @@ class Gen:
             [
                 "struct Pt { x: int, y: int }",
                 "struct GBox<T> { v: T }",
+                "enum GSt { GA(int), GB(float, string), GC }",
+                "enum GRes<T> { GOk(T), GNone }",
                 "error Efuzz, Egro;",
                 "fun gmax<T>(a: T, b: T): T { if a > b { return a; } return b; }",
                 "fun gid<T>(x: T): T { return x; }",
                 "fun gor<T>(v: T?, f: T): T { if v != null { return v; } return f; }",
+                "fun gwrap<T>(x: T, ok: bool): GRes<T> "
+                "{ if ok { return GRes<T>.GOk(x); } return GRes<T>.GNone(); }",
             ]
             + helpers
             + [

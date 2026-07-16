@@ -24,8 +24,8 @@ GRAMMAR = ROOT / "editors" / "vscode" / "syntaxes" / "ys.tmLanguage.json"
 # How each keyword spelling maps to a TextMate scope. Every KW_ in syntax.rs
 # must appear in exactly one bucket (checked below).
 CATEGORIES = {
-    "storage.type.ys": ["fun", "struct", "refstruct", "var", "const"],
-    "keyword.control.ys": ["return", "break", "continue", "if", "else", "while", "for", "in", "import", "export", "from", "try"],
+    "storage.type.ys": ["fun", "struct", "refstruct", "enum", "var", "const"],
+    "keyword.control.ys": ["return", "break", "continue", "if", "else", "while", "for", "in", "import", "export", "from", "try", "match"],
     "support.type.primitive.ys": ["int", "float", "bool", "string", "file", "error"],
     "constant.language.ys": ["true", "false", "null"],
 }
@@ -66,6 +66,7 @@ def build_grammar():
     kw_fun = keywords["FUN"]
     kw_struct = keywords["STRUCT"]
     kw_refstruct = keywords["REFSTRUCT"]
+    kw_enum = keywords["ENUM"]
     # `<T, U>` guts — idents inside a parameter/argument list color as
     # types (ADR 0035); punctuation stays plain.
     type_params = {
@@ -117,7 +118,7 @@ def build_grammar():
                 },
             },
             "type-definition": {
-                "match": rf"\b({kw_struct}|{kw_refstruct})\s+([A-Za-z_][A-Za-z0-9_]*)\s*(<[^<>]*>)?",
+                "match": rf"\b({kw_struct}|{kw_refstruct}|{kw_enum})\s+([A-Za-z_][A-Za-z0-9_]*)\s*(<[^<>]*>)?",
                 "captures": {
                     "1": {"name": "storage.type.ys"},
                     "2": {"name": "entity.name.type.ys"},

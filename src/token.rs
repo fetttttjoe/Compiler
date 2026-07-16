@@ -27,6 +27,10 @@ pub enum TokenKind {
     ErrorKw,
     /// Reserved for `try` propagation (ADR 0034).
     Try,
+    /// `enum` — payload-enum declarations (ADR 0036).
+    Enum,
+    /// `match` — variant dispatch (ADR 0036).
+    Match,
     // Type keywords
     IntType,
     FloatType,

@@ -1,0 +1,15 @@
+Circle(1.5)
+Square(2, 3)
+Ready
+12
+0
+Ok(42)
+Err(bad: nope)
+true
+false
+true
+false
+Wrap { s: Square(1, 4), tag: 7 }
+[Ok(1), Err(e)]
+Circle(0.5)!
+=> Int(83)

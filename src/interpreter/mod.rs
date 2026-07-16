@@ -9,13 +9,15 @@ use crate::syntax;
 
 // ---- Interpreter policy ----------------------------------------------
 // One unit of evaluation depth (a call, statement, or expression level)
-// costs at most ~16KB of native stack in debug builds (measured); the
-// owned stack is sized so the depth budget always binds first:
-// 65_536 units x 16KB = 1GB = INTERP_STACK_BYTES. The heap cap turns
+// costs at most ~16KB of native stack in debug builds (measured before
+// enums; ADR 0036's match/value shapes nudged it past that). The owned
+// stack is sized so the depth budget always binds first, with headroom
+// for frame growth: 65_536 units x 32KB = 2GB = INTERP_STACK_BYTES — a
+// virtual reservation, faulted only as used. The heap cap turns
 // runaway allocation into a diagnostic instead of an OOM kill.
 const MAX_EVAL_DEPTH: usize = 65_536;
 const MAX_HEAP_CELLS: usize = 1 << 20;
-const INTERP_STACK_BYTES: usize = 1 << 30;
+const INTERP_STACK_BYTES: usize = 1 << 31;
 
 /// The interpreter's arena: every refstruct object and array buffer lives
 /// here, addressed by handle into its own typed table — a `Value::Ref` can
@@ -81,6 +83,15 @@ pub enum Value {
     Struct {
         name: String,
         fields: Vec<(String, Value)>,
+    },
+    /// A payload enum value (ADR 0036): the pretty instance name, the
+    /// live variant, and its payloads in declaration order. Value
+    /// semantics — copies like a struct; derived `PartialEq` is the
+    /// structural equality (same variant, equal payloads).
+    Enum {
+        name: String,
+        variant: String,
+        payloads: Vec<Value>,
     },
     /// A `refstruct` instance: a handle to one shared heap object, aliased
     /// by every copy of the handle.

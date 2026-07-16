@@ -230,6 +230,47 @@ impl Parser {
         }
     }
 
+    /// Parses `enum Name<T, U> { Variant(T), Ready }` (ADR 0036) —
+    /// comma-separated variants, each with optional positional payload
+    /// types. The caller dispatched on the `enum` keyword.
+    pub(super) fn parse_enum(&mut self, exported: bool) -> EnumDecl {
+        let start = self.expect(TokenKind::Enum);
+        let name = self.expect_identifier();
+        let type_params = self.parse_type_params();
+        self.expect(TokenKind::LeftBrace);
+        let mut variants = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.at_eof() {
+            let vspan = self.peek().span;
+            let vname = self.expect_identifier();
+            let mut payloads = Vec::new();
+            if self.eat(&TokenKind::LeftParen) {
+                while !self.check(&TokenKind::RightParen) && !self.at_eof() {
+                    payloads.push(self.parse_type());
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RightParen);
+            }
+            variants.push(Variant {
+                name: vname,
+                payloads,
+                span: vspan,
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self.expect(TokenKind::RightBrace);
+        EnumDecl {
+            exported,
+            name,
+            type_params,
+            variants,
+            span: start.to(end),
+        }
+    }
+
     /// Parses `error Name[, Name]*;` — module-scoped error codes
     /// (ADR 0034). The caller dispatched on the `error` keyword.
     pub(super) fn parse_error_decl(&mut self, exported: bool) -> ErrorDecl {
@@ -298,6 +339,7 @@ impl Parser {
                 | TokenKind::Fun
                 | TokenKind::Struct
                 | TokenKind::RefStruct
+                | TokenKind::Enum
                 | TokenKind::Import
                 | TokenKind::Export
                 | TokenKind::ErrorKw => return,

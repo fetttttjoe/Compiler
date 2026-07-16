@@ -265,10 +265,12 @@ impl Parser {
             }
         }
         // Commit needs a clean list (no diagnostics — speculation is
-        // silent), a plain `>`, and `(` or `{` right after.
+        // silent), a plain `>`, and `(`, `{`, or `.` right after — the
+        // dot is qualified enum construction (ADR 0036).
         let commit = self.diagnostics.len() == start_diags
             && self.eat(&TokenKind::Greater)
             && (self.check(&TokenKind::LeftParen)
+                || self.check(&TokenKind::Dot)
                 || (self.struct_literals_allowed && self.check(&TokenKind::LeftBrace)));
         if !commit {
             self.pos = start_pos;
@@ -281,7 +283,46 @@ impl Parser {
         let Expr::Ident(name, span) = lhs else {
             unreachable!("caller guarantees an identifier lhs")
         };
+        if self.eat(&TokenKind::Dot) {
+            // `Result<int, string>.Ok(3)` — the applied name can only
+            // be a type, so the shape is unambiguous from here on.
+            let variant = self.expect_identifier();
+            self.expect(TokenKind::LeftParen);
+            return Ok(self.enum_lit_tail(name, span, type_args, variant));
+        }
         Ok(self.parse_struct_literal(name, span, type_args))
+    }
+
+    /// Construction arguments after `Enum.Variant(` was consumed
+    /// (ADR 0036).
+    fn enum_lit_tail(
+        &mut self,
+        name: String,
+        start: Span,
+        type_args: Vec<TypeAnn>,
+        variant: String,
+    ) -> Expr {
+        let prev = self.struct_literals_allowed;
+        self.struct_literals_allowed = true;
+        let mut args = Vec::new();
+        while !self.check(&TokenKind::RightParen) && !self.at_eof() {
+            args.push(self.parse_expr(0));
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.struct_literals_allowed = prev;
+        let end = self.expect(TokenKind::RightParen);
+        if !self.claim_op(end) {
+            return Expr::Ident(name, start);
+        }
+        Expr::EnumLit {
+            name,
+            type_args,
+            variant,
+            args,
+            span: start.to(end),
+        }
     }
 
     /// Call arguments after the `(` was consumed — shared by plain
@@ -304,6 +345,25 @@ impl Parser {
             return lhs;
         }
         let span = lhs.span().to(end);
+        // `ident.ident(…)` is qualified enum construction (ADR 0036) —
+        // there are no methods, so no call shape is stolen; the checker
+        // decides whether the base names an enum.
+        if let Expr::Field {
+            base,
+            name: variant,
+            optional: false,
+            ..
+        } = &lhs
+            && let Expr::Ident(enum_name, _) = base.as_ref()
+        {
+            return Expr::EnumLit {
+                name: enum_name.clone(),
+                type_args: Vec::new(),
+                variant: variant.clone(),
+                args,
+                span,
+            };
+        }
         Expr::Call {
             callee: Box::new(lhs),
             type_args,

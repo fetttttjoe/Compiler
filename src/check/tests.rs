@@ -2015,3 +2015,153 @@ fn instances_and_call_targets_land_in_resolutions() {
     assert!(res.instances.contains_key(&(0, "id<string>".to_string())));
     assert!(res.sigs.contains_key(&(0, "id<int>".to_string())));
 }
+
+// --- Payload enums and match (ADR 0036) ---
+
+#[test]
+fn match_coverage_rules() {
+    let base = "enum S { A(int), B }\n";
+    let d = diags(&format!(
+        "{base}fun main(): int {{ const s: S = S.B(); match s {{ A(v) {{ print(v); }} }} return 0; }}"
+    ));
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("does not cover variant(s) 'B'")),
+        "{d:?}"
+    );
+    // else closes the gap; a redundant else on an exhaustive match is
+    // legal (the divergence analyses are syntax-only).
+    let d = diags(&format!(
+        "{base}fun main(): int {{ const s: S = S.B(); \
+         match s {{ A(_) {{ }} B {{ }} else {{ }} }} return 0; }}"
+    ));
+    assert!(d.is_empty(), "{d:?}");
+    let d = diags(&format!(
+        "{base}fun main(): int {{ const s: S = S.B(); \
+         match s {{ A(v) {{ print(v); }} A(v) {{ print(v); }} B {{ }} }} return 0; }}"
+    ));
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("duplicate arm for variant 'A'")),
+        "{d:?}"
+    );
+    let d = diags(&format!(
+        "{base}fun main(): int {{ const s: S = S.B(); match s {{ C {{ }} else {{ }} }} return 0; }}"
+    ));
+    assert!(
+        d.iter().any(|e| e.message.contains("no variant 'C'")),
+        "{d:?}"
+    );
+    let d = diags(&format!(
+        "{base}fun main(): int {{ const s: S = S.B(); \
+         match s {{ A(v, w) {{ }} B {{ }} }} return 0; }}"
+    ));
+    assert!(
+        d.iter().any(|e| e
+            .message
+            .contains("'A' has 1 payload(s), found 2 binding(s)")),
+        "{d:?}"
+    );
+    let d = diags("fun main(): int { match 5 { A { } } return 0; }");
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("match needs an enum, found int")),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn match_with_else_satisfies_definite_return() {
+    let d = diags(
+        "enum S { A(int), B }\n\
+         fun f(s: S): int { match s { A(v) { return v; } else { return 0; } } }\n\
+         fun main(): int { return f(S.B()); }",
+    );
+    assert!(d.is_empty(), "{d:?}");
+    // Without else the analysis stays conservative.
+    let d = diags(
+        "enum S { A(int), B }\n\
+         fun f(s: S): int { match s { A(v) { return v; } B { return 0; } } }\n\
+         fun main(): int { return f(S.B()); }",
+    );
+    assert!(
+        d.iter().any(|e| e.message.contains("not all paths")),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn enum_construction_rules() {
+    let d = diags(
+        "enum S { A(int) }\n\
+         fun main(): int { const s: S = S.A(); return 0; }",
+    );
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("'A' expects 1 payload(s), found 0")),
+        "{d:?}"
+    );
+    let d = diags(
+        "enum S { A(int) }\n\
+         fun main(): int { const s: S = S.Q(1); return 0; }",
+    );
+    assert!(
+        d.iter().any(|e| e.message.contains("no variant 'Q'")),
+        "{d:?}"
+    );
+    let d = diags(
+        "enum S { A(int) }\n\
+         fun main(): int { const s: S = S.A(\"x\"); return 0; }",
+    );
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("payload of type int, found string")),
+        "{d:?}"
+    );
+    // Generic construction infers from payloads when they pin the
+    // parameters; unbound parameters need explicit arguments.
+    let d = diags(
+        "enum Opt2<T> { Some2(T), None2 }\n\
+         fun main(): int { const o: Opt2<int> = Opt2.Some2(3); return 0; }",
+    );
+    assert!(d.is_empty(), "{d:?}");
+    let d = diags(
+        "enum Opt2<T> { Some2(T), None2 }\n\
+         fun main(): int { const o: Opt2<int> = Opt2.None2(); return 0; }",
+    );
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("cannot infer 'T' from the arguments")),
+        "{d:?}"
+    );
+    // The old non-enum call shape keeps its message.
+    let d = diags(
+        "struct P { x: int }\n\
+         fun main(): int { const p: P = P { x: 1 }; p.x(1); return 0; }",
+    );
+    assert!(
+        d.iter()
+            .any(|e| e.message.contains("only named functions can be called")),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn enums_share_the_type_namespace() {
+    let d = diags("struct S { x: int } enum S { A } fun main(): int { return 0; }");
+    assert!(
+        d.iter().any(|e| e.message.contains("already defined")),
+        "{d:?}"
+    );
+    // Enums resolve through annotations and imports like structs.
+    let (res, d) = multi(&[
+        (
+            "main.ys",
+            "import { Color } from \"./lib\";\n\
+             fun main(): int { match Color.Red() { Red { return 1; } else { return 0; } } }",
+        ),
+        ("lib.ys", "export enum Color { Red, Blue }"),
+    ]);
+    assert!(d.is_empty(), "{d:?}");
+    assert!(res.enums.contains_key(&(1, "Color".to_string())));
+}

@@ -6,9 +6,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Expr, Function, Param, Stmt, Struct, TypeAnn};
+use crate::ast::{EnumDecl, Expr, Function, MatchArm, Param, Stmt, Struct, TypeAnn};
 use crate::span::Span;
-use crate::types::{StructType, Type, instance_name};
+use crate::types::{EnumType, StructType, Type, instance_name};
 
 /// Instantiation-chain ceiling: `f<T>` requesting `f<T[]>` (or a struct
 /// family doing the same through a field) diagnoses instead of
@@ -18,9 +18,10 @@ pub(super) const DEPTH_CAP: u32 = 32;
 /// An item's identity: (defining module, name).
 pub(super) type ItemKey = (usize, String);
 
-/// Structural view of struct instances: instance key → (template key,
-/// type arguments). Inference decomposes instantiated types through it.
-pub(super) type StructArgs = HashMap<ItemKey, (ItemKey, Vec<Type>)>;
+/// Structural view of struct/enum instances: instance key → (template
+/// key, type arguments). Inference decomposes instantiated types
+/// through it — the type namespaces are shared, so keys never collide.
+pub(super) type InstanceArgs = HashMap<ItemKey, (ItemKey, Vec<Type>)>;
 
 /// One pending function instantiation.
 pub(super) struct FnWork {
@@ -36,14 +37,17 @@ pub(super) struct FnWork {
 pub(super) struct Mono<'g> {
     pub fn_templates: HashMap<ItemKey, &'g Function>,
     pub struct_templates: HashMap<ItemKey, &'g Struct>,
+    pub enum_templates: HashMap<ItemKey, &'g EnumDecl>,
     /// Every struct layout — monomorphic declarations and instances
     /// alike. Moves into `Resolutions` when checking completes.
     pub structs: HashMap<ItemKey, StructType>,
-    pub struct_args: StructArgs,
+    /// Every enum definition, same story (ADR 0036).
+    pub enums: HashMap<ItemKey, EnumType>,
+    pub instance_args: InstanceArgs,
     pub work: Vec<FnWork>,
     /// Function instances already requested (dedup across call sites).
     pub requested: HashSet<ItemKey>,
-    /// Struct-instantiation nesting — the family-divergence fuel.
+    /// Struct/enum-instantiation nesting — the family-divergence fuel.
     pub struct_depth: u32,
 }
 
@@ -52,8 +56,10 @@ impl Mono<'_> {
         Mono {
             fn_templates: HashMap::new(),
             struct_templates: HashMap::new(),
+            enum_templates: HashMap::new(),
             structs: HashMap::new(),
-            struct_args: HashMap::new(),
+            enums: HashMap::new(),
+            instance_args: HashMap::new(),
             work: Vec::new(),
             requested: HashSet::new(),
             struct_depth: 0,
@@ -71,7 +77,7 @@ pub(super) fn unify(
     actual: &Type,
     tparams: &HashSet<&str>,
     bind: &mut HashMap<String, Type>,
-    struct_args: &StructArgs,
+    instance_args: &InstanceArgs,
     ty_alias: &super::Alias,
 ) -> Result<(), (String, Type, Type)> {
     match ann {
@@ -94,33 +100,37 @@ pub(super) fn unify(
         }
         // `T?` accepts `X?` or a bare `X` (the fits subsumption edge).
         TypeAnn::Optional(inner) => match actual {
-            Type::Optional(a) => unify(inner, a, tparams, bind, struct_args, ty_alias),
-            other => unify(inner, other, tparams, bind, struct_args, ty_alias),
+            Type::Optional(a) => unify(inner, a, tparams, bind, instance_args, ty_alias),
+            other => unify(inner, other, tparams, bind, instance_args, ty_alias),
         },
         // Same edge for `T!`: values flow into unions.
         TypeAnn::ErrUnion(inner) => match actual {
-            Type::ErrUnion(a) => unify(inner, a, tparams, bind, struct_args, ty_alias),
-            other => unify(inner, other, tparams, bind, struct_args, ty_alias),
+            Type::ErrUnion(a) => unify(inner, a, tparams, bind, instance_args, ty_alias),
+            other => unify(inner, other, tparams, bind, instance_args, ty_alias),
         },
         // Arrays are invariant: only an array argument informs `T[]`.
         TypeAnn::Array(inner) => match actual {
-            Type::Array(a) => unify(inner, a, tparams, bind, struct_args, ty_alias),
+            Type::Array(a) => unify(inner, a, tparams, bind, instance_args, ty_alias),
             _ => Ok(()),
         },
-        // `Pair<T, U>` against an instantiated struct: decompose when
-        // the argument instantiates the same template.
+        // `Pair<T, U>` against an instantiated struct or enum:
+        // decompose when the argument instantiates the same template.
         TypeAnn::Applied(n, anns) => {
-            let (Some(key), Type::Struct(am, an)) = (ty_alias.get(n), actual) else {
+            let (am, an) = match actual {
+                Type::Struct(am, an) | Type::Enum(am, an) => (am, an),
+                _ => return Ok(()),
+            };
+            let Some(key) = ty_alias.get(n) else {
                 return Ok(());
             };
-            let Some((tkey, args)) = struct_args.get(&(*am, an.clone())) else {
+            let Some((tkey, args)) = instance_args.get(&(*am, an.clone())) else {
                 return Ok(());
             };
             if tkey != key || anns.len() != args.len() {
                 return Ok(());
             }
             for (ann, arg) in anns.iter().zip(args) {
-                unify(ann, arg, tparams, bind, struct_args, ty_alias)?;
+                unify(ann, arg, tparams, bind, instance_args, ty_alias)?;
             }
             Ok(())
         }
@@ -255,6 +265,32 @@ fn clone_stmt(stmt: &Stmt, bind: &HashMap<String, Type>, delta: usize) -> Stmt {
             body: body.iter().map(|s| clone_stmt(s, bind, delta)).collect(),
             span: shift(*span, delta),
         },
+        Stmt::Match {
+            scrutinee,
+            arms,
+            else_body,
+            span,
+        } => Stmt::Match {
+            scrutinee: clone_expr(scrutinee, bind, delta),
+            arms: arms
+                .iter()
+                .map(|a| MatchArm {
+                    variant: a.variant.clone(),
+                    variant_span: shift(a.variant_span, delta),
+                    bindings: a
+                        .bindings
+                        .iter()
+                        .map(|(n, s)| (n.clone(), shift(*s, delta)))
+                        .collect(),
+                    body: a.body.iter().map(|s| clone_stmt(s, bind, delta)).collect(),
+                    span: shift(a.span, delta),
+                })
+                .collect(),
+            else_body: else_body
+                .as_ref()
+                .map(|b| b.iter().map(|s| clone_stmt(s, bind, delta)).collect()),
+            span: shift(*span, delta),
+        },
         Stmt::Expr(e) => Stmt::Expr(clone_expr(e, bind, delta)),
     }
 }
@@ -330,6 +366,19 @@ fn clone_expr(expr: &Expr, bind: &HashMap<String, Type>, delta: usize) -> Expr {
                 .iter()
                 .map(|(n, v)| (n.clone(), clone_expr(v, bind, delta)))
                 .collect(),
+            span: shift(*span, delta),
+        },
+        Expr::EnumLit {
+            name,
+            type_args,
+            variant,
+            args,
+            span,
+        } => Expr::EnumLit {
+            name: name.clone(),
+            type_args: type_args.iter().map(|t| substitute_ann(t, bind)).collect(),
+            variant: variant.clone(),
+            args: args.iter().map(|a| clone_expr(a, bind, delta)).collect(),
             span: shift(*span, delta),
         },
         Expr::ArrayLit { elements, span } => Expr::ArrayLit {

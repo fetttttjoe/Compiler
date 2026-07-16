@@ -62,6 +62,9 @@ pub const KW_STRING: &str = "string";
 pub const KW_FILE: &str = "file";
 pub const KW_ERROR: &str = "error";
 pub const KW_TRY: &str = "try";
+/// Payload enums and their consumption (ADR 0036).
+pub const KW_ENUM: &str = "enum";
+pub const KW_MATCH: &str = "match";
 pub const KW_TRUE: &str = "true";
 pub const KW_FALSE: &str = "false";
 pub const KW_NULL: &str = "null";

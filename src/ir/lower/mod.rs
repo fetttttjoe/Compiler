@@ -716,6 +716,93 @@ impl Lowerer<'_> {
             Stmt::Expr(expr) => {
                 self.expr(expr)?;
             }
+            // Variant dispatch (ADR 0036): a tag-compare chain into arm
+            // blocks; payload bindings copy out of the scrutinee before
+            // the body runs, so mutation inside the arm can't alias it.
+            Stmt::Match {
+                scrutinee,
+                arms,
+                else_body,
+                span,
+            } => {
+                let s_ty = self
+                    .ty(&scrutinee.span())
+                    .cloned()
+                    .ok_or_else(|| unsupported("this match", *span))?;
+                let Type::Enum(m, n) = &s_ty else {
+                    return Err(unsupported("this match", *span));
+                };
+                let key = (*m, n.clone());
+                let u = self.expr(scrutinee)?;
+                let tag = self.load_at(u, 0);
+                let end = self.fresh_label();
+                for arm in arms {
+                    let idx = *self
+                        .res
+                        .variant_tags
+                        .get(&arm.variant_span)
+                        .ok_or_else(|| unsupported("this match arm", arm.span))?;
+                    let hit = self.fresh(false);
+                    self.insts.push(Inst::BinImm {
+                        op: BinOp::Eq,
+                        dst: hit,
+                        lhs: tag,
+                        imm: idx as i64,
+                    });
+                    let next = self.fresh_label();
+                    self.insts.push(Inst::BrZero(hit, next));
+                    // Bindings copy out (the oracle clones payloads).
+                    let payloads = self.res.enums[&key].variants[idx as usize].1.clone();
+                    let mut bindings = HashMap::new();
+                    let mut off = 8i64;
+                    for (i, pt) in payloads.iter().enumerate() {
+                        let pk = kind_of(pt, self.res, FUEL)
+                            .ok_or_else(|| unsupported("payloads of this type", arm.span))?;
+                        if let Some((bname, _)) = arm.bindings.get(i)
+                            && bname != "_"
+                        {
+                            let v = self.fresh(*pt == Type::Float);
+                            if pk == Kind::Word {
+                                self.insts.push(Inst::LoadAt {
+                                    dst: v,
+                                    base: u,
+                                    off,
+                                });
+                            } else {
+                                let p = self.lea_at(u, off);
+                                self.insts.push(Inst::Temp {
+                                    dst: v,
+                                    words: pk.words(),
+                                });
+                                self.insts.push(Inst::CopyW {
+                                    dst: v,
+                                    src: p,
+                                    words: pk.words(),
+                                });
+                            }
+                            bindings.insert(
+                                bname.clone(),
+                                Binding {
+                                    v,
+                                    opt_inner: self.opt_inner_of(pt),
+                                    err_inner: None, // T! payloads are checker-rejected
+                                },
+                            );
+                        }
+                        off += 8 * pk.words() as i64;
+                    }
+                    self.scopes.push(bindings);
+                    let result = arm.body.iter().try_for_each(|stmt| self.stmt(stmt));
+                    self.scopes.pop();
+                    result?;
+                    self.insts.push(Inst::Jmp(end));
+                    self.insts.push(Inst::Label(next));
+                }
+                if let Some(else_body) = else_body {
+                    self.block(else_body)?;
+                }
+                self.insts.push(Inst::Label(end));
+            }
         }
         Ok(())
     }
@@ -1008,6 +1095,63 @@ impl Lowerer<'_> {
                     });
                     Ok(r)
                 }
+            }
+            // Construction (ADR 0036): a frame temp — tag word, then
+            // payloads at their packed offsets, slack zeroed so
+            // equality can memcmp (canonical, like the optional null).
+            Expr::EnumLit { args, span, .. } => {
+                let ty = self
+                    .ty(span)
+                    .cloned()
+                    .ok_or_else(|| unsupported("this construction", *span))?;
+                let (Type::Enum(m, n), Some(&tag)) = (&ty, self.res.variant_tags.get(span)) else {
+                    return Err(unsupported("this construction", *span));
+                };
+                let total = kind_of(&ty, self.res, FUEL)
+                    .ok_or_else(|| unsupported("enums of this shape", *span))?
+                    .words();
+                let payloads = self.res.enums[&(*m, n.clone())].variants[tag as usize]
+                    .1
+                    .clone();
+                let t = self.fresh(false);
+                self.insts.push(Inst::Temp {
+                    dst: t,
+                    words: total,
+                });
+                // Zero everything, then the tag, then the payloads —
+                // the zeroing keeps unused slack canonical.
+                let zero = self.const_word(0);
+                for i in 1..total {
+                    self.insts.push(Inst::StoreAt {
+                        base: t,
+                        off: 8 * i as i64,
+                        val: zero,
+                    });
+                }
+                let tagv = self.const_word(tag as i64);
+                self.insts.push(Inst::StoreAt {
+                    base: t,
+                    off: 0,
+                    val: tagv,
+                });
+                let mut off = 8i64;
+                for (arg, pt) in args.iter().zip(&payloads) {
+                    let pk = kind_of(pt, self.res, FUEL)
+                        .ok_or_else(|| unsupported("payloads of this type", *span))?;
+                    let val = self.expr_into(arg, pt)?;
+                    if pk == Kind::Word {
+                        self.insts.push(Inst::StoreAt { base: t, off, val });
+                    } else {
+                        let p = self.lea_at(t, off);
+                        self.insts.push(Inst::CopyW {
+                            dst: p,
+                            src: val,
+                            words: pk.words(),
+                        });
+                    }
+                    off += 8 * pk.words() as i64;
+                }
+                Ok(t)
             }
             Expr::StructLit { fields, span, .. } => {
                 let Some(Type::Struct(dm, dn)) = self.ty(span) else {

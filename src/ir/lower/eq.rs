@@ -212,6 +212,12 @@ impl Lowerer<'_> {
             | Kind::Opt {
                 no_memcmp: false,
                 words,
+            }
+            // Enums zero their slack at construction (ADR 0036), so
+            // the canonical-layout memcmp applies.
+            | Kind::Enum {
+                no_memcmp: false,
+                words,
             } => {
                 let pa = self.ptr_at(a, aoff);
                 let pb = self.ptr_at(b, boff);
@@ -257,6 +263,55 @@ impl Lowerer<'_> {
                     let fe = self.value_eq(&ft, a, aoff + off, b, boff + off, span)?;
                     self.insts.push(Inst::Copy(v, fe));
                     self.insts.push(Inst::BrZero(v, end));
+                }
+                self.insts.push(Inst::Label(end));
+                Ok(v)
+            }
+            // Tags equal, then the live variant's payloads walk — a
+            // compare chain over the variants (ADR 0036).
+            Kind::Enum {
+                no_memcmp: true, ..
+            } => {
+                let Type::Enum(m, n) = t else {
+                    unreachable!("enum kind from an enum type")
+                };
+                let def = self.res.enums[&(*m, n.clone())].clone();
+                let ta = self.load_at(a, aoff);
+                let tb = self.load_at(b, boff);
+                let v = self.fresh(false);
+                self.insts.push(Inst::Bin {
+                    op: BinOp::Eq,
+                    float: false,
+                    dst: v,
+                    lhs: ta,
+                    rhs: tb,
+                });
+                let end = self.fresh_label();
+                self.insts.push(Inst::BrZero(v, end));
+                for (idx, (_, payloads)) in def.variants.iter().enumerate() {
+                    if payloads.is_empty() {
+                        continue; // tag equality already decided it
+                    }
+                    let hit = self.fresh(false);
+                    self.insts.push(Inst::BinImm {
+                        op: BinOp::Eq,
+                        dst: hit,
+                        lhs: ta,
+                        imm: idx as i64,
+                    });
+                    let next = self.fresh_label();
+                    self.insts.push(Inst::BrZero(hit, next));
+                    let mut off = 8i64;
+                    for pt in payloads {
+                        let pk = kind_of(pt, self.res, FUEL)
+                            .ok_or_else(|| unsupported("payloads of this type", span))?;
+                        let pe = self.value_eq(pt, a, aoff + off, b, boff + off, span)?;
+                        self.insts.push(Inst::Copy(v, pe));
+                        self.insts.push(Inst::BrZero(v, end));
+                        off += 8 * pk.words() as i64;
+                    }
+                    self.insts.push(Inst::Jmp(end));
+                    self.insts.push(Inst::Label(next));
                 }
                 self.insts.push(Inst::Label(end));
                 Ok(v)

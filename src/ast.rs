@@ -12,8 +12,28 @@ pub type Ast = Vec<Item>;
 pub enum Item {
     Function(Function),
     Struct(Struct),
+    Enum(EnumDecl),
     Import(ImportDecl),
     Error(ErrorDecl),
+}
+
+/// `enum Shape { Circle(float), Ready }` — a payload enum (ADR 0036):
+/// variants carry zero or more positional payload types. Generic like
+/// structs (ADR 0035).
+#[derive(Debug, PartialEq)]
+pub struct EnumDecl {
+    pub exported: bool,
+    pub name: String,
+    pub type_params: Vec<(String, Span)>,
+    pub variants: Vec<Variant>,
+    pub span: Span,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Variant {
+    pub name: String,
+    pub payloads: Vec<TypeAnn>,
+    pub span: Span,
 }
 
 /// `error NotFound, Timeout;` — module-scoped error codes (ADR 0034).
@@ -143,6 +163,15 @@ pub enum Stmt {
         body: Vec<Stmt>,
         span: Span,
     },
+    /// `match s { Circle(r) { … } else { … } }` — variant dispatch
+    /// (ADR 0036). Arms are blocks; payload bindings are consts scoped
+    /// to their arm; `else` covers the rest.
+    Match {
+        scrutinee: Expr,
+        arms: Vec<MatchArm>,
+        else_body: Option<Vec<Stmt>>,
+        span: Span,
+    },
     /// `for x in xs { … }` — iterates an array; `x` is a const binding of
     /// the element type, fresh each iteration. `for [i, x] in xs` also
     /// binds the const int index.
@@ -173,6 +202,17 @@ impl Conv {
             Conv::Str => syntax::KW_STRING,
         }
     }
+}
+
+/// One `Variant(a, _, b) { … }` arm (ADR 0036). A `_` binding skips
+/// its payload; counts must match the variant.
+#[derive(Debug, PartialEq)]
+pub struct MatchArm {
+    pub variant: String,
+    pub variant_span: Span,
+    pub bindings: Vec<(String, Span)>,
+    pub body: Vec<Stmt>,
+    pub span: Span,
 }
 
 #[derive(Debug, PartialEq)]
@@ -235,6 +275,17 @@ pub enum Expr {
         /// Explicit type arguments — `Pair<int, string> { … }` (ADR 0035).
         type_args: Vec<TypeAnn>,
         fields: Vec<(String, Expr)>,
+        span: Span,
+    },
+    /// `Shape.Circle(1.5)` / `Result<int, string>.Ok(3)` — qualified
+    /// enum construction (ADR 0036). The parser builds this for every
+    /// `ident.ident(…)` call shape; the checker decides whether the
+    /// base names an enum.
+    EnumLit {
+        name: String,
+        type_args: Vec<TypeAnn>,
+        variant: String,
+        args: Vec<Expr>,
         span: Span,
     },
     ArrayLit {
@@ -314,6 +365,7 @@ impl Stmt {
             | Stmt::Continue { span }
             | Stmt::If { span, .. }
             | Stmt::While { span, .. }
+            | Stmt::Match { span, .. }
             | Stmt::For { span, .. } => *span,
             Stmt::Expr(e) => e.span(),
         }
@@ -367,6 +419,7 @@ impl Expr {
             | Expr::Call { span, .. }
             | Expr::Field { span, .. }
             | Expr::StructLit { span, .. }
+            | Expr::EnumLit { span, .. }
             | Expr::ArrayLit { span, .. }
             | Expr::Index { span, .. } => *span,
         }
@@ -430,6 +483,22 @@ impl Expr {
                     name,
                     show_type_args(type_args),
                     fs.join(" ")
+                )
+            }
+            Expr::EnumLit {
+                name,
+                type_args,
+                variant,
+                args,
+                ..
+            } => {
+                let args: Vec<String> = args.iter().map(Expr::sexpr).collect();
+                format!(
+                    "(enum {}{}.{} {})",
+                    name,
+                    show_type_args(type_args),
+                    variant,
+                    args.join(" ")
                 )
             }
             Expr::ArrayLit { elements, .. } => {

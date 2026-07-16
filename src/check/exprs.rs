@@ -233,6 +233,13 @@ impl Checker<'_, '_> {
                 fields,
                 span,
             } => self.check_struct_lit(name, type_args, fields, *span),
+            Expr::EnumLit {
+                name,
+                type_args,
+                variant,
+                args,
+                span,
+            } => self.check_enum_lit(name, type_args, variant, args, *span),
             Expr::ArrayLit { elements, .. } => {
                 // The first element names the type; a later `null` widens
                 // it to optional; `[]` is unconstrained and fits any array
@@ -523,6 +530,165 @@ impl Checker<'_, '_> {
         sig.ret.clone()
     }
 
+    /// Qualified enum construction — `Shape.Circle(1.5)` (ADR 0036).
+    /// The parser builds this node for every `ident.ident(…)` shape;
+    /// a base that isn't an enum type falls back to the pre-enum
+    /// diagnostics. Generic enums pin their parameters explicitly or
+    /// by unifying the variant's payload annotations against the
+    /// argument types (ADR 0035 machinery).
+    fn check_enum_lit(
+        &mut self,
+        name: &str,
+        type_args: &[TypeAnn],
+        variant: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Type {
+        let arg_tys: Vec<Type> = args.iter().map(|a| self.type_of_expr(a)).collect();
+        let Some(key) = self.ty_alias.get(name).cloned() else {
+            if self.find_var(name).is_some() {
+                // `p.x(…)` on a variable — the pre-enum call shape.
+                self.error("only named functions can be called".to_string(), span);
+            } else {
+                self.diagnostics.push(
+                    Diagnostic::error(format!("unknown enum '{name}'"), span)
+                        .suggest(name, self.ty_alias.keys().map(String::as_str)),
+                );
+            }
+            return Type::Error;
+        };
+        // Pin the instance: monomorphic key, or template + arguments.
+        let ikey = if let Some(tmpl) = self.mono.enum_templates.get(&key).copied() {
+            let tparams: Vec<&str> = tmpl.type_params.iter().map(|(n, _)| n.as_str()).collect();
+            let bind: HashMap<String, Type> = if !type_args.is_empty() {
+                if type_args.len() != tparams.len() {
+                    self.error(
+                        format!(
+                            "'{}' expects {} type argument(s), found {}",
+                            name,
+                            tparams.len(),
+                            type_args.len()
+                        ),
+                        span,
+                    );
+                    return Type::Error;
+                }
+                let resolved: Vec<Type> = type_args.iter().map(|a| self.resolve(a, span)).collect();
+                if resolved.iter().any(poisoned) {
+                    return Type::Error;
+                }
+                tparams
+                    .iter()
+                    .map(|n| n.to_string())
+                    .zip(resolved)
+                    .collect()
+            } else {
+                let Some(vdecl) = tmpl.variants.iter().find(|v| v.name == variant) else {
+                    self.unknown_variant(name, variant, span);
+                    return Type::Error;
+                };
+                let mut bind = HashMap::new();
+                let tset: std::collections::HashSet<&str> = tparams.iter().copied().collect();
+                for (ann, at) in vdecl.payloads.iter().zip(&arg_tys) {
+                    if let Err((tp, a, b)) = super::generics::unify(
+                        ann,
+                        at,
+                        &tset,
+                        &mut bind,
+                        &self.mono.instance_args,
+                        self.ty_alias,
+                    ) {
+                        self.error(
+                            format!(
+                                "conflicting types for '{tp}': {} vs {}",
+                                self.type_name(&a),
+                                self.type_name(&b)
+                            ),
+                            span,
+                        );
+                        return Type::Error;
+                    }
+                }
+                for tp in &tparams {
+                    if !bind.contains_key(*tp) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                format!("cannot infer '{tp}' from the arguments"),
+                                span,
+                            )
+                            .with_help(format!(
+                                "write the type arguments: '{name}<…>.{variant}(…)'"
+                            )),
+                        );
+                        return Type::Error;
+                    }
+                }
+                bind
+            };
+            let ordered: Vec<Type> = tparams.iter().map(|n| bind[*n].clone()).collect();
+            let mut cx = TypeCx {
+                module: self.module,
+                ty_aliases: self.ty_aliases,
+                mono: self.mono,
+                diags: self.diagnostics,
+            };
+            match instantiate_enum(&key, ordered, &mut cx, span) {
+                Type::Enum(m, n) => (m, n),
+                _ => return Type::Error,
+            }
+        } else if self.mono.enums.contains_key(&key) {
+            if !type_args.is_empty() {
+                self.error(format!("'{name}' takes no type arguments"), span);
+            }
+            key
+        } else {
+            self.error(format!("'{name}' is not an enum"), span);
+            return Type::Error;
+        };
+        // The variant against the (instance's) resolved payloads.
+        let def = &self.mono.enums[&ikey];
+        let Some(tag) = def.variants.iter().position(|(n, _)| n == variant) else {
+            self.unknown_variant(name, variant, span);
+            return Type::Error;
+        };
+        let payloads = def.variants[tag].1.clone();
+        if args.len() != payloads.len() {
+            self.error(
+                format!(
+                    "variant '{variant}' expects {} payload(s), found {}",
+                    payloads.len(),
+                    args.len()
+                ),
+                span,
+            );
+            return Type::Error;
+        }
+        for ((arg, at), expected) in args.iter().zip(&arg_tys).zip(&payloads) {
+            if poisoned(at) {
+                continue;
+            }
+            if matches!(arg, Expr::ArrayLit { .. }) && self.check_literal_against(arg, expected) {
+                continue;
+            }
+            if !fits(at, expected) {
+                self.error(
+                    format!(
+                        "payload of type {}, found {}",
+                        self.type_name(expected),
+                        self.type_name(at)
+                    ),
+                    arg.span(),
+                );
+            }
+        }
+        self.variant_tags.insert(span, tag as u32);
+        Type::Enum(ikey.0, ikey.1)
+    }
+
+    fn unknown_variant(&mut self, name: &str, variant: &str, span: Span) {
+        self.error(format!("enum '{name}' has no variant '{variant}'"), span);
+    }
+
     /// A call to a generic template (ADR 0035): pin the type parameters
     /// — explicitly, or by unifying parameter annotations against the
     /// argument types — then check arguments against the substituted
@@ -586,7 +752,7 @@ impl Checker<'_, '_> {
                     at,
                     &tset,
                     &mut bind,
-                    &self.mono.struct_args,
+                    &self.mono.instance_args,
                     self.ty_alias,
                 ) {
                     self.error(

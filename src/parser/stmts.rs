@@ -189,6 +189,59 @@ impl Parser {
                     clean,
                 )
             }
+            TokenKind::Match => {
+                self.bump();
+                // Struct literals are off in the scrutinee, same as
+                // conditions: `match s { … }` reads `s` then arms.
+                let scrutinee = self.parse_condition();
+                self.expect(TokenKind::LeftBrace);
+                let mut arms = Vec::new();
+                let mut else_body = None;
+                while !self.check(&TokenKind::RightBrace) && !self.at_eof() {
+                    if self.eat(&TokenKind::Else) {
+                        // `else` closes the arm list.
+                        let (body, _, _) = self.parse_block();
+                        else_body = Some(body);
+                        break;
+                    }
+                    let variant_span = self.peek().span;
+                    let Some(variant) = self.header_identifier() else {
+                        // Malformed arm head: skip the arm region.
+                        self.synchronize_stmt();
+                        continue;
+                    };
+                    let mut bindings = Vec::new();
+                    if self.eat(&TokenKind::LeftParen) {
+                        while !self.check(&TokenKind::RightParen) && !self.at_eof() {
+                            let span = self.peek().span;
+                            let name = self.expect_identifier();
+                            bindings.push((name, span));
+                            if !self.eat(&TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(TokenKind::RightParen);
+                    }
+                    let (body, arm_end, _) = self.parse_block();
+                    arms.push(MatchArm {
+                        variant,
+                        variant_span,
+                        bindings,
+                        body,
+                        span: variant_span.to(arm_end),
+                    });
+                }
+                let (end, clean) = self.expect_or_flag(TokenKind::RightBrace);
+                (
+                    Stmt::Match {
+                        scrutinee,
+                        arms,
+                        else_body,
+                        span: tok.span.to(end),
+                    },
+                    clean,
+                )
+            }
             TokenKind::Var | TokenKind::Const => {
                 let mutable = matches!(tok.kind, TokenKind::Var);
                 self.bump();

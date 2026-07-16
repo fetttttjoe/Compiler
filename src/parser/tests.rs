@@ -840,3 +840,46 @@ fn condition_position_never_commits_to_a_struct_literal() {
     };
     assert!(matches!(&f.body[0], Stmt::If { .. }));
 }
+
+// --- Payload enums (ADR 0036) ---
+
+#[test]
+fn enum_construction_parses_qualified() {
+    // Plain and generic (the speculation commits on `>` before `.`).
+    assert_eq!(expr("Shape.Circle(1.5)").sexpr(), "(enum Shape.Circle 1.5)");
+    assert_eq!(
+        expr("Result<int, string>.Ok(3)").sexpr(),
+        "(enum Result<int, string>.Ok 3)"
+    );
+    // Field access and calls on non-idents stay what they were.
+    assert_eq!(expr("p.x").sexpr(), "(. p x)");
+    assert_eq!(expr("f(x).g").sexpr(), "(. (call f x) g)");
+}
+
+#[test]
+fn enum_declarations_and_match_parse() {
+    let (tokens, _) = lex("enum Shape<T> { Circle(T), Ready }\n\
+         fun f(s: Shape<int>): int {\n\
+             match s { Circle(r) { return r; } else { return 0; } }\n\
+         }");
+    let (items, diags) = parse(&tokens);
+    assert!(diags.is_empty(), "{diags:?}");
+    let Item::Enum(e) = &items[0] else {
+        panic!("expected an enum")
+    };
+    assert_eq!(e.variants.len(), 2);
+    assert_eq!(e.variants[0].payloads.len(), 1);
+    assert_eq!(e.type_params.len(), 1);
+    let Item::Function(f) = &items[1] else {
+        panic!("expected a function")
+    };
+    let Stmt::Match {
+        arms, else_body, ..
+    } = &f.body[0]
+    else {
+        panic!("expected a match")
+    };
+    assert_eq!(arms.len(), 1);
+    assert_eq!(arms[0].bindings[0].0, "r");
+    assert!(else_body.is_some());
+}

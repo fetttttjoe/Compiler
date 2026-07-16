@@ -101,7 +101,7 @@
       }
     },
     "type-definition": {
-      "match": "\\b(struct|refstruct)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(<[^<>]*>)?",
+      "match": "\\b(struct|refstruct|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(<[^<>]*>)?",
       "captures": {
         "1": {
           "name": "storage.type.ys"
@@ -123,11 +123,11 @@
       "patterns": [
         {
           "name": "storage.type.ys",
-          "match": "\\b(const|fun|refstruct|struct|var)\\b"
+          "match": "\\b(const|enum|fun|refstruct|struct|var)\\b"
         },
         {
           "name": "keyword.control.ys",
-          "match": "\\b(break|continue|else|export|for|from|if|import|in|return|try|while)\\b"
+          "match": "\\b(break|continue|else|export|for|from|if|import|in|match|return|try|while)\\b"
         },
         {
           "name": "support.type.primitive.ys",

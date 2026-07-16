@@ -18,8 +18,21 @@ pub(crate) const FUEL: usize = 64;
 pub(crate) enum Kind {
     Word,
     Str,
-    Struct { words: usize, no_memcmp: bool },
-    Opt { words: usize, no_memcmp: bool },
+    Struct {
+        words: usize,
+        no_memcmp: bool,
+    },
+    Opt {
+        words: usize,
+        no_memcmp: bool,
+    },
+    /// A payload enum (ADR 0036): tag word + max-variant payload,
+    /// slack zeroed at construction (canonical, like the optional
+    /// null) — memcmp-equal whenever every payload allows it.
+    Enum {
+        words: usize,
+        no_memcmp: bool,
+    },
 }
 
 impl Kind {
@@ -27,7 +40,9 @@ impl Kind {
         match self {
             Kind::Word => 1,
             Kind::Str => 2,
-            Kind::Struct { words, .. } | Kind::Opt { words, .. } => words,
+            Kind::Struct { words, .. } | Kind::Opt { words, .. } | Kind::Enum { words, .. } => {
+                words
+            }
         }
     }
 }
@@ -66,6 +81,10 @@ pub(crate) fn kind_of(t: &Type, res: &Resolutions, fuel: usize) -> Option<Kind> 
                             no_memcmp: true,
                             ..
                         }
+                        | Kind::Enum {
+                            no_memcmp: true,
+                            ..
+                        }
                         | Kind::Opt { .. }
                 );
             Some(Kind::Opt {
@@ -86,6 +105,10 @@ pub(crate) fn kind_of(t: &Type, res: &Resolutions, fuel: usize) -> Option<Kind> 
                             no_memcmp: true,
                             ..
                         }
+                        | Kind::Enum {
+                            no_memcmp: true,
+                            ..
+                        }
                         | Kind::Opt { .. }
                 );
             Some(Kind::Opt {
@@ -101,6 +124,47 @@ pub(crate) fn kind_of(t: &Type, res: &Resolutions, fuel: usize) -> Option<Kind> 
             Some(Kind::Word)
         }
         Type::Str => Some(Kind::Str),
+        // Tag word + the widest variant (ADR 0036). `no_memcmp`
+        // mirrors the struct rule over every payload of every variant.
+        Type::Enum(m, n) => {
+            let def = &res.enums[&(*m, n.clone())];
+            let next = fuel.checked_sub(1)?;
+            let mut max_words = 0;
+            let mut no_memcmp = false;
+            for (_, payloads) in &def.variants {
+                let mut words = 0;
+                for pt in payloads {
+                    no_memcmp |= matches!(pt, Type::Float);
+                    match kind_of(pt, res, next)? {
+                        Kind::Word => words += 1,
+                        Kind::Str => {
+                            words += 2;
+                            no_memcmp = true;
+                        }
+                        Kind::Struct {
+                            words: w,
+                            no_memcmp: n,
+                        }
+                        | Kind::Opt {
+                            words: w,
+                            no_memcmp: n,
+                        }
+                        | Kind::Enum {
+                            words: w,
+                            no_memcmp: n,
+                        } => {
+                            words += w;
+                            no_memcmp |= n;
+                        }
+                    }
+                }
+                max_words = max_words.max(words);
+            }
+            Some(Kind::Enum {
+                words: 1 + max_words,
+                no_memcmp,
+            })
+        }
         Type::Struct(m, n) => {
             let def = &res.structs[&(*m, n.clone())];
             if def.by_ref {
@@ -122,6 +186,10 @@ pub(crate) fn kind_of(t: &Type, res: &Resolutions, fuel: usize) -> Option<Kind> 
                         no_memcmp: n,
                     }
                     | Kind::Opt {
+                        words: w,
+                        no_memcmp: n,
+                    }
+                    | Kind::Enum {
                         words: w,
                         no_memcmp: n,
                     } => {
