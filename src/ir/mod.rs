@@ -72,6 +72,24 @@ pub(crate) fn function(
     )?))
 }
 
+/// Like `function`, but emitted under `name` instead of the source
+/// name — the `main(): int!` implementation moves aside so the C entry
+/// can be a tag-testing wrapper (ADR 0034 decision 8). Lowering still
+/// sees the source name, so the entry-args materialization applies.
+pub(crate) fn function_as(
+    f: &Function,
+    module: usize,
+    res: &Resolutions,
+    strings: &mut Strings,
+    printers: &mut show::Printers,
+    map: &SourceMap,
+    name: &str,
+) -> Result<String, Diagnostic> {
+    let mut ir = lower_function(f, module, res, strings, printers, map)?;
+    ir.name = name.to_string();
+    Ok(emit::emit(ir))
+}
+
 /// Emits one already-lowered function (the generated show routines).
 pub(crate) fn emit_function(ir: FunctionIr) -> String {
     emit::emit(ir)

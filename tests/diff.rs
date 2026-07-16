@@ -2353,6 +2353,28 @@ fn ref_shaped_error_unions_stay_tagged() {
 }
 
 #[test]
+fn main_error_union_value_path_agrees() {
+    // ADR 0034 decision 8: main(): int! on the value path — the
+    // wrapper forwards argc/argv behind the sret and exits with the
+    // payload.
+    diff_io(
+        "mainerrval",
+        r#"error Boom;
+        fun risky(n: int): int! {
+            if n > 5 { return error.Boom; }
+            return n + 10;
+        }
+        fun main(args: string[]): int! {
+            const x: int = try risky(len(args));
+            print(x);
+            return x;
+        }"#,
+        &["a", "b"],
+        b"",
+    );
+}
+
+#[test]
 fn try_payload_wraps_into_optional_slots() {
     // ADR 0034 × 0021: try yields T; the slot's declared type wraps it.
     diff(

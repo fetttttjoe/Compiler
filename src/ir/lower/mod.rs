@@ -132,7 +132,12 @@ pub(super) fn lower(
             );
         }
     }
-    let nparams = if entry_args { 2 } else { lo.vregs };
+    // argc+argv, plus the hidden sret when main returns int! (ADR 0034).
+    let nparams = if entry_args {
+        lo.sret.is_some() as usize + 2
+    } else {
+        lo.vregs
+    };
     for stmt in &f.body {
         lo.stmt(stmt)?;
     }

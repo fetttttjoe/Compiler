@@ -26,6 +26,48 @@ fn tempdir() -> std::path::PathBuf {
 }
 
 #[test]
+fn main_error_union_exits_one_with_the_trap_shape() {
+    // ADR 0034 decision 8: an error escaping main(): int! prints
+    // `error: error.Name` on stderr and exits 1 — no result line —
+    // in BOTH engines.
+    let dir = tempdir();
+    std::fs::write(
+        dir.join("m.ys"),
+        "error Nope;\n\
+         fun main(): int! {\n\
+             print(\"hi\");\n\
+             if 2 > 1 { return error.Nope; }\n\
+             return 0;\n\
+         }",
+    )
+    .unwrap();
+    let src = dir.join("m.ys");
+    let out = compiler(&[src.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("error: error.Nope"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bin = dir.join("m");
+    let out = compiler(&["build", src.to_str().unwrap(), "-o", bin.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = std::process::Command::new(&bin).output().unwrap();
+    assert_eq!(run.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "hi\n");
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("error: error.Nope"),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
 fn runs_a_program_from_its_entry_file() {
     // examples/main.ys imports fib from examples/math.ys — discovery loads it.
     let out = compiler(&["examples/main.ys"]);

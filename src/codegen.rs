@@ -62,6 +62,13 @@ pub(crate) const RT_STRLEN: &str = "strlen@PLT";
 pub(crate) const RT_STRTOD: &str = "strtod@PLT";
 // abort left the inventory with ADR 0022: traps report and exit 1.
 pub(crate) const RT_EXIT: &str = "exit@PLT";
+/// `main(): int!` escaping with an error (ADR 0034): prints the
+/// builder's bytes as `error: …` on stderr and exits 1. CALL-entered
+/// like every stub — never `jmp` (stack alignment).
+pub(crate) const RT_ERR_EXIT: &str = "ys_err_exit";
+/// The `main(): int!` implementation label: the dot keeps it out of
+/// user-identifier space (the show-routine convention).
+pub(crate) const ENTRY_IMPL: &str = "ys.main";
 
 /// Trap stubs (ADR 0022): print a runtime diagnostic and exit 1.
 pub(crate) const TRAP_DIV0: &str = "ys_trap_div0";
@@ -77,6 +84,7 @@ pub(crate) const FMT_INT: &str = ".Lfmt_int";
 pub(crate) const FMT_INT_RAW: &str = ".Lfmt_int_raw";
 pub(crate) const FMT_CSTR: &str = ".Lfmt_cstr";
 pub(crate) const FMT_STR: &str = ".Lfmt_str";
+pub(crate) const FMT_ERR_EXIT: &str = ".Lfmt_err_exit";
 pub(crate) const TRUE_S: &str = ".Ltrue_s";
 pub(crate) const FALSE_S: &str = ".Lfalse_s";
 pub(crate) const NULL_S: &str = ".Lnull_s";
@@ -151,14 +159,21 @@ impl Strings {
     }
 }
 
-fn validate_main(main_fn: &Function) -> Result<(), Diagnostic> {
-    if main_fn.return_type != Some(TypeAnn::Int) {
-        return Err(Diagnostic::error(
-            format!("not yet compilable: {} not returning int", syntax::ENTRY_FN),
+/// `main` returns `int` (the exit code) or `int!` (ADR 0034 decision
+/// 8: an escaping error prints and exits 1). Returns whether the entry
+/// needs the tag-testing wrapper.
+fn validate_main(main_fn: &Function) -> Result<bool, Diagnostic> {
+    match &main_fn.return_type {
+        Some(TypeAnn::Int) => Ok(false),
+        Some(TypeAnn::ErrUnion(inner)) if **inner == TypeAnn::Int => Ok(true),
+        _ => Err(Diagnostic::error(
+            format!(
+                "not yet compilable: {} not returning int or int!",
+                syntax::ENTRY_FN
+            ),
             main_fn.span,
-        ));
+        )),
     }
-    Ok(())
 }
 
 /// Compiles the checked program to assembly text: every function in
@@ -171,7 +186,7 @@ pub fn compile(
     res: &Resolutions,
     map: &SourceMap,
 ) -> Result<String, Diagnostic> {
-    validate_main(main_fn)?;
+    let entry_errs = validate_main(main_fn)?;
 
     // The GNU-stack note marks the stack non-executable; without it the
     // linker warns and grants an executable stack.
@@ -181,6 +196,20 @@ pub fn compile(
     for (mi, module) in graph.modules.iter().enumerate() {
         for item in &module.ast {
             if let Item::Function(f) = item {
+                // The int!-returning entry moves aside (sret convention);
+                // the C `main` below adapts (ADR 0034 decision 8).
+                if entry_errs && mi == 0 && f.name == syntax::ENTRY_FN {
+                    asm.push_str(&crate::ir::function_as(
+                        f,
+                        mi,
+                        res,
+                        &mut strings,
+                        &mut printers,
+                        map,
+                        ENTRY_IMPL,
+                    )?);
+                    continue;
+                }
                 asm.push_str(&crate::ir::function(
                     f,
                     mi,
@@ -191,6 +220,26 @@ pub fn compile(
                 )?);
             }
         }
+    }
+    if entry_errs {
+        // The wrapper: forward argc/argv behind the sret pointer, then
+        // exit with the payload — or render the code via its show
+        // routine (builder reset first, consumer discipline) and take
+        // the trap-shaped exit.
+        let show = printers.request(&crate::types::Type::ErrCode, res);
+        let impl_label = label_of(0, ENTRY_IMPL);
+        let show_label = label_of(0, &show);
+        let _ = write!(
+            asm,
+            "\t.globl main\nmain:\n\
+             \tpushq %rbp\n\tmovq %rsp, %rbp\n\tsubq $16, %rsp\n\
+             \tmovq %rsi, %rdx\n\tmovq %rdi, %rsi\n\tleaq -16(%rbp), %rdi\n\
+             \tcall {impl_label}\n\
+             \tmovq -16(%rbp), %rdi\n\tcmpq $2, %rdi\n\tjl .Lys_main_ok\n\
+             \tmovq $0, {SB_HDR}(%rip)\n\tmovq $8, %rsi\n\tcall {show_label}\n\
+             \tcall {RT_ERR_EXIT}\n\
+             .Lys_main_ok:\n\tmovq -8(%rbp), %rax\n\tleave\n\tret\n"
+        );
     }
     // The show routines requested by print sites (ADR 0025).
     for ir in printers.build(res, &mut strings) {
@@ -674,6 +723,18 @@ fn io_runtime() -> String {
 fn sb_runtime() -> String {
     format!(
         "\
+{RT_ERR_EXIT}:
+\tpushq %rbp
+\tmovq %rsp, %rbp
+\tleaq {SB_HDR}(%rip), %rax
+\tmovq 0(%rax), %rdx
+\tmovq 16(%rax), %rcx
+\tleaq {FMT_ERR_EXIT}(%rip), %rsi
+\tmovl $2, %edi
+\txorl %eax, %eax
+\tcall {RT_DPRINTF}
+\tmovl $1, %edi
+\tcall {RT_EXIT}
 {RT_SB_APPEND}:
 \tpushq %rbp
 \tmovq %rsp, %rbp
@@ -1003,6 +1064,8 @@ fn rodata() -> String {
 \t.string \"null\"
 {FMT_TRAP}:
 \t.string \"error: %s\\n --> %s\\n\"
+{FMT_ERR_EXIT}:
+\t.string \"error: %.*s\\n\"
 {FMT_TRAP_OOB}:
 \t.string \"error: index %ld out of bounds (length %ld)\\n --> %s\\n\"
 {MSG_DIV0}:

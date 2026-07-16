@@ -109,6 +109,13 @@ fn run() {
         }
         Mode::Ir => print_ir(main_fn, &graph, &resolutions, &map),
         Mode::Interpret { args } => match interpreter::interpret(&graph, &resolutions, &args) {
+            // `main(): int!` escaping with an error (ADR 0034): the
+            // trap-shaped exit — stderr message, code 1, no result line.
+            Ok((value @ interpreter::Value::Err(_), heap)) => {
+                let name = String::from_utf8_lossy(&value.display(&heap)).into_owned();
+                let _ = writeln!(std::io::stderr(), "error: {name}");
+                std::process::exit(1);
+            }
             Ok((value, heap)) => write_stdout(&format!("=> {}\n", value.render(&heap))),
             Err(diag) => exit_on_errors(&[diag], &map),
         },
